@@ -11,10 +11,11 @@ verbs:
 ros_distro: lyrical
 tier: infra
 examples: [config/ros2-bag-logger.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
-# Defaults to a driver image (rmw_zenoh + rosbag2). If you point BAG_LOGGER_IMAGE at a stock ROS image
-# instead, mirror it into the registry so an offline vehicle can pull it:
-# mirror:
-#   - ros:lyrical
+# Default image: the shared fleet-ros base (rosbag2 + mcap + rmw_zenoh, ~1 GB) — a camera-less vehicle
+# no longer pulls a 3+ GB driver image just to record bags. `rig build` builds + pushes it; certify
+# enforces the compose pulls it as :RIG_IMAGE_TAG. Override via BAG_LOGGER_IMAGE (e.g. a driver image
+# that already carries both — then swap this `build:` for a `mirror:` of whatever you point at).
+build: { command: ../base/build.sh, images: [fleet-ros] }
 launch_surface:
   - ros2-bag-logger-up
   - tools/bag_cmd.py

@@ -10,10 +10,13 @@ verbs:
 ros_distro: lyrical
 tier: infra
 examples: [config/zenoh-router.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
-# The router uses a third-party image (no build) — `rig build --registry <host>` mirrors it into the
-# registry so an offline vehicle can pull it. Change this if you point ZENOH_ROUTER_IMAGE at a ROS image.
-mirror:
-  - eclipse/zenoh:latest
+# Default image: the shared fleet-ros base (rmw_zenoh from the SAME distro packages as the sessions —
+# the router/session version-match holds by construction). `rig build` builds + pushes it; certify
+# enforces the compose pulls it as :RIG_IMAGE_TAG (build/pull agreement).
+build: { command: ../base/build.sh, images: [fleet-ros] }
+# Standalone alternative: point ZENOH_ROUTER_IMAGE at a PINNED eclipse/zenoh (e.g. eclipse/zenoh:1.2.1
+# — never :latest, mirrored tags can silently drift on re-mirror), swap this `build:` for
+# `mirror: [eclipse/zenoh:1.2.1]`, and see the command note in docker/compose.deploy.yaml.
 launch_surface:
   - zenoh-router-up
   - docker/compose.deploy.yaml

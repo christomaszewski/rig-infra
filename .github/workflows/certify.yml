@@ -1,0 +1,35 @@
+name: certify
+# The rig launcher contract as an executable gate (the camera-service pattern): check out rig, run
+# `rig certify --repo` against every service dir. Certify runs each launcher's `config` verb under a
+# poisoned fleet env and asserts the contract held — project name honored, images pulled from
+# RIG_IMAGE_REGISTRY, BUILT images pulled as :RIG_IMAGE_TAG (build/pull agreement with base/build.sh),
+# fleet ROS env unmangled, deterministic output, identity derived from the config name.
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: christomaszewski/rig
+          path: .rig
+      - run: python3 -m pip install --user pyyaml
+      # Each service's declared `examples:` is certify's default --config.
+      - name: certify zenoh-router
+        run: ./.rig/rig certify --repo zenoh-router
+      # The router's second config path: an inline `router_config:` renders + mounts a zenohd.json5.
+      - name: certify zenoh-router (router_config path)
+        run: |
+          printf 'service: zenoh-router\nname: zr\nrouter_config:\n  scouting: {multicast: {enabled: false}}\n' > /tmp/zr.yaml
+          ./.rig/rig certify --repo zenoh-router --config /tmp/zr.yaml
+      - name: certify ros2-bag-logger
+        run: ./.rig/rig certify --repo ros2-bag-logger
+      - name: certify ros1-bag-logger
+        run: ./.rig/rig certify --repo ros1-bag-logger
+      # The fleet-ros build script parses (its docker build/push only runs against a real registry).
+      - name: base/build.sh syntax
+        run: sh -n base/build.sh
