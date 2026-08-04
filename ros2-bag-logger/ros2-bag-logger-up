@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Launcher for the vehicle's shared ROS 2 bag logger (infra). rig brings it up just AFTER the zenoh router
+# (order ~1) so it records the graph from the start, exporting ROS_DOMAIN_ID / RMW_IMPLEMENTATION /
+# RIG_DATA_DIR. It records the telemetry graph to ${RIG_DATA_DIR}/current/bags/<name> (run-aware; flat without a registry); image topics are excluded
+# by default (camera-service records compressed video at the source). SELECTS + PARAMETERIZES `ros2 bag
+# record` — it does not generate compose.
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${BAG_LOGGER_PYTHON:-python3}"
+
+CONFIG="${1:?usage: ros2-bag-logger-up <config.yaml> [up [-d]|down|status|logs|config|...]}"; shift || true
+[ -f "$CONFIG" ] || { echo "ros2-bag-logger-up: config not found: $CONFIG" >&2; exit 1; }
+CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+
+# config -> the exact `ros2 bag record` command, rendered to var/run/<name>/record.sh (captured by
+# `rig bake` like any launcher-rendered file). bag_cmd prints "<name>\t<script-path>".
+NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/bag_cmd.py" "$CONFIG_ABS" "$REPO")"
+NAME="${NAME_AND_SCRIPT%%$'\t'*}"
+SCRIPT="${NAME_AND_SCRIPT#*$'\t'}"
+export BAG_LOGGER_NAME="$NAME"
+export BAG_RECORD_SCRIPT="$SCRIPT"
+
+# rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros2-bag-logger_${NAME}}"
+ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+echo "ros2-bag-logger-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} script=$SCRIPT" >&2
+exec docker compose -f "$REPO/docker/compose.deploy.yaml" "${ARGS[@]}"

@@ -1,0 +1,21 @@
+# rig descriptor for the vehicle's shared ROS 2 bag logger (infra tier — up just after the zenoh router,
+# down last). Records the telemetry graph; image topics excluded by default (see the example config).
+service: ros2-bag-logger
+launcher: ros2-bag-logger-up
+verbs:
+  up: "up -d"
+  down: "down"
+  status: "ps"
+  logs: "logs"
+  config: "config"
+ros_distro: lyrical
+tier: infra
+examples: [config/ros2-bag-logger.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
+# Defaults to a driver image (rmw_zenoh + rosbag2). If you point BAG_LOGGER_IMAGE at a stock ROS image
+# instead, mirror it into the registry so an offline vehicle can pull it:
+# mirror:
+#   - ros:lyrical
+launch_surface:
+  - ros2-bag-logger-up
+  - tools/bag_cmd.py
+  - docker/compose.deploy.yaml

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Minimal launcher for the vehicle's shared Zenoh router (infra). rig brings this up FIRST (infra tier),
+# exporting ROS_DOMAIN_ID / RMW_IMPLEMENTATION / VEHICLE_ID, which the compose passes to the router. ROS 2
+# stacks using rmw_zenoh connect to it on localhost:7447 (host networking).
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${ZENOH_ROUTER_PYTHON:-python3}"
+
+CONFIG="${1:?usage: zenoh-router-up <config.yaml> [up [-d]|down|status|logs|config|...]}"; shift || true
+[ -f "$CONFIG" ] || { echo "zenoh-router-up: config not found: $CONFIG" >&2; exit 1; }
+CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+
+# Parse the instance config once: the name, plus (optionally) an inline `router_config:` mapping — the
+# zenohd config authored INSIDE the instance YAML. It renders to var/run/<name>/zenohd.json5 (sorted JSON,
+# a JSON5 subset) so `rig bake` captures it like any launcher-rendered file, and the config overlay below
+# mounts it. A non-mapping `router_config` is a config error (paths don't bake; inline only).
+NAME_AND_CFG="$("$PYTHON" - "$CONFIG_ABS" "$REPO" <<'PY'
+import json, pathlib, sys
+import yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+name = str(cfg.get("name") or "zenoh-router")
+rc = cfg.get("router_config")
+rendered = ""
+if isinstance(rc, dict):
+    d = pathlib.Path(sys.argv[2]) / "var" / "run" / name
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "zenohd.json5"
+    p.write_text(json.dumps(rc, indent=2, sort_keys=True) + "\n")
+    rendered = str(p)
+elif rc is not None:
+    sys.stderr.write("zenoh-router-up: `router_config` must be a YAML mapping (inline zenohd config; "
+                     "a file path would not survive `rig bake`)\n")
+    sys.exit(2)
+print(name + "\t" + rendered)
+PY
+)"
+NAME="${NAME_AND_CFG%%$'\t'*}"
+CFG_FILE="${NAME_AND_CFG#*$'\t'}"
+export ZENOH_ROUTER_NAME="$NAME"
+
+# rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-zenoh-router_${NAME}}"
+FILES=(-f "$REPO/docker/compose.deploy.yaml")
+if [ -n "$CFG_FILE" ]; then
+  export ZENOH_ROUTER_CONFIG_FILE="$CFG_FILE"
+  FILES+=(-f "$REPO/docker/compose.config.yaml")
+fi
+ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+echo "zenoh-router-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?}${CFG_FILE:+ router_config=$CFG_FILE}" >&2
+exec docker compose "${FILES[@]}" "${ARGS[@]}"

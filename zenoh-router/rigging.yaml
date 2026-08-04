@@ -1,0 +1,20 @@
+# rig descriptor for the vehicle's shared Zenoh router (infra tier — rig brings it up FIRST).
+service: zenoh-router
+launcher: zenoh-router-up
+verbs:
+  up: "up -d"
+  down: "down"
+  status: "ps"
+  logs: "logs"
+  config: "config"
+ros_distro: lyrical
+tier: infra
+examples: [config/zenoh-router.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
+# The router uses a third-party image (no build) — `rig build --registry <host>` mirrors it into the
+# registry so an offline vehicle can pull it. Change this if you point ZENOH_ROUTER_IMAGE at a ROS image.
+mirror:
+  - eclipse/zenoh:latest
+launch_surface:
+  - zenoh-router-up
+  - docker/compose.deploy.yaml
+  - docker/compose.config.yaml   # applied only when the instance config has an inline `router_config:`

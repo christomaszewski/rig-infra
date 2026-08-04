@@ -1,0 +1,10 @@
+# Overlay applied by zenoh-router-up ONLY when the instance config carries an inline `router_config:`
+# mapping (rendered to var/run/<name>/zenohd.json5 — pure JSON, a JSON5 subset — and mounted read-only).
+# Plain zenohd takes it via `-c`; ZENOH_ROUTER_CONFIG_URI covers an rmw_zenohd image (command override).
+services:
+  router:
+    command: ["-c", "/zenohd.json5"]
+    environment:
+      ZENOH_ROUTER_CONFIG_URI: /zenohd.json5
+    volumes:
+      - ${ZENOH_ROUTER_CONFIG_FILE:?set by zenoh-router-up}:/zenohd.json5:ro

@@ -1,0 +1,22 @@
+# Drop into your deployment as config/infra/ros2-bag-logger.yaml and add it to vehicle.yaml `infra:` with
+# an order just ABOVE the zenoh router (e.g. order 1, router at 0) so the logger is recording before the
+# sensors come up. Records the ROS 2 telemetry graph to ${RIG_DATA_DIR}/current/bags/<name>/<name>_<UTCstamp>
+# (the OPEN run — flat bags/<name> when no run registry exists);
+# the heavy image topics are excluded by default (camera-service records compressed video at the source).
+service: ros2-bag-logger
+name: bag_logger
+
+record:
+  mode: exclude            # all | allow | exclude
+  topics: []               # allow: exact topic names to record; exclude: regex patterns to drop
+  exclude_images: true     # also drop image topics (default true)
+  # exclude_images_regex: '.*/image_raw(/.*)?$'   # the default; widen for image_color/_rect if needed
+
+output:
+  subdir: bags             # -> <run>/bags/<name>/... (flat bags/<name> without a registry)
+  storage: mcap            # mcap (one file, recommended; needs the rosbag2 mcap storage plugin) | sqlite3
+  compression: none        # none | file:zstd | message:zstd
+  split_duration_s: 600    # roll to a new file every N seconds (0 = no time split)
+  max_size_mb: 0           # also roll at N MB (0 = no size split)
+
+# services: []             # FUTURE: also record service calls (not implemented yet — this key is ignored)

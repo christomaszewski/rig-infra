@@ -1,0 +1,25 @@
+# The vehicle's shared ROS 1 bag logger (infra) — the ROS 1 sibling of ros2-bag-logger. ONE per vehicle;
+# records the telemetry graph to ${RIG_DATA_DIR}/bags/<name> (a real host path → survives `rig down
+# --purge`). Image topics excluded by default (drivers record compressed video at the source).
+#
+# ROS 1 needs a roscore: this belongs in a ROS 1 fleet (e.g. a jp6 vehicle running ros1-bridge cameras)
+# with a roscore infra service. ROS_MASTER_URI defaults to localhost; point it at your roscore.
+# IMAGE: must have `rosbag` (any ROS 1 image / your ros1-bridge image does); add `ros-<distro>-rosbag`
+# if missing, or set BAG_LOGGER_IMAGE.
+services:
+  bag-logger:
+    image: ${BAG_LOGGER_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}ros1-bridge:${RIG_IMAGE_TAG:-latest}}
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      ROS_MASTER_URI: ${ROS_MASTER_URI:-http://localhost:11311}   # ROS 1 discovery — supply a roscore
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}            # fleet env, passed through uniformly (ROS 1 ignores it)
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-}   # ditto — present for uniformity; rosbag doesn't read it
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      RIG_BAG_ROOT: /data
+    volumes:
+      # Data ROOT mounted so the recorder resolves the run registry's relative `current` symlink
+      # (run-aware: <data>/current/bags/<name>; flat fallback without a registry).
+      - ${RIG_DATA_DIR:-/data}:/data
+      - ${BAG_RECORD_SCRIPT:?set by ros1-bag-logger-up}:/record.sh:ro
+    command: ["/bin/bash", "/record.sh"]   # bash, not sh: record.sh sources ROS `setup.bash` (bash-only)

@@ -1,0 +1,11 @@
+# Drop this into your deployment as config/infra/zenoh-router.yaml and reference it from vehicle.yaml's
+# `infra:` list. The router is shared (one per vehicle), so there's nothing per-sensor to configure.
+service: zenoh-router
+name: zenoh-router
+
+# Optional inline zenohd config: a mapping rendered verbatim to JSON (a JSON5 subset) and handed to the
+# router (`zenohd -c …`; also exported as ZENOH_ROUTER_CONFIG_URI for rmw_zenohd-image setups). Author it
+# HERE — inline survives `rig bake`; a path to a deployment-local file would not. Example:
+# router_config:
+#   scouting: { multicast: { enabled: false } }
+#   transport: { link: { tx: { batch_size: 16384 } } }

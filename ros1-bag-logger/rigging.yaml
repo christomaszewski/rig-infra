@@ -1,0 +1,22 @@
+# rig descriptor for the vehicle's shared ROS 1 bag logger (infra tier). Sibling of ros2-bag-logger, same
+# config schema, mapped to `rosbag record`. For a ROS 1 fleet (one distro vehicle-wide — rig's doctor
+# enforces that), alongside a roscore infra service.
+service: ros1-bag-logger
+launcher: ros1-bag-logger-up
+verbs:
+  up: "up -d"
+  down: "down"
+  status: "ps"
+  logs: "logs"
+  config: "config"
+ros_distro: noetic
+tier: infra
+examples: [config/ros1-bag-logger.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
+# Defaults to a ros1-bridge image (has rosbag). Point BAG_LOGGER_IMAGE at a stock ROS 1 image instead and
+# mirror it so an offline vehicle can pull it:
+# mirror:
+#   - ros:noetic-ros-base
+launch_surface:
+  - ros1-bag-logger-up
+  - tools/bag_cmd.py
+  - docker/compose.deploy.yaml

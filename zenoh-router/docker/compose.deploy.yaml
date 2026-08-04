@@ -1,0 +1,20 @@
+# The vehicle's shared Zenoh router — ONE per vehicle, brought up first by rig. ROS 2 stacks using
+# rmw_zenoh connect on localhost:7447 (host networking).
+#
+# ADJUST FOR YOUR rmw_zenoh SETUP:
+#   - Set ZENOH_ROUTER_IMAGE to a ROS image that has rmw_zenoh installed (your driver images already do),
+#     or a standalone zenoh router image (default: eclipse/zenoh).
+#   - For the rmw_zenoh-provided router (recommended for full ROS fidelity), run it on a ROS image by
+#     uncommenting the `command:` below. The standalone eclipse/zenoh image runs `zenohd` via its own
+#     entrypoint (leave command unset).
+#   - Point nodes at a non-default/remote router via ZENOH_ROUTER_CONFIG_URI only if ever needed.
+services:
+  router:
+    image: ${ZENOH_ROUTER_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}eclipse/zenoh:latest}
+    network_mode: host            # nodes reach the router at localhost:7447
+    restart: unless-stopped
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+    # command: ["ros2", "run", "rmw_zenoh_cpp", "rmw_zenohd"]   # uncomment on a ROS + rmw_zenoh image

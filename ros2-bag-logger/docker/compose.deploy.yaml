@@ -1,0 +1,26 @@
+# The vehicle's shared ROS 2 bag logger (infra) — ONE per vehicle. rig brings it up just after the zenoh
+# router so it records the graph from the start, and tears it down last so it captures shutdown. The bag
+# goes to ${RIG_DATA_DIR}/bags/<name> (a real host path → survives `rig down --purge`).
+#
+# IMAGE: must have BOTH rosbag2 (`ros2 bag`) AND rmw_zenoh_cpp so the logger joins the same graph as the
+# drivers (on localhost:7447, host networking). Your driver images carry rmw_zenoh; if one lacks rosbag2,
+# add `ros-<distro>-rosbag2*` (incl. `…-storage-mcap` for mcap), or point BAG_LOGGER_IMAGE at a ROS 2
+# image that has both. The recorder runs via `command:` so the image's ROS-sourcing entrypoint still runs;
+# record.sh also sources ROS defensively.
+services:
+  bag-logger:
+    image: ${BAG_LOGGER_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}ros2-bridge:${RIG_IMAGE_TAG:-latest}}
+    network_mode: host            # join the graph / reach the zenoh router at localhost:7447
+    restart: unless-stopped
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      RIG_BAG_ROOT: /data
+    volumes:
+      # The DATA ROOT is mounted (not just bags/) so the recorder can resolve the run registry's
+      # `current` symlink (relative target `runs/<id>` -> stays inside the mount). Run-aware output:
+      # <data>/current/bags/<name>; flat <data>/bags/<name> when no registry exists.
+      - ${RIG_DATA_DIR:-/data}:/data
+      - ${BAG_RECORD_SCRIPT:?set by ros2-bag-logger-up}:/record.sh:ro
+    command: ["/bin/bash", "/record.sh"]   # bash, not sh: record.sh sources ROS `setup.bash` (bash-only)

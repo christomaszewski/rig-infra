@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Launcher for the vehicle's shared ROS 1 bag logger (infra) — the ROS 1 sibling of ros2-bag-logger.
+# Records the telemetry graph to ${RIG_DATA_DIR}/current/bags/<name> (run-aware; flat without a registry) via `rosbag record`; image topics excluded
+# by default. ROS 1 discovers via a roscore (ROS_MASTER_URI), so this belongs in a ROS 1 fleet with a
+# roscore infra service (rig's fleet env is ROS 2-shaped; the master is wired in the compose).
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${BAG_LOGGER_PYTHON:-python3}"
+
+CONFIG="${1:?usage: ros1-bag-logger-up <config.yaml> [up [-d]|down|status|logs|config|...]}"; shift || true
+[ -f "$CONFIG" ] || { echo "ros1-bag-logger-up: config not found: $CONFIG" >&2; exit 1; }
+CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+
+NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/bag_cmd.py" "$CONFIG_ABS" "$REPO")"
+NAME="${NAME_AND_SCRIPT%%$'\t'*}"
+SCRIPT="${NAME_AND_SCRIPT#*$'\t'}"
+export BAG_LOGGER_NAME="$NAME"
+export BAG_RECORD_SCRIPT="$SCRIPT"
+
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros1-bag-logger_${NAME}}"
+ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+echo "ros1-bag-logger-up: project=${COMPOSE_PROJECT_NAME} master=${ROS_MASTER_URI:-http://localhost:11311} script=$SCRIPT" >&2
+exec docker compose -f "$REPO/docker/compose.deploy.yaml" "${ARGS[@]}"
