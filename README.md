@@ -15,7 +15,9 @@ one in CI).
 - **`base/`** — the `fleet-ros` image: `ros:<distro>-ros-base` + `rmw-zenoh-cpp` + `rosbag2` (+ mcap).
   `base/build.sh <registry> [tag]` follows the rig build contract; the router and ros2 bag logger
   riggings declare it (`build: { command: ../base/build.sh, images: [fleet-ros] }`), so `rig build`
-  builds + pushes it and certify enforces the compose pulls the same tag.
+  builds + pushes it and certify enforces the compose pulls the same tag. The distro comes from
+  vehicle.yaml's `ros.distro` (rig ≥ v0.1.29 exports it as `ROS_DISTRO`; a doctor ERROR flags a
+  vehicle whose services target a different distro).
 
 Use from a rig deployment (clone as a sibling):
 

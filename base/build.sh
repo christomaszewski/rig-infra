@@ -6,7 +6,9 @@
 # (rig runs it with cwd = the service dir; this script self-locates, so the double invocation when
 # both services are in one manifest is a docker-cache no-op building the identical image twice).
 #
-# ROS_DISTRO overrides the base distro (default: lyrical — match your fleet's `ros.distro`).
+# ROS_DISTRO selects the base distro: `rig build` (≥ v0.1.29) exports it from vehicle.yaml's
+# `ros.distro` automatically, so the image bakes the fleet's distro; the default (lyrical) applies
+# only when run standalone outside rig.
 set -eu
 registry="${1:?usage: build.sh <registry> [tag]}"
 tag="${2:-latest}"
