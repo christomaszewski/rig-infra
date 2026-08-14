@@ -7,10 +7,24 @@ records anything itself, and rig stays schema-opaque (it only reads name/service
 like any launcher-rendered file) and returns ``<name>\\t<script-path>``; ``build_args(cfg)`` is the pure,
 testable core that maps the config to a ``ros2 bag record`` argv.
 
-Record selection (``record.mode``):
-  all      -> ``--all``                        every topic (minus images, if ``exclude_images``)
-  allow    -> ``<topic> <topic> ...``          exactly these (``exclude_images`` is moot, ignored)
-  exclude  -> ``--all --exclude-regex '...'``  everything except ``topics`` (+ images, if enabled)
+Record selection (``record.mode``) — topics only; services/actions are separate explicit keys because
+on current rosbag2 ``--all`` sweeps in service/action event topics too:
+  all      -> ``--all-topics``                 every topic (minus images, if ``exclude_images``)
+  allow    -> ``--topics <t> <t> ...``         exactly these (``exclude_images`` is moot, ignored)
+  exclude  -> ``--all-topics --exclude-regex`` everything except ``topics`` (+ images, if enabled)
+(Positional topic names are GONE from current ``ros2 bag record`` — allow mode must use ``--topics``.
+Flag spellings track the fleet-ros distro; a BAG_LOGGER_IMAGE from an older distro won't know them,
+but rig doctor already flags distro-mismatched images.)
+
+Runtime control: the recorder node name is pinned (``control.node_name``, default: sanitized ``name``)
+so rosbag2's control services sit at stable paths — /<node>/{pause,resume,is_paused,split_bagfile,
+stop,record} (+ /<node>/snapshot in snapshot mode). Trigger POLICY (arm/disarm, geofence, ...) stays
+outside this service: an external node gates recording through those services.
+
+Compression: mcap output compresses in-band by default (``storage_preset: zstd_fast`` — zstd chunks
+INSIDE a standard ``.mcap``; every mcap tool reads it directly). The rosbag2-layer ``compression:``
+knob is the sqlite3 path; layering it on a compressing preset double-compresses, so the preset
+defaults to ``none`` whenever ``compression:`` is set.
 
 Restart-safety: the output dir carries a runtime UTC stamp (evaluated in-container at start), so a compose
 restart writes a NEW bag instead of failing on an existing dir — and ``config`` stays host-independent
@@ -19,6 +33,7 @@ restart writes a NEW bag instead of failing on an existing dir — and ``config`
 from __future__ import annotations
 
 import pathlib
+import re
 import shlex
 import sys
 
@@ -29,12 +44,27 @@ import yaml
 # image_color / image_rect via `record.exclude_images_regex`.
 DEFAULT_IMAGE_EXCLUDE = r".*/image_raw(/.*)?$"
 
+STORAGE_PRESETS = ("none", "fastwrite", "zstd_fast", "zstd_small")
 
-def build_args(cfg: dict) -> tuple[str, str, list[str], list[str]]:
-    """(name, output-subdir, ros2-bag-record argv WITHOUT -o, warnings). Pure — no I/O."""
+
+def _all_or_names(args: list[str], val, key: str, all_flag: str, list_flag: str) -> None:
+    """record.services / record.actions: 'all' (or true) -> the --all-* flag, [names] -> the list flag."""
+    if not val:
+        return
+    if isinstance(val, list):
+        args += [list_flag] + [str(v) for v in val]
+    elif val is True or str(val).lower() == "all":
+        args.append(all_flag)
+    else:
+        raise SystemExit(f"bag_cmd: record.{key} must be 'all' or a list of names")
+
+
+def build_args(cfg: dict) -> tuple[str, str, str, list[str], list[str]]:
+    """(name, output-subdir, node-name, ros2-bag-record argv WITHOUT -o, warnings). Pure — no I/O."""
     name = str(cfg.get("name") or "bag_logger")
     rec = cfg.get("record") or {}
     out = cfg.get("output") or {}
+    ctl = cfg.get("control") or {}
     warns: list[str] = []
 
     mode = str(rec.get("mode") or "exclude").lower()
@@ -45,44 +75,100 @@ def build_args(cfg: dict) -> tuple[str, str, list[str], list[str]]:
     exclude_images = bool(rec.get("exclude_images", True))
     img_re = str(rec.get("exclude_images_regex") or DEFAULT_IMAGE_EXCLUDE)
 
-    args: list[str] = ["-s", str(out.get("storage") or "mcap")]
+    storage = str(out.get("storage") or "mcap")
+    args: list[str] = ["-s", storage]
+
     comp = str(out.get("compression") or "none").lower()
+    preset = out.get("storage_preset")
+    if storage == "mcap":
+        if preset is None:  # compress by default, but never UNDER a rosbag2-layer compressor
+            preset = "none" if comp not in ("none", "") else "zstd_fast"
+        preset = str(preset).lower()
+        if preset not in STORAGE_PRESETS:
+            raise SystemExit(f"bag_cmd: unknown output.storage_preset '{preset}' ({'|'.join(STORAGE_PRESETS)})")
+        if preset != "none":
+            args += ["--storage-preset-profile", preset]
+            if comp not in ("none", ""):
+                warns.append(f"output.compression={comp} on top of storage_preset={preset} double-compresses"
+                             " (and file mode yields .mcap.zstd, unreadable without decompressing)")
+    elif preset:
+        warns.append(f"output.storage_preset is mcap-only; ignored for storage={storage}")
     if comp not in ("none", ""):
         cmode, cfmt = comp.split(":", 1) if ":" in comp else ("file", comp)  # "zstd" -> file:zstd
         args += ["--compression-mode", cmode, "--compression-format", cfmt]
-    if int(out.get("split_duration_s") or 0) > 0:
-        args += ["--max-bag-duration", str(int(out["split_duration_s"]))]
-    if int(out.get("max_size_mb") or 0) > 0:
-        args += ["--max-bag-size", str(int(out["max_size_mb"]) * 1024 * 1024)]
+
+    split_s = int(out.get("split_duration_s") or 0)
+    split_mb = int(out.get("max_size_mb") or 0)
+    if split_s > 0:
+        args += ["--max-bag-duration", str(split_s)]
+    if split_mb > 0:
+        args += ["--max-bag-size", str(split_mb * 1024 * 1024)]
+    if int(out.get("max_files") or 0) > 0:  # circular logging: rosbag2 deletes the oldest split
+        if split_s <= 0 and split_mb <= 0:
+            raise SystemExit("bag_cmd: output.max_files needs a split (split_duration_s or max_size_mb)")
+        args += ["--max-bag-files", str(int(out["max_files"]))]
+    if int(out.get("max_cache_mb") or 0) > 0:
+        args += ["--max-cache-size", str(int(out["max_cache_mb"]) * 1024 * 1024)]
 
     if mode == "all":
-        args.append("--all")
+        args.append("--all-topics")
         if topics:
             warns.append("record.mode=all ignores record.topics")
         if exclude_images:
-            args += ["--exclude-regex", img_re]   # NOTE: pre-Iron rosbag2 spells this `--exclude`
+            args += ["--exclude-regex", img_re]
     elif mode == "allow":
-        if not topics:
-            raise SystemExit("bag_cmd: record.mode=allow needs record.topics (the topics to record)")
-        args += topics
+        if not topics and not (rec.get("services") or rec.get("actions")):
+            raise SystemExit("bag_cmd: record.mode=allow needs record.topics (and/or services/actions)")
+        if topics:
+            args += ["--topics"] + topics
         if exclude_images:
             warns.append("record.mode=allow records exactly record.topics; exclude_images ignored")
     elif mode == "exclude":
-        args.append("--all")
+        args.append("--all-topics")
         pats = list(topics) + ([img_re] if exclude_images else [])
         if pats:
             args += ["--exclude-regex", "|".join(f"(?:{p})" for p in pats)]
     else:
         raise SystemExit(f"bag_cmd: unknown record.mode '{mode}' (all|allow|exclude)")
 
-    if cfg.get("services"):  # forward-looking knob; rosbag2 service recording is a later addition
-        warns.append("record of service calls is not implemented yet (the `services:` key is ignored)")
-    return name, str(out.get("subdir") or "bags"), args, warns
+    _all_or_names(args, rec.get("services"), "services", "--all-services", "--services")
+    _all_or_names(args, rec.get("actions"), "actions", "--all-actions", "--actions")
+    if rec.get("include_hidden_topics"):
+        args.append("--include-hidden-topics")
+    if rec.get("include_unpublished_topics"):
+        args.append("--include-unpublished-topics")
+    rtl = rec.get("repeat_transient_local")  # re-write latched topics (/tf_static, …) on split/snapshot
+    if rtl:
+        if isinstance(rtl, list):
+            args += ["--repeat-transient-local"] + [str(v) for v in rtl]
+        elif rtl is True:
+            args.append("--repeat-all-transient-local")
+        elif isinstance(rtl, int):
+            args += ["--repeat-all-transient-local", str(rtl)]
+        else:
+            raise SystemExit("bag_cmd: record.repeat_transient_local must be true, a depth, or a list")
+
+    # Control surface: ALWAYS pin the node name so the rosbag2 services sit at stable, documented paths
+    # (/<node>/pause etc.) — that is the whole contract an external trigger node programs against.
+    node = str(ctl.get("node_name") or re.sub(r"[^A-Za-z0-9_]", "_", name))
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", node):
+        raise SystemExit(f"bag_cmd: '{node}' is not a valid ROS node name; set control.node_name")
+    args += ["--node-name", node]
+    if ctl.get("start_paused"):
+        args.append("--start-paused")
+    if ctl.get("snapshot"):
+        args.append("--snapshot-mode")
+    if ctl.get("use_sim_time"):
+        args.append("--use-sim-time")
+
+    if cfg.get("services"):
+        warns.append("top-level `services:` moved to record.services (service recording is now implemented)")
+    return name, str(out.get("subdir") or "bags"), node, args, warns
 
 
 def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str]:
     """Write var/run/<name>/record.sh and return (name, script-path)."""
-    name, subdir, args, warns = build_args(cfg)
+    name, subdir, node, args, warns = build_args(cfg)
     for w in warns:
         sys.stderr.write("ros2-bag-logger: " + w + "\n")
     argv = " ".join(shlex.quote(a) for a in args)
@@ -102,7 +188,8 @@ def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str]:
         f'base="$bags/{shlex.quote(name)}"\n'
         f'out="$base/{shlex.quote(name)}_$(date -u +%Y%m%dT%H%M%SZ)"\n'
         'mkdir -p "$base"\n'
-        f'echo "ros2-bag-logger: recording ({shlex.quote(subdir)}) -> $out" >&2\n'
+        f'echo "ros2-bag-logger: recording ({shlex.quote(subdir)}) -> $out'
+        f' (control services: /{node}/pause|resume|split_bagfile|stop)" >&2\n'
         f'exec ros2 bag record {argv} -o "$out"\n'
     )
     script.chmod(0o755)

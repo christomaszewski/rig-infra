@@ -4,19 +4,49 @@
 # (the OPEN run — flat bags/<name> when no run registry exists);
 # the heavy image topics are excluded by default (camera-service records compressed video at the source).
 service: ros2-bag-logger
-name: bag_logger
+name: bag_logger           # bag dir name; also the recorder node name (control.node_name overrides)
 
 record:
-  mode: exclude            # all | allow | exclude
+  mode: exclude            # all | allow | exclude — topics only; services/actions are the keys below
   topics: []               # allow: exact topic names to record; exclude: regex patterns to drop
   exclude_images: true     # also drop image topics (default true)
   # exclude_images_regex: '.*/image_raw(/.*)?$'   # the default; widen for image_color/_rect if needed
+  # include_hidden_topics: true       # also record ROS-internal (hidden) topics
+  # include_unpublished_topics: true  # also subscribe to discovered topics that have no publisher yet
+  # services: all                     # record service calls: all | [/exact/service, ...] — captured via
+  #                                   # service EVENT topics, so only servers with introspection ON appear
+  # actions: all                      # record action activity: all | [/exact/action, ...]
+  # repeat_transient_local: true      # re-write latched topics (/tf_static, maps) into every split /
+  #                                   # snapshot file: true = last msg per topic, N = depth, ['/tf_static=1', ...]
 
 output:
   subdir: bags             # -> <run>/bags/<name>/... (flat bags/<name> without a registry)
   storage: mcap            # mcap (one file, recommended; needs the rosbag2 mcap storage plugin) | sqlite3
-  compression: none        # none | file:zstd | message:zstd
+  # storage_preset: zstd_fast   # mcap chunk compression INSIDE a standard .mcap (every tool reads it
+  #                             # as-is). Default zstd_fast; zstd_small = best ratio (more CPU),
+  #                             # fastwrite = no chunking/CRC (max throughput), none = uncompressed.
+  compression: none        # rosbag2-LAYER compression (file:zstd | message:zstd) — meant for sqlite3.
+  #                          Leave none for mcap: the storage_preset above already compresses in-band;
+  #                          file:zstd would double-compress and emit .mcap.zstd files that mcap tools
+  #                          can't read without decompressing first.
   split_duration_s: 600    # roll to a new file every N seconds (0 = no time split)
   max_size_mb: 0           # also roll at N MB (0 = no size split)
+  # max_files: 0             # circular logging: keep only the newest N split files, delete the oldest
+  #                          # (disk-capped vehicles; requires a time or size split above)
+  # max_cache_mb: 100        # recorder write cache in RAM (rosbag2 default 100); in snapshot mode this
+  #                          # IS the ring buffer of history that .../snapshot flushes to disk
 
-# services: []             # FUTURE: also record service calls (not implemented yet — this key is ignored)
+# Runtime control (triggered logging): the recorder is a normal ROS 2 node with a PINNED name (default:
+# `name`, sanitized), so rosbag2's own control services sit at stable paths:
+#   /bag_logger/{pause,resume,is_paused,split_bagfile,stop,record}  (+ /bag_logger/snapshot if snapshot: true)
+# Gate recording from OUTSIDE — a trigger node (arm/disarm, geofence, mission state) or by hand:
+#   ros2 service call /bag_logger/pause         rosbag2_interfaces/srv/Pause
+#   ros2 service call /bag_logger/split_bagfile rosbag2_interfaces/srv/SplitBagfile  # split, then resume,
+#   ros2 service call /bag_logger/resume        rosbag2_interfaces/srv/Resume        # -> session-aligned files
+# control:
+#   node_name: bag_logger  # override the service-path prefix above
+#   start_paused: true     # up + subscribed from boot but write nothing until .../resume (fail-paused;
+#                          # the default false = record unless told otherwise, fail-recording)
+#   snapshot: true         # keep only the last max_cache_mb of messages in RAM; dump to disk on
+#                          # .../snapshot (incident capture — nothing is written until triggered)
+#   use_sim_time: false    # SITL/sim rigs: stamp messages from /clock

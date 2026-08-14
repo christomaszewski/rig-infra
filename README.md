@@ -9,8 +9,11 @@ one in CI).
   running `ros2 run rmw_zenoh_cpp rmw_zenohd` — the router and the sessions share one distro's zenoh
   packages by construction. Optional inline `router_config:` renders to a mounted `zenohd.json5`.
 - **`ros2-bag-logger/`** — records the ROS 2 telemetry graph to `${RIG_DATA_DIR}` (run-aware:
-  `current/bags/<name>`). Default image: `fleet-ros` (rosbag2 + mcap + rmw_zenoh, ~1 GB — no camera
-  image needed on camera-less vehicles).
+  `current/bags/<name>`), zstd-compressed mcap by default. The recorder node name is pinned, so
+  recording can be gated at runtime through rosbag2's own services
+  (`/bag_logger/{pause,resume,split_bagfile,stop,…}`); trigger *policy* (arm/disarm, geofence)
+  belongs in a separate node that calls them — see the example config. Default image: `fleet-ros`
+  (rosbag2 + mcap + rmw_zenoh, ~1 GB — no camera image needed on camera-less vehicles).
 - **`ros1-bag-logger/`** — the ROS 1 sibling (`rosbag record`), for ROS 1 fleets with a roscore.
 - **`base/`** — the `fleet-ros` image: `ros:<distro>-ros-base` + `rmw-zenoh-cpp` + `rosbag2` (+ mcap).
   `base/build.sh <registry> [tag]` follows the rig build contract; the router and ros2 bag logger
