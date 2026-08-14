@@ -1,0 +1,98 @@
+# On every published GitHub release (tag vX.Y.Z) update this repo's THREE service entries in the
+# public rig registry — rig-infra is a collection repo, so one repo-wide version covers
+# zenoh-router, ros2-bag-logger and ros1-bag-logger (they ship together and share the fleet-ros
+# base). Rewrites each services/<name>/manifest.yaml wholesale (version + source.rev), regenerates
+# index.json with the registry's own tooling, pushes ONE commit. The manifests are OWNED by this
+# workflow — registry-side hand edits to them do not survive the next release.
+#
+# One-time setup: a RIG_REGISTRY_TOKEN Actions secret in THIS repo — fine-grained PAT scoped to
+# christomaszewski/rig-registry-public with Contents read/write, nothing else.
+name: registry-release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+# Serialize releases — two concurrent runs would race the registry push.
+concurrency:
+  group: registry-release
+
+jobs:
+  update-registry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: derive version from tag
+        id: meta
+        run: |
+          echo "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "::error::release tag '${GITHUB_REF_NAME}' is not vX.Y.Z — registry versions are exact X.Y.Z"
+            exit 1
+          }
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: christomaszewski/rig-registry-public
+          token: ${{ secrets.RIG_REGISTRY_TOKEN }}
+          path: registry
+
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+
+      - name: install rig (registry validate/index tooling)
+        run: pip install git+https://github.com/christomaszewski/rig
+
+      # GITHUB_SHA on a release event is the tagged commit — exactly the rev consumers should pin.
+      # One manifest per service subdir; per-service divergence (platforms, instantiable, a distro
+      # bump) belongs in the list below.
+      - name: rewrite manifests
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          while read -r name distro; do
+            mkdir -p "registry/services/${name}"
+            cat > "registry/services/${name}/manifest.yaml" <<EOF
+          # AUTO-UPDATED on every rig-infra release by that repo's registry-release workflow
+          # (one repo-wide version; rewrites this file wholesale + regenerates index.json).
+          # Hand-edits will be clobbered by the next release — change the workflow in the
+          # rig-infra repo instead.
+          kind: service
+          name: ${name}
+          version: ${VERSION}
+          ros_distro: ${distro}
+          source:
+            repo: https://github.com/christomaszewski/rig-infra.git
+            rev: ${GITHUB_SHA}
+            path: ${name}              # rig-infra is a collection repo — one service per subdir
+          EOF
+          done <<'SERVICES'
+          zenoh-router lyrical
+          ros2-bag-logger lyrical
+          ros1-bag-logger noetic
+          SERVICES
+
+      - name: regenerate index + validate
+        working-directory: registry
+        run: |
+          ./tools/gen-index
+          ./tools/validate
+
+      - name: commit + push
+        working-directory: registry
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add services/zenoh-router/manifest.yaml \
+                  services/ros2-bag-logger/manifest.yaml \
+                  services/ros1-bag-logger/manifest.yaml index.json
+          if git diff --staged --quiet; then
+            echo "registry already current for rig-infra ${VERSION}"
+            exit 0
+          fi
+          git commit -m "rig-infra ${VERSION} — zenoh-router, ros2-bag-logger, ros1-bag-logger (auto: release ${GITHUB_REF_NAME})"
+          git push
