@@ -5,7 +5,147 @@ name: zenoh-router
 
 # Optional inline zenohd config: a mapping rendered verbatim to JSON (a JSON5 subset) and handed to the
 # router (`zenohd -c …`; also exported as ZENOH_ROUTER_CONFIG_URI for rmw_zenohd-image setups). Author it
-# HERE — inline survives `rig bake`; a path to a deployment-local file would not. Example:
+# HERE — inline survives `rig bake`; a path to a deployment-local file would not. Omitted fields keep
+# zenohd defaults, so uncomment only the blocks you need. Any file PATHS referenced from inside (TLS
+# certs, auth dictionaries) must ALSO be mounted into the router container — the config overlay mounts
+# only the rendered zenohd.json5 itself.
+#
+# What ACL / downsampling rules match against — rmw_zenoh's key exprs. The 0/ prefix below is
+# ROS_DOMAIN_ID: in a rig deployment write "{{ros_domain_id}}/…" instead — rig interpolates {{var}}
+# markers (vehicle.yaml vars: + provisioned identity) into this config before the launcher renders it;
+# hardcode the domain only when using the launcher standalone.
+#   topic /gps/fix          ->  0/gps/fix/<type>/<type-hash>   — match with "0/gps/fix/**"
+#   services & actions      ->  same <domain>/<name>/… shape, carried as query (request) / reply messages
+#   graph discovery (ros2 topic list, node info)  ->  liveliness tokens under "@ros2_lv/<domain>/**"
+# Wildcards never match @-prefixed chunks: "**" does NOT cover @ros2_lv/… — list those explicitly.
+#
 # router_config:
-#   scouting: { multicast: { enabled: false } }
-#   transport: { link: { tx: { batch_size: 16384 } } }
+#
+#   # -- Topic egress control (ACL): which topics may leave this vehicle -----------------------------
+#   # Subjects classify each link by the network interface it arrived on (host networking, so these are
+#   # the vehicle's real interfaces): onboard rmw_zenoh sessions connect over loopback, other vehicles /
+#   # shore over the uplink (wlan0 below — set your radio/LTE interface). All onboard traffic transits
+#   # this router (sessions are clients of it), so its egress ACL is authoritative. Two things bite:
+#   #  * default_permission applies to EVERY link, so the onboard subject needs an allow-everything
+#   #    rule or the vehicle's own graph stops working the moment ACL turns on.
+#   #  * deny beats allow when rules overlap, so "only these leave" must be default deny + allow-list
+#   #    ("everything except X" via a deny-** plus allow rules is not expressible).
+#   access_control:
+#     enabled: true
+#     default_permission: deny
+#     subjects:
+#       - { id: onboard, interfaces: [lo] }
+#       - { id: uplink, interfaces: [wlan0] }
+#       # subjects can also match TLS identities / usernames instead of interfaces (see link security
+#       # below): { id: shore, cert_common_names: [shore.example.com] }, { id: ops, usernames: [ops] }
+#     rules:
+#       - id: onboard-all            # onboard traffic: everything, both directions
+#         permission: allow
+#         flows: [ingress, egress]
+#         messages: [put, delete, query, reply, declare_subscriber, declare_queryable,
+#                    liveliness_token, liveliness_query, declare_liveliness_subscriber]
+#         key_exprs: ["**", "@/**", "@ros2_lv/**"]
+#       - id: uplink-telemetry-out   # the data allowed OFF the vehicle — the allow-list
+#         permission: allow
+#         flows: [egress]
+#         messages: [put]
+#         key_exprs: ["0/gps/fix/**", "0/vehicle_status/**", "0/tf/**"]
+#       - id: uplink-discovery       # remote side may see the graph and declare subscribers (it still
+#         permission: allow          # only RECEIVES allow-listed data); drop this rule to hide the
+#         flows: [ingress, egress]   # vehicle's topology from remote `ros2 topic list` entirely
+#         messages: [declare_subscriber, declare_queryable, liveliness_token, liveliness_query,
+#                    declare_liveliness_subscriber]
+#         key_exprs: ["**", "@ros2_lv/**"]
+#       - id: uplink-commands-in     # data / service+action calls allowed ONTO the vehicle …
+#         permission: allow
+#         flows: [ingress]
+#         messages: [put, query]
+#         key_exprs: ["0/cmd_vel/**", "0/mission/**"]
+#       - id: uplink-replies-out     # … and the service/action replies back out
+#         permission: allow
+#         flows: [egress]
+#         messages: [reply]
+#         key_exprs: ["0/mission/**"]
+#     policies:
+#       - { subjects: [onboard], rules: [onboard-all] }
+#       - { subjects: [uplink],
+#           rules: [uplink-telemetry-out, uplink-discovery, uplink-commands-in, uplink-replies-out] }
+#
+#   # -- Egress rate caps (downsampling): throttle high-rate topics at the uplink only ---------------
+#   downsampling:
+#     - id: uplink-throttle
+#       flows: [egress]
+#       interfaces: [wlan0]
+#       messages: [push]         # data only (zenoh >= 1.3 can also throttle query/reply)
+#       rules:
+#         - { key_expr: "0/imu/data/**", freq: 5 }   # Hz on the wire; onboard subscribers unaffected
+#         - { key_expr: "0/scan/**", freq: 1 }
+#
+#   # -- Egress size cap (low-pass filter): drop oversized payloads at the uplink (zenoh >= 1.1) -----
+#   low_pass_filter:
+#     - id: uplink-size-cap
+#       flows: [egress]
+#       interfaces: [wlan0]
+#       messages: [put]
+#       key_exprs: ["**"]
+#       size_limit: 262144       # bytes (payload + attachment) — keeps raw images/pointclouds home
+#
+#   # -- Connectivity: dial the OTHER routers (ground station, other vehicles) -----------------------
+#   # Routers route across each other, so a vehicle that can only reach the ground station still
+#   # reaches everything connected there; direct vehicle-to-vehicle entries just cut out that hop.
+#   # Unreachable endpoints don't block startup — the router keeps re-dialing in the background
+#   # (defaults: forever, 1 s backing off ×2 to a 4 s cap), so list the WHOLE fleet and let links come
+#   # and go with radio range. Gossip does NOT auto-link routers: this list IS the fleet topology.
+#   # In a rig deployment (rig >= v0.1.66) feed these from the fleet vars convention, not literals.
+#   # vehicle.yaml:   vars: { gcs_ip: 10.160.1.10, fleet_ids: [1, 2, 7],
+#   #                         peer_endpoint: "tcp/10.160.1.{}:7447" }
+#   # rig derives {{fleet_peer_ids}} (fleet_ids minus THIS vehicle — no self-dial) and the whole-
+#   # scalar {{map <list> <template>}} form renders a list, so either topology is one line:
+#   #   endpoints: ["tcp/{{gcs_ip}}:7447"]                 # hub-and-spoke via the ground station
+#   #   endpoints: "{{map fleet_peer_ids peer_endpoint}}"  # vehicle mesh ({} = each peer id)
+#   # Test-day changes ride the shell/roster tier, no config edits, recorded in the run snapshot:
+#   #   rig fleet up --var gcs_ip=192.168.44.10            # fleet.yaml roster fan-out
+#   #   RIG_VAR_fleet_ids=1,2,7                            # comma string coerces to a list
+#   #   RIG_VAR_peer_endpoint='tcp/127.0.0.1:744{}'        # SIL on one box: swap the TEMPLATE
+#   connect:
+#     endpoints:                                 # literals: the standalone (non-rig) form
+#       - "tcp/groundstation.example.com:7447"   # DNS or IP; tls/… once link security below is set up
+#       - "tcp/10.0.0.11:7447"                   # vehicle-11
+#       - "tcp/10.0.0.12:7447"                   # vehicle-12
+#     # retry: { period_init_ms: 1000, period_max_ms: 4000, period_increase_factor: 2 }
+#   listen:
+#     endpoints: ["tcp/[::]:7447"]   # the default; pin an address ("tcp/10.0.0.10:7447") or an
+#                                    # interface ("tcp/0.0.0.0:7447#iface=wlan0") to control exposure
+#
+#   # -- Discovery: multicast scouting OFF keeps vehicles from auto-meshing on shared networks -------
+#   # (deliberate topology instead: routers dial each other via the connect: list above; gossip only
+#   # spreads discovery to sessions, it does not auto-link routers)
+#   scouting:
+#     multicast: { enabled: false }
+#     gossip: { enabled: true }
+#
+#   # -- Transport tuning + link security ------------------------------------------------------------
+#   transport:
+#     unicast:
+#       compression: { enabled: true }   # negotiated PER LINK: a link compresses only when BOTH ends
+#                                        # enable it (there is no per-endpoint/interface switch).
+#                                        # Onboard rmw_zenoh sessions leave it off by default, so
+#                                        # enabling it here and on the shore/other-vehicle routers
+#                                        # compresses just the inter-router radio links — localhost
+#                                        # session traffic stays uncompressed and costs no CPU
+#     link:
+#       tx: { batch_size: 16384 }        # smaller batches favor latency, larger favor throughput
+#       # TLS gives links an identity that ACL cert_common_names subjects can match (mount /certs into
+#       # the container); usrpwd auth is the lighter equivalent for usernames subjects.
+#       # tls:
+#       #   root_ca_certificate: /certs/minica.pem
+#       #   listen_private_key: /certs/key.pem
+#       #   listen_certificate: /certs/cert.pem
+#       #   enable_mtls: true            # also require + verify client certs
+#     # auth:
+#     #   usrpwd: { user: vehicle1, password: changeme }
+#
+#   # -- Introspection -------------------------------------------------------------------------------
+#   adminspace: { permissions: { read: true, write: false } }   # router admin space, queried at "@/**"
+#   # plugins: { rest: { http_port: 8000 } }   # REST bridge to the admin space — standalone
+#   #                                          # eclipse/zenoh image only (rmw_zenohd loads no plugins)
