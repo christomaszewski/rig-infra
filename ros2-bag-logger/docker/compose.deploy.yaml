@@ -11,6 +11,8 @@ services:
   bag-logger:
     image: ${BAG_LOGGER_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}
     network_mode: host            # join the graph / reach the zenoh router at localhost:7447
+    ipc: host                     # zenoh SHM (`zenoh.shared_memory` in the config) needs a shared IPC
+                                  # namespace to reach same-host publishers; harmless when SHM is off
     restart: unless-stopped
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}

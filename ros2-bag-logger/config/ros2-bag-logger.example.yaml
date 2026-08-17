@@ -50,3 +50,17 @@ output:
 #   snapshot: true         # keep only the last max_cache_mb of messages in RAM; dump to disk on
 #                          # .../snapshot (incident capture — nothing is written until triggered)
 #   use_sim_time: false    # SITL/sim rigs: stamp messages from /clock
+
+# Zenoh shared memory (rmw_zenoh only — ships DISABLED): same-host transport for big topics
+# (pointclouds). Opt-in is per session AND per link: data moves over SHM only where the PUBLISHER's
+# session also enabled it and both containers share the host IPC namespace (this service's compose
+# sets ipc:host; the publisher's must too). Anything unmet = silent TCP-loopback fallback — verify by
+# watching `lo` traffic collapse, not by the config. Keep every SHM participant on the same distro's
+# zenoh (fleet-ros holds this by construction). Renders as a record.sh preamble that patches a copy
+# of the image's shipped session config; inert under other RMWs, and skipped (with a log line) if the
+# deployment already sets ZENOH_SESSION_CONFIG_URI.
+# zenoh:
+#   shared_memory: true
+#   shm_pool_mb: 256       # SHM pool for messages THIS session publishes (default 48 MB ≈ 8-16
+#                          # pointclouds) — mostly moot for this subscriber-only service; the knob
+#                          # that matters is the publisher's

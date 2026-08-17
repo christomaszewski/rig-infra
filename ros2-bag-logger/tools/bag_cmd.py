@@ -46,6 +46,15 @@ DEFAULT_IMAGE_EXCLUDE = r".*/image_raw(/.*)?$"
 
 STORAGE_PRESETS = ("none", "fastwrite", "zstd_fast", "zstd_small")
 
+# zenoh.shared_memory: line-oriented patch of the SHIPPED session config (first `enabled: false`
+# inside the `shared_memory: {` block -> true; first `pool_size:` there -> pool bytes, when given).
+# ZENOH_SESSION_CONFIG_URI REPLACES the default wholesale, so a hand-rolled minimal config would
+# silently drop rmw_zenoh's ROS defaults (peer mode, connect to localhost:7447) — patch a copy instead.
+AWK_SHM = (r'/shared_memory: \{/ && !d {s=1} '
+           r's && /enabled: false/ {sub(/enabled: false/, "enabled: true"); if (pool+0 == 0) {s=0; d=1}} '
+           r's && pool+0 > 0 && /pool_size:/ {sub(/pool_size: *[0-9]+/, "pool_size: " pool); s=0; d=1} '
+           r'{print}')
+
 
 def _all_or_names(args: list[str], val, key: str, all_flag: str, list_flag: str) -> None:
     """record.services / record.actions: 'all' (or true) -> the --all-* flag, [names] -> the list flag."""
@@ -166,9 +175,51 @@ def build_args(cfg: dict) -> tuple[str, str, str, list[str], list[str]]:
     return name, str(out.get("subdir") or "bags"), node, args, warns
 
 
+def zenoh_shm_lines(cfg: dict, warns: list[str]) -> str:
+    """record.sh preamble for `zenoh:` (shared_memory / shm_pool_mb) — empty string when off.
+    Runtime-guarded on RMW_IMPLEMENTATION (the knob is inert under other RMWs) and skipped when the
+    deployment already owns ZENOH_SESSION_CONFIG_URI. An unpatchable config (format drift in a future
+    distro) warns rather than half-enabling: cmp catching an unchanged copy means SHM stays OFF."""
+    zn = cfg.get("zenoh") or {}
+    if not isinstance(zn, dict):
+        raise SystemExit("bag_cmd: `zenoh` must be a mapping")
+    unknown = set(zn) - {"shared_memory", "shm_pool_mb"}
+    if unknown:
+        raise SystemExit(f"bag_cmd: unknown zenoh key(s): {', '.join(sorted(unknown))} "
+                         "(zenoh.shared_memory, zenoh.shm_pool_mb)")
+    pool_mb = int(zn.get("shm_pool_mb") or 0)
+    if pool_mb < 0:
+        raise SystemExit("bag_cmd: zenoh.shm_pool_mb must be a size in MB")
+    if not zn.get("shared_memory"):
+        if pool_mb:
+            warns.append("zenoh.shm_pool_mb without zenoh.shared_memory: true — ignored")
+        return ""
+    return (
+        "# zenoh.shared_memory: patch a copy of the shipped session config (SHM ships disabled) and\n"
+        "# point this session at it. SHM engages per link only where the publisher opted in too AND\n"
+        "# the containers share the host IPC namespace (compose sets ipc:host) — otherwise zenoh\n"
+        "# falls back to TCP loopback silently.\n"
+        'if [ "${RMW_IMPLEMENTATION:-}" = "rmw_zenoh_cpp" ]; then\n'
+        '  if [ -n "${ZENOH_SESSION_CONFIG_URI:-}" ]; then\n'
+        '    echo "ros2-bag-logger: zenoh.shared_memory skipped — ZENOH_SESSION_CONFIG_URI already set" >&2\n'
+        '  else\n'
+        '    def="/opt/ros/${ROS_DISTRO:-}/share/rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_SESSION_CONFIG.json5"\n'
+        '    if [ -f "$def" ] && awk -v pool=' + str(pool_mb * 1024 * 1024) + " '" + AWK_SHM + "'"
+        ' "$def" > /tmp/zenoh_session_shm.json5 && ! cmp -s "$def" /tmp/zenoh_session_shm.json5; then\n'
+        '      export ZENOH_SESSION_CONFIG_URI=/tmp/zenoh_session_shm.json5\n'
+        '      echo "ros2-bag-logger: zenoh shared memory ON (ZENOH_SESSION_CONFIG_URI=$ZENOH_SESSION_CONFIG_URI)" >&2\n'
+        '    else\n'
+        '      echo "ros2-bag-logger: WARNING could not patch shared_memory in $def — SHM NOT enabled" >&2\n'
+        '    fi\n'
+        '  fi\n'
+        'fi\n'
+    )
+
+
 def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str]:
     """Write var/run/<name>/record.sh and return (name, script-path)."""
     name, subdir, node, args, warns = build_args(cfg)
+    shm = zenoh_shm_lines(cfg, warns)
     for w in warns:
         sys.stderr.write("ros2-bag-logger: " + w + "\n")
     argv = " ".join(shlex.quote(a) for a in args)
@@ -181,6 +232,7 @@ def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str]:
         "# Source ROS if the image's entrypoint didn't (we run as `command:`, so usually it did).\n"
         '[ -n "${ROS_DISTRO:-}" ] && [ -f "/opt/ros/$ROS_DISTRO/setup.bash" ] && '
         '. "/opt/ros/$ROS_DISTRO/setup.bash"\n'
+        + shm +
         # Run-aware output (ROADMAP §3c): pin the OPEN run at process start — resolve `current` ONCE
         # (a live symlink flip would ENOENT the recorder's next split). No run registry -> flat layout.
         'root="${RIG_BAG_ROOT:-/data}"\n'
