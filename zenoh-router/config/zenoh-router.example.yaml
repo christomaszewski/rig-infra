@@ -96,17 +96,17 @@ name: zenoh-router
 #   # Unreachable endpoints don't block startup — the router keeps re-dialing in the background
 #   # (defaults: forever, 1 s backing off ×2 to a 4 s cap), so list the WHOLE fleet and let links come
 #   # and go with radio range. Gossip does NOT auto-link routers: this list IS the fleet topology.
-#   # In a rig deployment (rig >= v0.1.66) feed these from the fleet vars convention, not literals.
-#   # vehicle.yaml:   vars: { gcs_ip: 10.160.1.10, fleet_ids: [1, 2, 7],
-#   #                         peer_endpoint: "tcp/10.160.1.{}:7447" }
-#   # rig derives {{fleet_peer_ids}} (fleet_ids minus THIS vehicle — no self-dial) and the whole-
-#   # scalar {{map <list> <template>}} form renders a list, so either topology is one line:
+#   # In a rig deployment (rig >= v0.1.68) feed these from vars, not literals. The values come from
+#   # the deployment-root fleet.yaml (pushed by `rig fleet up`; persists across reboots):
+#   # {{fleet_ids}} DERIVES from its roster (vehicles[].id — never hand-listed), {{gcs_ip}} from its
+#   # top-level key, and fleet policy like peer_endpoint from its vars: section. rig derives
+#   # {{fleet_peer_ids}} = fleet_ids minus THIS vehicle (no self-dial), and the whole-scalar
+#   # {{map <list> <template>}} form renders a list, so either topology is one line:
 #   #   endpoints: ["tcp/{{gcs_ip}}:7447"]                 # hub-and-spoke via the ground station
 #   #   endpoints: "{{map fleet_peer_ids peer_endpoint}}"  # vehicle mesh ({} = each peer id)
-#   # Test-day changes ride the shell/roster tier, no config edits, recorded in the run snapshot:
-#   #   rig fleet up --var gcs_ip=192.168.44.10            # fleet.yaml roster fan-out
-#   #   RIG_VAR_fleet_ids=1,2,7                            # comma string coerces to a list
-#   #   RIG_VAR_peer_endpoint='tcp/127.0.0.1:744{}'        # SIL on one box: swap the TEMPLATE
+#   # vehicle.yaml vars: are per-deployment fallback defaults only. Test-day changes are one file
+#   # (fleet.yaml: add a roster row, flip peer_endpoint to SIL ports 'tcp/127.0.0.1:744{}') or ride
+#   # the shell tier (rig fleet up --var gcs_ip=192.168.44.10) — always in the run's config snapshot.
 #   connect:
 #     endpoints:                                 # literals: the standalone (non-rig) form
 #       - "tcp/groundstation.example.com:7447"   # DNS or IP; tls/… once link security below is set up
