@@ -3,12 +3,20 @@
 service: zenoh-router
 name: zenoh-router
 
-# Optional inline zenohd config: a mapping rendered verbatim to JSON (a JSON5 subset) and handed to the
-# router (`zenohd -c …`; also exported as ZENOH_ROUTER_CONFIG_URI for rmw_zenohd-image setups). Author it
-# HERE — inline survives `rig bake`; a path to a deployment-local file would not. Omitted fields keep
-# zenohd defaults, so uncomment only the blocks you need. Any file PATHS referenced from inside (TLS
-# certs, auth dictionaries) must ALSO be mounted into the router container — the config overlay mounts
-# only the rendered zenohd.json5 itself.
+# Inline zenohd config — ships ACTIVE below with a few pinned production defaults (gossip discovery
+# on, multicast scouting off, router SHM negotiation off — each restating the rmw_zenohd shipped
+# default so behavior is image-independent); extend it by uncommenting catalog blocks in place. Author config HERE — inline survives `rig bake`;
+# a path to a deployment-local file would not. How it reaches the router depends on the image:
+#  * rmw_zenohd (default): as ZENOH_CONFIG_OVERRIDE leaf pairs applied ON TOP of rmw_zenoh's shipped
+#    router config — keys you don't set keep the shipped tuning (mode: router, the 7447 listener,
+#    multicast scouting OFF). A list you set replaces that whole list; a bad key is a router-log WARN
+#    and ignored, so check `logs` after config changes. (Never fed as ZENOH_ROUTER_CONFIG_URI: a
+#    partial file would REPLACE the shipped config and the router silently stops listening on 7447.)
+#  * standalone eclipse/zenoh: as a mounted zenohd.json5 via `-c` — there, omitted fields take
+#    zenohd's own defaults (router mode + 7447 listener included, but multicast scouting defaults ON —
+#    see the scouting block below).
+# Any file PATHS referenced from inside (TLS certs, auth dictionaries) must ALSO be mounted into the
+# router container — the config overlay mounts only the rendered zenohd.json5 itself.
 #
 # What ACL / downsampling rules match against — rmw_zenoh's key exprs. The 0/ prefix below is
 # ROS_DOMAIN_ID: in a rig deployment write "{{ros_domain_id}}/…" instead — rig interpolates {{var}}
@@ -19,7 +27,7 @@ name: zenoh-router
 #   graph discovery (ros2 topic list, node info)  ->  liveliness tokens under "@ros2_lv/<domain>/**"
 # Wildcards never match @-prefixed chunks: "**" does NOT cover @ros2_lv/… — list those explicitly.
 #
-# router_config:
+router_config:
 #
 #   # -- Topic egress control (ACL): which topics may leave this vehicle -----------------------------
 #   # Subjects classify each link by the network interface it arrived on (host networking, so these are
@@ -76,7 +84,8 @@ name: zenoh-router
 #     - id: uplink-throttle
 #       flows: [egress]
 #       interfaces: [wlan0]
-#       messages: [push]         # data only (zenoh >= 1.3 can also throttle query/reply)
+#       messages: [put]          # data only (query/reply can also be throttled; older zenoh spelled
+#                                # this "push" — now deprecated, the router WARNs)
 #       rules:
 #         - { key_expr: "0/imu/data/**", freq: 5 }   # Hz on the wire; onboard subscribers unaffected
 #         - { key_expr: "0/scan/**", freq: 1 }
@@ -117,33 +126,45 @@ name: zenoh-router
 #     endpoints: ["tcp/[::]:7447"]   # the default; pin an address ("tcp/10.0.0.10:7447") or an
 #                                    # interface ("tcp/0.0.0.0:7447#iface=wlan0") to control exposure
 #
-#   # -- Discovery: multicast scouting OFF keeps vehicles from auto-meshing on shared networks -------
-#   # (deliberate topology instead: routers dial each other via the connect: list above; gossip only
-#   # spreads discovery to sessions, it does not auto-link routers)
-#   scouting:
-#     multicast: { enabled: false }
-#     gossip: { enabled: true }
+  # -- Discovery (ACTIVE) --------------------------------------------------------------------------
+  # Gossip ON is load-bearing: rmw sessions are peers that learn of each other THROUGH this router —
+  # without gossip forwarding, onboard nodes never open their direct data links. Multicast scouting
+  # OFF keeps vehicles from auto-meshing on shared networks (deliberate topology instead: routers
+  # dial each other via the connect: list above; gossip only spreads discovery to sessions, it does
+  # not auto-link routers). Both restate rmw_zenohd's shipped defaults — pinned ACTIVE so behavior
+  # is image-independent (standalone zenohd defaults multicast ON).
+  scouting:
+    multicast: { enabled: false }
+    gossip:
+      enabled: true
+      # multihop: true    # let gossip traverse router-to-router hops (shipped default false — not
+      #                   # needed while sessions only ever discover through their own vehicle router)
 #
-#   # -- Transport tuning + link security ------------------------------------------------------------
-#   transport:
-#     unicast:
-#       compression: { enabled: true }   # negotiated PER LINK: a link compresses only when BOTH ends
-#                                        # enable it (there is no per-endpoint/interface switch).
-#                                        # Onboard rmw_zenoh sessions leave it off by default, so
-#                                        # enabling it here and on the shore/other-vehicle routers
-#                                        # compresses just the inter-router radio links — localhost
-#                                        # session traffic stays uncompressed and costs no CPU
-#     link:
-#       tx: { batch_size: 16384 }        # smaller batches favor latency, larger favor throughput
-#       # TLS gives links an identity that ACL cert_common_names subjects can match (mount /certs into
-#       # the container); usrpwd auth is the lighter equivalent for usernames subjects.
-#       # tls:
-#       #   root_ca_certificate: /certs/minica.pem
-#       #   listen_private_key: /certs/key.pem
-#       #   listen_certificate: /certs/cert.pem
-#       #   enable_mtls: true            # also require + verify client certs
-#     # auth:
-#     #   usrpwd: { user: vehicle1, password: changeme }
+  # -- Transport tuning + link security (ACTIVE) ---------------------------------------------------
+  # SHM negotiation pinned OFF regardless of image: rmw_zenohd's shipped default already disables it,
+  # but a standalone SHM-built zenohd defaults ON — and the router never needs it (onboard data flows
+  # session-to-session; sessions opt in instead, e.g. ros2-bag-logger's `zenoh:` knob). Extend by
+  # uncommenting in place:
+  transport:
+    shared_memory: { enabled: false }
+    # unicast:
+    #   compression: { enabled: true }  # negotiated PER LINK: a link compresses only when BOTH ends
+    #                                   # enable it (there is no per-endpoint/interface switch).
+    #                                   # Onboard rmw_zenoh sessions leave it off by default, so
+    #                                   # enabling it here and on the shore/other-vehicle routers
+    #                                   # compresses just the inter-router radio links — localhost
+    #                                   # session traffic stays uncompressed and costs no CPU
+    # link:
+    #   tx: { batch_size: 16384 }       # smaller batches favor latency, larger favor throughput
+    #   # TLS gives links an identity that ACL cert_common_names subjects can match (mount /certs
+    #   # into the container); usrpwd auth is the lighter equivalent for usernames subjects.
+    #   # tls:
+    #   #   root_ca_certificate: /certs/minica.pem
+    #   #   listen_private_key: /certs/key.pem
+    #   #   listen_certificate: /certs/cert.pem
+    #   #   enable_mtls: true           # also require + verify client certs
+    # auth:
+    #   usrpwd: { user: vehicle1, password: changeme }
 #
 #   # -- Introspection -------------------------------------------------------------------------------
 #   adminspace: { permissions: { read: true, write: false } }   # router admin space, queried at "@/**"

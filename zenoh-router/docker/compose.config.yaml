@@ -1,11 +1,21 @@
 # Overlay applied by zenoh-router-up ONLY when the instance config carries an inline `router_config:`
-# mapping (rendered to var/run/<name>/zenohd.json5 — pure JSON, a JSON5 subset — and mounted read-only).
-# rmw_zenohd (the default command in compose.deploy.yaml) reads ZENOH_ROUTER_CONFIG_URI; a standalone
-# eclipse/zenoh image instead takes `-c` — uncomment the command below (it replaces the deploy one).
+# mapping. Two delivery forms, both rendered by the launcher from that one mapping:
+#
+#  * rmw_zenohd (the default command in compose.deploy.yaml): ZENOH_CONFIG_OVERRIDE — leaf
+#    `path=json;…` pairs applied ON TOP of rmw_zenoh's shipped DEFAULT_RMW_ZENOH_ROUTER_CONFIG.json5,
+#    so its router tuning (mode: router, the tcp/[::]:7447 listener, multicast scouting OFF) survives
+#    for every key you did not set. Do NOT switch this to ZENOH_ROUTER_CONFIG_URI for a partial
+#    config: the URI file REPLACES the shipped config wholesale — mode/listen revert to zenoh library
+#    defaults and the router silently stops listening on 7447. A bad override pair is logged as a
+#    WARN by the router and ignored — check `logs` after config changes.
+#
+#  * standalone eclipse/zenoh: uncomment the command below — plain zenohd takes `-c` with the mounted
+#    zenohd.json5 (it has no override env), and the daemon itself supplies router mode + the default
+#    7447 listener, so a partial file is safe there.
 services:
   router:
     environment:
-      ZENOH_ROUTER_CONFIG_URI: /zenohd.json5
+      ZENOH_CONFIG_OVERRIDE: ${ZENOH_ROUTER_CONFIG_OVERRIDE?set by zenoh-router-up}
     volumes:
       - ${ZENOH_ROUTER_CONFIG_FILE:?set by zenoh-router-up}:/zenohd.json5:ro
-    # command: ["-c", "/zenohd.json5"]   # standalone eclipse/zenoh only (plain zenohd has no URI env)
+    # command: ["-c", "/zenohd.json5"]   # standalone eclipse/zenoh only (see above)

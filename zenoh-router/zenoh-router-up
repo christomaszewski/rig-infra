@@ -11,9 +11,15 @@ CONFIG="${1:?usage: zenoh-router-up <config.yaml> [up [-d]|down|status|logs|conf
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 
 # Parse the instance config once: the name, plus (optionally) an inline `router_config:` mapping — the
-# zenohd config authored INSIDE the instance YAML. It renders to var/run/<name>/zenohd.json5 (sorted JSON,
-# a JSON5 subset) so `rig bake` captures it like any launcher-rendered file, and the config overlay below
-# mounts it. A non-mapping `router_config` is a config error (paths don't bake; inline only).
+# zenohd config authored INSIDE the instance YAML. It renders TWO forms (both from the same mapping, so
+# `rig bake` captures everything like any launcher-rendered file):
+#  * var/run/<name>/zenohd.json5 (sorted JSON, a JSON5 subset) — mounted for the STANDALONE
+#    eclipse/zenoh path (`zenohd -c`), where the daemon itself supplies router mode + the 7447 listener.
+#  * a ZENOH_CONFIG_OVERRIDE string (leaf `path=json;…` pairs) — the rmw_zenohd path. rmw_zenoh applies
+#    these ON TOP of its shipped DEFAULT_RMW_ZENOH_ROUTER_CONFIG.json5. Pointing ZENOH_ROUTER_CONFIG_URI
+#    at a partial file instead would REPLACE that config wholesale — mode/listen fall back to zenoh
+#    library defaults and the router silently stops listening on 7447 (verified empirically).
+# A non-mapping `router_config` is a config error (paths don't bake; inline only).
 NAME_AND_CFG="$("$PYTHON" - "$CONFIG_ABS" "$REPO" <<'PY'
 import json, pathlib, sys
 import yaml
@@ -21,21 +27,41 @@ cfg = yaml.safe_load(open(sys.argv[1])) or {}
 name = str(cfg.get("name") or "zenoh-router")
 rc = cfg.get("router_config")
 rendered = ""
-if isinstance(rc, dict):
+override = ""
+if isinstance(rc, dict) and rc:
     d = pathlib.Path(sys.argv[2]) / "var" / "run" / name
     d.mkdir(parents=True, exist_ok=True)
     p = d / "zenohd.json5"
     p.write_text(json.dumps(rc, indent=2, sort_keys=True) + "\n")
     rendered = str(p)
-elif rc is not None:
+    # Leaf-path pairs: recurse into mappings so untouched shipped defaults survive at the finest
+    # granularity (lists and scalars are leaves — a list you set replaces that list wholesale).
+    pairs = []
+    def leaves(prefix, val):
+        if isinstance(val, dict) and val:
+            for k in sorted(val):
+                leaves(f"{prefix}/{k}" if prefix else str(k), val[k])
+        else:
+            pairs.append((prefix, json.dumps(val, sort_keys=True, separators=(",", ":"))))
+    leaves("", rc)
+    for path, js in pairs:
+        if ";" in path or ";" in js:
+            sys.stderr.write(f"zenoh-router-up: router_config value at '{path}' contains ';' — "
+                             "rmw_zenoh's ZENOH_CONFIG_OVERRIDE parser splits on ';', so this cannot "
+                             "be passed as an override\n")
+            sys.exit(2)
+    override = ";".join(f"{path}={js}" for path, js in pairs)
+elif rc is not None and not isinstance(rc, dict):
     sys.stderr.write("zenoh-router-up: `router_config` must be a YAML mapping (inline zenohd config; "
                      "a file path would not survive `rig bake`)\n")
     sys.exit(2)
-print(name + "\t" + rendered)
+print(name + "\t" + rendered + "\t" + override)
 PY
 )"
 NAME="${NAME_AND_CFG%%$'\t'*}"
-CFG_FILE="${NAME_AND_CFG#*$'\t'}"
+REST="${NAME_AND_CFG#*$'\t'}"
+CFG_FILE="${REST%%$'\t'*}"
+CFG_OVERRIDE="${REST#*$'\t'}"
 export ZENOH_ROUTER_NAME="$NAME"
 
 # rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
@@ -43,6 +69,7 @@ export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-zenoh-router_${NAME}}"
 FILES=(-f "$REPO/docker/compose.deploy.yaml")
 if [ -n "$CFG_FILE" ]; then
   export ZENOH_ROUTER_CONFIG_FILE="$CFG_FILE"
+  export ZENOH_ROUTER_CONFIG_OVERRIDE="$CFG_OVERRIDE"
   FILES+=(-f "$REPO/docker/compose.config.yaml")
 fi
 ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
