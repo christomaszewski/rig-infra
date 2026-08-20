@@ -33,8 +33,11 @@ output:
   max_size_mb: 0           # also roll at N MB (0 = no size split)
   # max_files: 0             # circular logging: keep only the newest N split files, delete the oldest
   #                          # (disk-capped vehicles; requires a time or size split above)
-  # max_cache_mb: 100        # recorder write cache in RAM (rosbag2 default 100); in snapshot mode this
-  #                          # IS the ring buffer of history that .../snapshot flushes to disk
+  # max_cache_mb: 512        # recorder write cache in RAM (rosbag2 default 100). Size to ~5 s of
+  #                          # expected ingest: vehicle storage stalls for 100s of ms under zstd
+  #                          # flushes, and 100 MB is ~1 s at expanded-pointcloud rates. A crash or
+  #                          # power cut loses up to the cache contents (splits bound the window);
+  #                          # in snapshot mode this IS the ring buffer .../snapshot flushes to disk
 
 # Runtime control (triggered logging): the recorder is a normal ROS 2 node with a PINNED name (default:
 # `name`, sanitized), so rosbag2's own control services sit at stable paths:
@@ -51,16 +54,26 @@ output:
 #                          # .../snapshot (incident capture — nothing is written until triggered)
 #   use_sim_time: false    # SITL/sim rigs: stamp messages from /clock
 
-# Zenoh shared memory (rmw_zenoh only — ships DISABLED): same-host transport for big topics
-# (pointclouds). Opt-in is per session AND per link: data moves over SHM only where the PUBLISHER's
-# session also enabled it and both containers share the host IPC namespace (this service's compose
-# sets ipc:host; the publisher's must too). Anything unmet = silent TCP-loopback fallback — verify by
-# watching `lo` traffic collapse, not by the config. Keep every SHM participant on the same distro's
-# zenoh (fleet-ros holds this by construction). Renders as a record.sh preamble that patches a copy
-# of the image's shipped session config; inert under other RMWs, and skipped (with a log line) if the
-# deployment already sets ZENOH_SESSION_CONFIG_URI.
+# Zenoh session tweaks (rmw_zenoh only; inert under other RMWs). Rendered into record.sh as one
+# ZENOH_CONFIG_OVERRIDE export — rmw_zenoh applies the pairs ON TOP of the session config it loads
+# (its shipped ROS default, or your ZENOH_SESSION_CONFIG_URI file), so untouched keys keep their
+# ROS-tuned values; a bad key is a WARN in the recorder log and ignored, so check `logs` after
+# changes. Shared memory ships DISABLED in rmw_zenoh and engages per link only where the PUBLISHER's
+# session also opted in AND both containers share the host IPC namespace (this service's compose
+# sets ipc:host; the publisher's must too) — anything unmet = silent TCP-loopback fallback, so
+# verify by watching `lo` traffic collapse, not by the config. Keep every SHM participant on the
+# same distro's zenoh (fleet-ros holds this by construction).
 # zenoh:
-#   shared_memory: true
-#   shm_pool_mb: 256       # SHM pool for messages THIS session publishes (default 48 MB ≈ 8-16
-#                          # pointclouds) — mostly moot for this subscriber-only service; the knob
-#                          # that matters is the publisher's
+#   shared_memory: true    # sugar for transport/shared_memory/enabled=true
+#   shm_pool_mb: 8         # sugar for …/transport_optimization/pool_size — sizes the SHM pool for
+#                          # what THIS session publishes (rmw default 48 MB): tiny suffices here,
+#                          # the logger only publishes rosout/recorder events; the pool that matters
+#                          # for pointclouds is the PUBLISHER's. Never set the ZENOH_SHM_ALLOC_SIZE
+#                          # env instead — it aliases the same key and silently overrides this knob.
+#                          # (No need to trim RMW_ZENOH_BUFFER_POOL_MAX_SIZE_BYTES for a subscriber-
+#                          # only node either: that publish-path cap is lazy, not a reservation.)
+#   overrides:             # any zenoh session-config subtree, flattened to leaf overrides and
+#     transport:           # applied LAST (wins over the sugar above on conflict)
+#       link: { rx: { buffer_size: 1048576 } }   # per-link read buffer (default 64 KiB): helps
+#                          # sustained ingest of big topics arriving over TCP (one buffer per peer
+#                          # link; topics riding SHM bypass this path entirely)

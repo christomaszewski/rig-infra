@@ -32,6 +32,7 @@ restart writes a NEW bag instead of failing on an existing dir — and ``config`
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import shlex
@@ -46,14 +47,6 @@ DEFAULT_IMAGE_EXCLUDE = r".*/image_raw(/.*)?$"
 
 STORAGE_PRESETS = ("none", "fastwrite", "zstd_fast", "zstd_small")
 
-# zenoh.shared_memory: line-oriented patch of the SHIPPED session config (first `enabled: false`
-# inside the `shared_memory: {` block -> true; first `pool_size:` there -> pool bytes, when given).
-# ZENOH_SESSION_CONFIG_URI REPLACES the default wholesale, so a hand-rolled minimal config would
-# silently drop rmw_zenoh's ROS defaults (peer mode, connect to localhost:7447) — patch a copy instead.
-AWK_SHM = (r'/shared_memory: \{/ && !d {s=1} '
-           r's && /enabled: false/ {sub(/enabled: false/, "enabled: true"); if (pool+0 == 0) {s=0; d=1}} '
-           r's && pool+0 > 0 && /pool_size:/ {sub(/pool_size: *[0-9]+/, "pool_size: " pool); s=0; d=1} '
-           r'{print}')
 
 
 def _all_or_names(args: list[str], val, key: str, all_flag: str, list_flag: str) -> None:
@@ -175,51 +168,67 @@ def build_args(cfg: dict) -> tuple[str, str, str, list[str], list[str]]:
     return name, str(out.get("subdir") or "bags"), node, args, warns
 
 
-def zenoh_shm_lines(cfg: dict, warns: list[str]) -> str:
-    """record.sh preamble for `zenoh:` (shared_memory / shm_pool_mb) — empty string when off.
-    Runtime-guarded on RMW_IMPLEMENTATION (the knob is inert under other RMWs) and skipped when the
-    deployment already owns ZENOH_SESSION_CONFIG_URI. An unpatchable config (format drift in a future
-    distro) warns rather than half-enabling: cmp catching an unchanged copy means SHM stays OFF."""
+def zenoh_env_lines(cfg: dict, warns: list[str]) -> str:
+    """record.sh preamble for `zenoh:` (shared_memory / shm_pool_mb sugar + a generic `overrides:`
+    mapping) — empty string when the block is absent. Renders one ZENOH_CONFIG_OVERRIDE export:
+    rmw_zenoh applies the `path=json;…` pairs ON TOP of whatever session config it loads (its
+    shipped ROS default, or a deployment-set ZENOH_SESSION_CONFIG_URI file), so every key not set
+    here keeps its ROS-tuned value. Appends after any pre-existing container-level override (ours
+    later = ours wins on conflict); runtime-guarded on RMW_IMPLEMENTATION (inert under other RMWs).
+    rmw logs a bad pair as a WARN and ignores it — it cannot hard-fail the recorder."""
     zn = cfg.get("zenoh") or {}
     if not isinstance(zn, dict):
         raise SystemExit("bag_cmd: `zenoh` must be a mapping")
-    unknown = set(zn) - {"shared_memory", "shm_pool_mb"}
+    unknown = set(zn) - {"shared_memory", "shm_pool_mb", "overrides"}
     if unknown:
         raise SystemExit(f"bag_cmd: unknown zenoh key(s): {', '.join(sorted(unknown))} "
-                         "(zenoh.shared_memory, zenoh.shm_pool_mb)")
+                         "(zenoh.shared_memory, zenoh.shm_pool_mb, zenoh.overrides)")
     pool_mb = int(zn.get("shm_pool_mb") or 0)
     if pool_mb < 0:
         raise SystemExit("bag_cmd: zenoh.shm_pool_mb must be a size in MB")
-    if not zn.get("shared_memory"):
+    if pool_mb and not zn.get("shared_memory"):
+        warns.append("zenoh.shm_pool_mb without zenoh.shared_memory: true — ignored")
+
+    pairs: list[tuple[str, str]] = []
+    if zn.get("shared_memory"):
+        pairs.append(("transport/shared_memory/enabled", "true"))
         if pool_mb:
-            warns.append("zenoh.shm_pool_mb without zenoh.shared_memory: true — ignored")
+            pairs.append(("transport/shared_memory/transport_optimization/pool_size",
+                          str(pool_mb * 1024 * 1024)))
+    ov = zn.get("overrides")
+    if ov is not None and not isinstance(ov, dict):
+        raise SystemExit("bag_cmd: zenoh.overrides must be a mapping (nested zenoh session config)")
+    if ov:  # flatten to leaf paths AFTER the sugar: explicit overrides win on conflict (later wins)
+        def leaves(prefix: str, val) -> None:
+            if isinstance(val, dict) and val:
+                for k in sorted(val):
+                    leaves(f"{prefix}/{k}" if prefix else str(k), val[k])
+            else:
+                pairs.append((prefix, json.dumps(val, sort_keys=True, separators=(",", ":"))))
+        leaves("", ov)
+    if not pairs:
         return ""
+    for path, js in pairs:
+        if ";" in path or ";" in js:
+            raise SystemExit(f"bag_cmd: zenoh override at '{path}' contains ';' — rmw_zenoh's "
+                             "ZENOH_CONFIG_OVERRIDE parser splits on ';'")
+    ov_str = shlex.quote(";".join(f"{p}={v}" for p, v in pairs))
     return (
-        "# zenoh.shared_memory: patch a copy of the shipped session config (SHM ships disabled) and\n"
-        "# point this session at it. SHM engages per link only where the publisher opted in too AND\n"
-        "# the containers share the host IPC namespace (compose sets ipc:host) — otherwise zenoh\n"
-        "# falls back to TCP loopback silently.\n"
+        "# zenoh: overrides applied by rmw_zenoh ON TOP of the session config it loads (shipped ROS\n"
+        "# default, or the ZENOH_SESSION_CONFIG_URI file if the deployment sets one). SHM additionally\n"
+        "# needs ipc:host (compose sets it) AND the publisher's session opted in — silent TCP-loopback\n"
+        "# fallback otherwise. Bad keys are WARNs in this log; check after config changes.\n"
         'if [ "${RMW_IMPLEMENTATION:-}" = "rmw_zenoh_cpp" ]; then\n'
-        '  if [ -n "${ZENOH_SESSION_CONFIG_URI:-}" ]; then\n'
-        '    echo "ros2-bag-logger: zenoh.shared_memory skipped — ZENOH_SESSION_CONFIG_URI already set" >&2\n'
-        '  else\n'
-        '    def="/opt/ros/${ROS_DISTRO:-}/share/rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_SESSION_CONFIG.json5"\n'
-        '    if [ -f "$def" ] && awk -v pool=' + str(pool_mb * 1024 * 1024) + " '" + AWK_SHM + "'"
-        ' "$def" > /tmp/zenoh_session_shm.json5 && ! cmp -s "$def" /tmp/zenoh_session_shm.json5; then\n'
-        '      export ZENOH_SESSION_CONFIG_URI=/tmp/zenoh_session_shm.json5\n'
-        '      echo "ros2-bag-logger: zenoh shared memory ON (ZENOH_SESSION_CONFIG_URI=$ZENOH_SESSION_CONFIG_URI)" >&2\n'
-        '    else\n'
-        '      echo "ros2-bag-logger: WARNING could not patch shared_memory in $def — SHM NOT enabled" >&2\n'
-        '    fi\n'
-        '  fi\n'
-        'fi\n'
+        '  export ZENOH_CONFIG_OVERRIDE="${ZENOH_CONFIG_OVERRIDE:+$ZENOH_CONFIG_OVERRIDE;}"' + ov_str + "\n"
+        '  echo "ros2-bag-logger: ZENOH_CONFIG_OVERRIDE=$ZENOH_CONFIG_OVERRIDE" >&2\n'
+        "fi\n"
     )
 
 
 def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str]:
     """Write var/run/<name>/record.sh and return (name, script-path)."""
     name, subdir, node, args, warns = build_args(cfg)
-    shm = zenoh_shm_lines(cfg, warns)
+    shm = zenoh_env_lines(cfg, warns)
     for w in warns:
         sys.stderr.write("ros2-bag-logger: " + w + "\n")
     argv = " ".join(shlex.quote(a) for a in args)
