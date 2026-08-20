@@ -20,3 +20,4 @@ launch_surface:
   - ros2-bag-logger-up
   - tools/bag_cmd.py
   - docker/compose.deploy.yaml
+  - docker/compose.shm.yaml   # applied only when the config effectively enables zenoh shared memory

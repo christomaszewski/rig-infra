@@ -168,9 +168,12 @@ def build_args(cfg: dict) -> tuple[str, str, str, list[str], list[str]]:
     return name, str(out.get("subdir") or "bags"), node, args, warns
 
 
-def zenoh_env_lines(cfg: dict, warns: list[str]) -> str:
+def zenoh_env_lines(cfg: dict, warns: list[str]) -> tuple[str, bool]:
     """record.sh preamble for `zenoh:` (shared_memory / shm_pool_mb sugar + a generic `overrides:`
-    mapping) — empty string when the block is absent. Renders one ZENOH_CONFIG_OVERRIDE export:
+    mapping) — empty when the block is absent — plus the EFFECTIVE shared-memory state (last pair
+    for the enabled key wins, so an overrides: entry can veto the sugar). The launcher keys the
+    ipc:host compose overlay off that flag: the container only gives up IPC-namespace isolation
+    when SHM can actually use it. Renders one ZENOH_CONFIG_OVERRIDE export:
     rmw_zenoh applies the `path=json;…` pairs ON TOP of whatever session config it loads (its
     shipped ROS default, or a deployment-set ZENOH_SESSION_CONFIG_URI file), so every key not set
     here keeps its ROS-tuned value. Appends after any pre-existing container-level override (ours
@@ -207,28 +210,30 @@ def zenoh_env_lines(cfg: dict, warns: list[str]) -> str:
                 pairs.append((prefix, json.dumps(val, sort_keys=True, separators=(",", ":"))))
         leaves("", ov)
     if not pairs:
-        return ""
+        return "", False
     for path, js in pairs:
         if ";" in path or ";" in js:
             raise SystemExit(f"bag_cmd: zenoh override at '{path}' contains ';' — rmw_zenoh's "
                              "ZENOH_CONFIG_OVERRIDE parser splits on ';'")
+    effective = {p: v for p, v in pairs}
+    shm_on = effective.get("transport/shared_memory/enabled") == "true"
     ov_str = shlex.quote(";".join(f"{p}={v}" for p, v in pairs))
     return (
         "# zenoh: overrides applied by rmw_zenoh ON TOP of the session config it loads (shipped ROS\n"
         "# default, or the ZENOH_SESSION_CONFIG_URI file if the deployment sets one). SHM additionally\n"
-        "# needs ipc:host (compose sets it) AND the publisher's session opted in — silent TCP-loopback\n"
-        "# fallback otherwise. Bad keys are WARNs in this log; check after config changes.\n"
+        "# needs ipc:host (the launcher's compose overlay adds it when SHM is on) AND the publisher's\n"
+        "# session opted in — silent TCP-loopback fallback otherwise. Bad keys are WARNs in this log.\n"
         'if [ "${RMW_IMPLEMENTATION:-}" = "rmw_zenoh_cpp" ]; then\n'
         '  export ZENOH_CONFIG_OVERRIDE="${ZENOH_CONFIG_OVERRIDE:+$ZENOH_CONFIG_OVERRIDE;}"' + ov_str + "\n"
         '  echo "ros2-bag-logger: ZENOH_CONFIG_OVERRIDE=$ZENOH_CONFIG_OVERRIDE" >&2\n'
         "fi\n"
-    )
+    ), shm_on
 
 
-def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str]:
-    """Write var/run/<name>/record.sh and return (name, script-path)."""
+def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str, bool]:
+    """Write var/run/<name>/record.sh and return (name, script-path, shm-enabled)."""
     name, subdir, node, args, warns = build_args(cfg)
-    shm = zenoh_env_lines(cfg, warns)
+    shm, shm_on = zenoh_env_lines(cfg, warns)
     for w in warns:
         sys.stderr.write("ros2-bag-logger: " + w + "\n")
     argv = " ".join(shlex.quote(a) for a in args)
@@ -254,7 +259,7 @@ def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str]:
         f'exec ros2 bag record {argv} -o "$out"\n'
     )
     script.chmod(0o755)
-    return name, str(script)
+    return name, str(script), shm_on
 
 
 def main() -> int:
@@ -262,8 +267,8 @@ def main() -> int:
         sys.stderr.write("usage: bag_cmd.py <config.yaml> <repo-dir>\n")
         return 2
     cfg = yaml.safe_load(open(sys.argv[1])) or {}
-    name, script = render(cfg, pathlib.Path(sys.argv[2]))
-    print(name + "\t" + script)
+    name, script, shm_on = render(cfg, pathlib.Path(sys.argv[2]))
+    print(name + "\t" + script + "\t" + ("shm" if shm_on else ""))
     return 0
 
 

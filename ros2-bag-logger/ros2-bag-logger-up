@@ -13,16 +13,22 @@ CONFIG="${1:?usage: ros2-bag-logger-up <config.yaml> [up [-d]|down|status|logs|c
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 
 # config -> the exact `ros2 bag record` command, rendered to var/run/<name>/record.sh (captured by
-# `rig bake` like any launcher-rendered file). bag_cmd prints "<name>\t<script-path>".
+# `rig bake` like any launcher-rendered file). bag_cmd prints "<name>\t<script-path>\t<shm-flag>";
+# the flag ("shm" when zenoh shared memory is EFFECTIVELY on) gates the ipc:host compose overlay —
+# the container only gives up IPC-namespace isolation when SHM can actually use it.
 NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/bag_cmd.py" "$CONFIG_ABS" "$REPO")"
 NAME="${NAME_AND_SCRIPT%%$'\t'*}"
-SCRIPT="${NAME_AND_SCRIPT#*$'\t'}"
+REST="${NAME_AND_SCRIPT#*$'\t'}"
+SCRIPT="${REST%%$'\t'*}"
+SHM_FLAG="${REST#*$'\t'}"
 export BAG_LOGGER_NAME="$NAME"
 export BAG_RECORD_SCRIPT="$SCRIPT"
 
 # rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros2-bag-logger_${NAME}}"
+FILES=(-f "$REPO/docker/compose.deploy.yaml")
+[ "$SHM_FLAG" = "shm" ] && FILES+=(-f "$REPO/docker/compose.shm.yaml")
 ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
 [ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
-echo "ros2-bag-logger-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} script=$SCRIPT" >&2
-exec docker compose -f "$REPO/docker/compose.deploy.yaml" "${ARGS[@]}"
+echo "ros2-bag-logger-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} script=$SCRIPT${SHM_FLAG:+ shm=on}" >&2
+exec docker compose "${FILES[@]}" "${ARGS[@]}"

@@ -1,0 +1,8 @@
+# Overlay applied by ros2-bag-logger-up ONLY when the instance config EFFECTIVELY enables zenoh
+# shared memory (`zenoh.shared_memory: true`, or an equivalent `zenoh.overrides:` leaf — an
+# overrides entry disabling it wins and drops this overlay). Zenoh SHM maps the publisher's
+# segments, so both containers must share the host IPC namespace; keeping this conditional means
+# the logger only gives up IPC-namespace isolation when SHM can actually use it.
+services:
+  bag-logger:
+    ipc: host

@@ -59,9 +59,10 @@ output:
 # (its shipped ROS default, or your ZENOH_SESSION_CONFIG_URI file), so untouched keys keep their
 # ROS-tuned values; a bad key is a WARN in the recorder log and ignored, so check `logs` after
 # changes. Shared memory ships DISABLED in rmw_zenoh and engages per link only where the PUBLISHER's
-# session also opted in AND both containers share the host IPC namespace (this service's compose
-# sets ipc:host; the publisher's must too) — anything unmet = silent TCP-loopback fallback, so
-# verify by watching `lo` traffic collapse, not by the config. Keep every SHM participant on the
+# session also opted in AND both containers share the host IPC namespace (the launcher adds the
+# ipc:host overlay here automatically when SHM is effectively on; the PUBLISHER's container must set
+# it itself) — anything unmet = silent TCP-loopback fallback, so verify by watching `lo` traffic
+# collapse, not by the config. Keep every SHM participant on the
 # same distro's zenoh (fleet-ros holds this by construction).
 # zenoh:
 #   shared_memory: true    # sugar for transport/shared_memory/enabled=true
