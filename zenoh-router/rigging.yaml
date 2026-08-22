@@ -13,7 +13,16 @@ examples: [config/zenoh-router.example.yaml]   # default config for `rig certify
 # Default image: the shared fleet-ros base (rmw_zenoh from the SAME distro packages as the sessions —
 # the router/session version-match holds by construction). `rig build` builds + pushes it; certify
 # enforces the compose pulls it as :RIG_IMAGE_TAG (build/pull agreement).
-build: { command: ../base/build.sh, images: [fleet-ros] }
+#
+# `provides: base` (rig >= v0.2.21) declares fleet-ros the DEPLOYMENT's base image: rig builds it
+# FIRST and exports <registry>/fleet-ros:<tag> to every other build command and launcher as
+# RIG_BASE_IMAGE, so the whole fleet's distro + rmw layer comes from one image (this compose RUNS
+# it; a service that builds its own image should build FROM it). ros2-bag-logger declares the SAME
+# image from the SAME script, so rig dedupes the two into one base built once — two providers naming
+# DIFFERENT images would be an ERROR, never a guess. vehicle.yaml `images.base` overrides with an
+# external ref: rig then skips this build (nothing would pull fleet-ros) and the compose runs that
+# image instead.
+build: { command: ../base/build.sh, images: [fleet-ros], provides: base }
 # Standalone alternative: point ZENOH_ROUTER_IMAGE at a PINNED eclipse/zenoh (e.g. eclipse/zenoh:1.2.1
 # — never :latest, mirrored tags can silently drift on re-mirror), swap this `build:` for
 # `mirror: [eclipse/zenoh:1.2.1]`, and see the command note in docker/compose.deploy.yaml.

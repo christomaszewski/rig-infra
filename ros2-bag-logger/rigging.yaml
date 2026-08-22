@@ -15,7 +15,13 @@ examples: [config/ros2-bag-logger.example.yaml]   # default config for `rig cert
 # no longer pulls a 3+ GB driver image just to record bags. `rig build` builds + pushes it; certify
 # enforces the compose pulls it as :RIG_IMAGE_TAG. Override via BAG_LOGGER_IMAGE (e.g. a driver image
 # that already carries both — then swap this `build:` for a `mirror:` of whatever you point at).
-build: { command: ../base/build.sh, images: [fleet-ros] }
+#
+# `provides: base` (rig >= v0.2.21) declares fleet-ros the DEPLOYMENT's base image — the same
+# declaration zenoh-router carries, naming the same image from the same script, so rig treats them
+# as ONE base: built first, exported to every other build and launcher as RIG_BASE_IMAGE. Keeping it
+# on BOTH riggings is deliberate: either service alone in a deployment still supplies the fleet's
+# base. (vehicle.yaml `images.base` overrides it with an external ref; rig then skips this build.)
+build: { command: ../base/build.sh, images: [fleet-ros], provides: base }
 launch_surface:
   - ros2-bag-logger-up
   - tools/bag_cmd.py

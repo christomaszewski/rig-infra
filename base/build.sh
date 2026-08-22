@@ -2,19 +2,49 @@
 # fleet-ros image build — the rig build contract: build.sh <registry> [tag].
 #
 # Declared by zenoh-router and ros2-bag-logger as
-#   build: { command: ../base/build.sh, images: [fleet-ros] }
-# (rig runs it with cwd = the service dir; this script self-locates, so the double invocation when
-# both services are in one manifest is a docker-cache no-op building the identical image twice).
+#   build: { command: ../base/build.sh, images: [fleet-ros], provides: base }
+# `provides: base` (rig >= v0.2.21) makes fleet-ros the DEPLOYMENT's base image: images[0] names it,
+# rig composes the ref exactly like the pull side (<registry>/fleet-ros:<tag>), builds it as stage 0
+# — before every other service — and exports it to every OTHER build command and to every launcher
+# as RIG_BASE_IMAGE. Both services name the same image from the same script, so rig dedupes them by
+# resolved script path and this runs ONCE per `rig build`; run standalone, the double invocation is
+# a docker-cache no-op building the identical image twice.
 #
-# ROS_DISTRO selects the base distro: `rig build` (≥ v0.1.29) exports it from vehicle.yaml's
-# `ros.distro` automatically, so the image bakes the fleet's distro; the default (lyrical) applies
-# only when run standalone outside rig.
+# Env (the argv contract stays `<cmd> <registry> [tag]`; the rest arrives through the environment):
+#   ROS_DISTRO          vehicle.yaml `ros.distro` (rig >= v0.1.29): the distro this image bakes, so
+#                       the router and the sessions get one set of zenoh packages. The default
+#                       (lyrical) applies only outside rig.
+#   RIG_BUILD_NO_CACHE  `rig build --no-cache`: full rebuild, no layer cache — the way to re-converge
+#                       apt-level drift across a fleet's images after `rig image audit` reports skew.
+#   RIG_ROS_RMW         vehicle.yaml `ros.rmw` (rig >= v0.2.23): the rmw this image installs, as
+#                       ros-<distro>-<name, '_' -> '-'> — the same mapping `rig image audit` uses to
+#                       check it, so the builder and the checker agree by construction. Rig-owned
+#                       and set-or-popped; deliberately NOT the conventional RMW_IMPLEMENTATION,
+#                       which most ROS shells export (a dev box's .bashrc must not decide what a
+#                       fleet image contains).
+#                       NOTE the consequence: on a non-zenoh fleet this image carries no
+#                       rmw_zenoh_cpp, so it cannot run `rmw_zenohd` — zenoh-router requires
+#                       `ros.rmw: rmw_zenoh_cpp` when it runs on fleet-ros. rig's doctor WARNs on
+#                       that combination at preflight; see the README for the standalone router
+#                       path a non-zenoh fleet would use instead.
+#   FLEET_ROS_RMW       the same choice for builds OUTSIDE rig (standalone `./base/build.sh`), where
+#                       nothing sets RIG_ROS_RMW. RIG_ROS_RMW wins when both are set.
+#   RIG_BASE_IMAGE      NOT consumed, deliberately: fleet-ros IS the deployment's base image and
+#                       cannot be built FROM itself, so rig pops the variable for this stage-0 build.
+#                       (An explicit vehicle.yaml `images.base` doesn't re-parent fleet-ros either —
+#                       it REPLACES it: rig skips this build entirely and the composes run that ref.)
 set -eu
 registry="${1:?usage: build.sh <registry> [tag]}"
 tag="${2:-latest}"
 base_dir="$(cd "$(dirname "$0")" && pwd)"
 ref="${registry}/fleet-ros:${tag}"
+distro="${ROS_DISTRO:-lyrical}"
+rmw="${RIG_ROS_RMW:-${FLEET_ROS_RMW:-rmw_zenoh_cpp}}"
 
-echo "fleet-ros: building ${ref} (ROS_DISTRO=${ROS_DISTRO:-lyrical})" >&2
-docker build --build-arg "ROS_DISTRO=${ROS_DISTRO:-lyrical}" -t "$ref" "$base_dir"
+echo "fleet-ros: building ${ref} (ROS_DISTRO=${distro} rmw=${rmw})${RIG_BUILD_NO_CACHE:+ --no-cache}" >&2
+# Unquoted on purpose: ${VAR:+--no-cache} expands to exactly one word or none (safe under `set -u`).
+docker build ${RIG_BUILD_NO_CACHE:+--no-cache} \
+    --build-arg "ROS_DISTRO=${distro}" \
+    --build-arg "RMW_IMPLEMENTATION=${rmw}" \
+    -t "$ref" "$base_dir"
 docker push "$ref"

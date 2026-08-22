@@ -7,9 +7,17 @@
 # exactly that; point BAG_LOGGER_IMAGE at a driver image only if you prefer reusing one that already has
 # both. The recorder runs via `command:` so the image's ROS-sourcing entrypoint still runs; record.sh
 # also sources ROS defensively.
+#
+# Resolution, outermost first: BAG_LOGGER_IMAGE (this instance's explicit override) -> RIG_BASE_IMAGE
+# (the DEPLOYMENT's base image — rig exports it from this rigging's `provides: base`, or from
+# vehicle.yaml `images.base` when the fleet declares an external one; recording from the fleet's base
+# is how the logger's rmw packages stay identical to the router's) -> the composed fleet-ros pull ref,
+# which is what certify renders (it never inherits a RIG_BASE_IMAGE) and what a standalone
+# `docker compose` outside rig gets. An external base must still carry rosbag2 + the fleet's rmw —
+# `rig image audit` checks exactly that.
 services:
   bag-logger:
-    image: ${BAG_LOGGER_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}
+    image: ${BAG_LOGGER_IMAGE:-${RIG_BASE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}}
     network_mode: host            # join the graph / reach the zenoh router at localhost:7447
     restart: unless-stopped
     environment:

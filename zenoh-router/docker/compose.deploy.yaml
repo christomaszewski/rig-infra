@@ -5,12 +5,18 @@
 # fidelity, and the router + sessions share one distro's zenoh packages by construction (rig build
 # pushes fleet-ros; certify enforces the tag agreement).
 #
+# IMAGE resolution, outermost first: ZENOH_ROUTER_IMAGE (this instance's explicit override) ->
+# RIG_BASE_IMAGE (the DEPLOYMENT's base image — rig exports it from this rigging's `provides: base`,
+# or from vehicle.yaml `images.base` when the fleet declares an external one; the router RUNS the
+# base directly) -> the composed fleet-ros pull ref. The fallback is what certify renders (it never
+# inherits a RIG_BASE_IMAGE) and what a standalone `docker compose` outside rig gets.
+#
 # Standalone alternative: set ZENOH_ROUTER_IMAGE to a PINNED eclipse/zenoh (e.g. eclipse/zenoh:1.2.1,
 # never :latest) — its own entrypoint runs `zenohd`, so ALSO comment out the `command:` below (and see
 # the `-c` note in compose.config.yaml if you use an inline `router_config:`).
 services:
   router:
-    image: ${ZENOH_ROUTER_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}
+    image: ${ZENOH_ROUTER_IMAGE:-${RIG_BASE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}}
     network_mode: host            # nodes reach the router at localhost:7447
     restart: unless-stopped
     environment:

@@ -4,6 +4,11 @@ name: certify
 # poisoned fleet env and asserts the contract held — project name honored, images pulled from
 # RIG_IMAGE_REGISTRY, BUILT images pulled as :RIG_IMAGE_TAG (build/pull agreement with base/build.sh),
 # fleet ROS env unmangled, deterministic output, identity derived from the config name.
+#
+# The last two steps cover what certify structurally cannot: certify pops RIG_BASE_IMAGE (the
+# deployment's base image is optional, and launchers carry a fallback), so both sides of that
+# contract — the composes RUNNING an exported base, and base/build.sh honoring the rig-owned build
+# env — are checked here directly.
 on:
   push: { branches: [main] }
   pull_request:
@@ -30,6 +35,70 @@ jobs:
         run: ./.rig/rig certify --repo ros2-bag-logger
       - name: certify ros1-bag-logger
         run: ./.rig/rig certify --repo ros1-bag-logger
-      # The fleet-ros build script parses (its docker build/push only runs against a real registry).
-      - name: base/build.sh syntax
-        run: sh -n base/build.sh
+      # RIG_BASE_IMAGE, consumer side: with a base exported the stacks RUN it; with none — certify's
+      # view, and a standalone `docker compose` — they fall back to the composed fleet-ros pull ref.
+      # A per-instance ${<SVC>_IMAGE} override still beats both.
+      - name: composes honor RIG_BASE_IMAGE
+        env:
+          RIG_IMAGE_REGISTRY: devbox:5000
+          RIG_IMAGE_TAG: v1.3.0
+        run: |
+          set -eu
+          rendered() {   # <base-ref-or-empty> <service> [EXTRA=VAL ...] -> the compose's image ref
+            base="$1"; svc="$2"; shift 2
+            [ -z "$base" ] || set -- "RIG_BASE_IMAGE=$base" "$@"
+            env "$@" "./$svc/$svc-up" "$svc/config/$svc.example.yaml" config \
+              | sed -n 's/^ *image: //p'   # launcher banners go to stderr -> the step log, not here
+          }
+          expect() {     # <label> <want> <got>
+            [ "$2" = "$3" ] || { echo "::error::$1: expected '$2', got '$3'"; exit 1; }
+            echo "  ok  $1 -> $3"
+          }
+          BASE=nvcr.io/vendor/l4t-ros:36.4
+          for svc in zenoh-router ros2-bag-logger; do
+            expect "$svc fallback (certify's view)" "devbox:5000/fleet-ros:v1.3.0" "$(rendered '' $svc)"
+            expect "$svc runs the base"             "$BASE"                        "$(rendered $BASE $svc)"
+          done
+          expect "instance override wins" "eclipse/zenoh:1.2.1" \
+                 "$(rendered $BASE zenoh-router ZENOH_ROUTER_IMAGE=eclipse/zenoh:1.2.1)"
+
+      # Provider side: the fleet-ros build script parses, opts into `rig build --no-cache`, installs
+      # the rmw the fleet declares (RIG_ROS_RMW, rig >= v0.2.23), and ignores RIG_BASE_IMAGE —
+      # fleet-ros IS the base, so the stage-0 build must stay FROM the stock ROS base even if the
+      # variable leaks in. A stub `docker` on PATH records the argv, so this needs no daemon and no
+      # registry (the real build/push only runs against one).
+      - name: base/build.sh syntax + build env contract
+        run: |
+          set -eu
+          sh -n base/build.sh
+          mkdir -p /tmp/stub
+          cat > /tmp/stub/docker <<'STUB'
+          #!/bin/sh
+          echo "docker $*" >> /tmp/stub/argv
+          STUB
+          chmod +x /tmp/stub/docker
+          export PATH=/tmp/stub:$PATH ROS_DISTRO=lyrical
+          build() {   # <label> <expected rmw> [ENV=VAL ...] — run build.sh, assert the rmw build-arg
+            label="$1"; want="$2"; shift 2
+            : > /tmp/stub/argv
+            env "$@" ./base/build.sh devbox:5000 v1.3.0
+            grep -q -- "--build-arg RMW_IMPLEMENTATION=$want" /tmp/stub/argv || {
+              echo "::error::$label: expected RMW_IMPLEMENTATION=$want"; cat /tmp/stub/argv; exit 1; }
+            echo "  ok  $label -> $want"
+          }
+          # rmw precedence: rig's var wins, the standalone knob is the fallback, then the default.
+          build "RIG_ROS_RMW (rig-wired)"   rmw_cyclonedds_cpp RIG_ROS_RMW=rmw_cyclonedds_cpp
+          build "FLEET_ROS_RMW (standalone)" rmw_fastrtps_cpp  FLEET_ROS_RMW=rmw_fastrtps_cpp
+          build "RIG_ROS_RMW beats FLEET_ROS_RMW" rmw_cyclonedds_cpp \
+                RIG_ROS_RMW=rmw_cyclonedds_cpp FLEET_ROS_RMW=rmw_fastrtps_cpp
+          build "neither set -> zenoh default" rmw_zenoh_cpp
+          # --no-cache is opt-in; RIG_BASE_IMAGE must NOT reach the base build even when it leaks in.
+          : > /tmp/stub/argv
+          RIG_BUILD_NO_CACHE=1 ./base/build.sh devbox:5000 v1.3.0
+          grep -q -- 'docker build --no-cache .*--build-arg ROS_DISTRO=lyrical' /tmp/stub/argv || {
+            echo "::error::RIG_BUILD_NO_CACHE=1 did not reach docker build"; cat /tmp/stub/argv; exit 1; }
+          : > /tmp/stub/argv
+          RIG_BASE_IMAGE=nvcr.io/vendor/l4t-ros:36.4 ./base/build.sh devbox:5000 v1.3.0
+          ! grep -qE -- '--no-cache|nvcr\.io' /tmp/stub/argv || {
+            echo "::error::the base build consumed a variable it must ignore"; cat /tmp/stub/argv; exit 1; }
+          echo "  ok  build.sh: --no-cache opt-in, RIG_BASE_IMAGE ignored"
