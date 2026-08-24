@@ -92,13 +92,15 @@ jobs:
           build "RIG_ROS_RMW beats FLEET_ROS_RMW" rmw_cyclonedds_cpp \
                 RIG_ROS_RMW=rmw_cyclonedds_cpp FLEET_ROS_RMW=rmw_fastrtps_cpp
           build "neither set -> zenoh default" rmw_zenoh_cpp
-          # --no-cache is opt-in; RIG_BASE_IMAGE must NOT reach the base build even when it leaks in.
+          # --no-cache is opt-in, and --pull rides with it: a deliberate refresh must re-pull the
+          # ros base parent (the version authority) or the "fresh" build reuses the stale local
+          # parent. RIG_BASE_IMAGE must NOT reach the base build even when it leaks in.
           : > /tmp/stub/argv
           RIG_BUILD_NO_CACHE=1 ./base/build.sh devbox:5000 v1.3.0
-          grep -q -- 'docker build --no-cache .*--build-arg ROS_DISTRO=lyrical' /tmp/stub/argv || {
-            echo "::error::RIG_BUILD_NO_CACHE=1 did not reach docker build"; cat /tmp/stub/argv; exit 1; }
+          grep -q -- 'docker build --no-cache --pull .*--build-arg ROS_DISTRO=lyrical' /tmp/stub/argv || {
+            echo "::error::RIG_BUILD_NO_CACHE=1 did not reach docker build as --no-cache --pull"; cat /tmp/stub/argv; exit 1; }
           : > /tmp/stub/argv
           RIG_BASE_IMAGE=nvcr.io/vendor/l4t-ros:36.4 ./base/build.sh devbox:5000 v1.3.0
-          ! grep -qE -- '--no-cache|nvcr\.io' /tmp/stub/argv || {
+          ! grep -qE -- '--no-cache|--pull|nvcr\.io' /tmp/stub/argv || {
             echo "::error::the base build consumed a variable it must ignore"; cat /tmp/stub/argv; exit 1; }
-          echo "  ok  build.sh: --no-cache opt-in, RIG_BASE_IMAGE ignored"
+          echo "  ok  build.sh: --no-cache --pull opt-in, RIG_BASE_IMAGE ignored"

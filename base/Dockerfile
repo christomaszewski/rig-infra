@@ -28,8 +28,17 @@ ARG ROS_DISTRO
 # agree by construction. The default only applies outside rig; note that a non-zenoh value yields an
 # image with no rmw_zenohd in it, which zenoh-router cannot run on (see build.sh and the README).
 ARG RMW_IMPLEMENTATION=rmw_zenoh_cpp
+# --no-upgrade: installing a package the parent image already carries silently upgrades it to the
+# repo's current candidate — pushing this image past the parent, and past every sibling image FROM
+# the same parent that merely inherits the package (the skew `rig image audit` flags). The local
+# ros base parent is the version authority: parent-carried packages (rosbag2 and its storage
+# plugins here) stay at ITS versions and advance only when the parent itself is re-pulled
+# deliberately (build.sh: --pull rides with --no-cache); packages the parent lacks (the rmw)
+# install fresh at the candidate. Known residual, same as rig's v0.2.24 consumer doctrine:
+# --no-upgrade holds only the packages LISTED here — dependency resolution can still upgrade
+# what it drags in. Accepted.
 RUN rmw_pkg="ros-${ROS_DISTRO}-$(echo "${RMW_IMPLEMENTATION}" | tr '_' '-')" \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apt-get update && apt-get install -y --no-install-recommends --no-upgrade \
         "${rmw_pkg}" \
         ros-${ROS_DISTRO}-rosbag2 \
         ros-${ROS_DISTRO}-rosbag2-storage-mcap \
