@@ -8,9 +8,11 @@
 # (BAG_LOGGER_IMAGE -> RIG_MSGS_IMAGE -> RIG_BASE_IMAGE -> composed fleet-ros ref), so building and
 # exporting it is all it takes for the logger to start recording the fleet's custom types.
 #
-# NOT yet driven by `rig build` — no rigging declares this script. Until rig grows the msgs
-# aggregation role (see ~/ws/infra/rig-msgs-image-handoff.md), run it by hand with the union
-# manifest you authored, and point the logger at the result:
+# Driven by `rig build` (rig >= v0.2.28): the zenoh-router + ros2-bag-logger riggings declare this
+# script as `build.msgs_overlay` — rig unions the fleet's `msgs:` blocks, renders the union to a
+# temp file (RIG_MSGS_MANIFEST), and runs this right after the base stage; `rig up` then exports
+# RIG_MSGS_IMAGE and the logger records the fleet's custom types. Standalone use (no rig, or an
+# older rig) stays supported — author the union by hand and point the logger at the result:
 #   FLEET_MSGS_MANIFEST=./msgs.yaml ./msgs/build-msgs.sh <registry> <tag>
 #   # then export BAG_LOGGER_IMAGE=<registry>/fleet-ros-msgs:<tag> (or RIG_MSGS_IMAGE) for `rig up`
 #

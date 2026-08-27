@@ -22,7 +22,16 @@ examples: [config/zenoh-router.example.yaml]   # default config for `rig certify
 # DIFFERENT images would be an ERROR, never a guess. vehicle.yaml `images.base` overrides with an
 # external ref: rig then skips this build (nothing would pull fleet-ros) and the compose runs that
 # image instead.
-build: { command: ../base/build.sh, images: [fleet-ros], provides: base }
+#
+# `msgs_overlay` (rig >= v0.2.28): the base provider also knows how to OVERLAY the base — rig
+# unions the fleet's riggings' `msgs:` blocks and runs this build right after the base stage,
+# producing fleet-ros-msgs (base + the fleet's custom interface packages) and exporting it as
+# RIG_MSGS_IMAGE, which the bag logger's compose prefers over the bare base. No `msgs:` declared
+# anywhere = no overlay build, and the logger falls back to the base — correct. ros2-bag-logger
+# declares the SAME overlay from the SAME script (either service alone still supplies it); rig
+# dedupes by script identity exactly like the base build.
+build: { command: ../base/build.sh, images: [fleet-ros], provides: base,
+         msgs_overlay: { command: ../msgs/build-msgs.sh, image: fleet-ros-msgs } }
 # Standalone alternative: point ZENOH_ROUTER_IMAGE at a PINNED eclipse/zenoh (e.g. eclipse/zenoh:1.2.1
 # — never :latest, mirrored tags can silently drift on re-mirror), swap this `build:` for
 # `mirror: [eclipse/zenoh:1.2.1]`, and see the command note in docker/compose.deploy.yaml.

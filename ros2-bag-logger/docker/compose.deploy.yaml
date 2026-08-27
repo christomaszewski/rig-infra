@@ -11,8 +11,9 @@
 # Resolution, outermost first: BAG_LOGGER_IMAGE (this instance's explicit override) -> RIG_MSGS_IMAGE
 # (the deployment's fleet-ros-msgs interface overlay — base + the custom message packages the fleet's
 # services declare, which the recorder MUST have installed to record their topics; see ../../msgs/.
-# Rig does not export this var yet — until it does, a deployment that built the overlay exports it,
-# or sets BAG_LOGGER_IMAGE) -> RIG_BASE_IMAGE (the DEPLOYMENT's base image — rig exports it from this
+# rig >= v0.2.28 builds it via this rigging's `msgs_overlay` and exports the var whenever the
+# fleet declares `msgs:` blocks; standalone or on older rigs, export it yourself or set
+# BAG_LOGGER_IMAGE) -> RIG_BASE_IMAGE (the DEPLOYMENT's base image — rig exports it from this
 # rigging's `provides: base`, or from vehicle.yaml `images.base` when the fleet declares an external
 # one; recording from the fleet's base is how the logger's rmw packages stay identical to the
 # router's) -> the composed fleet-ros pull ref, which is what certify renders (it never inherits

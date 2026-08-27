@@ -114,20 +114,24 @@ The fix is one thin image, never a fat one: `fleet-ros-msgs` = the deployment's 
 - **Declared, per service.** A service that publishes custom types carries a top-level `msgs:` block
   in its rigging.yaml naming the interface packages — `apt:` for distro-released ones, `source:`
   (repo + **mandatory** ref pin + packages) for source-built ones. Schema and rules:
-  `msgs/msgs-manifest.example.yaml`. Current rig ignores unknown top-level keys, so the block is
-  inert (and self-documenting) until rig aggregates it.
+  `msgs/msgs-manifest.example.yaml`. rig >= v0.2.28 validates the block strictly and aggregates it
+  fleet-wide; older rigs ignore unknown top-level keys, so on them the block is inert (and
+  self-documenting).
 - **Built.** `msgs/build-msgs.sh <registry> [tag]` (the rig build contract shape) builds
   `<registry>/fleet-ros-msgs:<tag>` `FROM ${RIG_BASE_IMAGE}` out of the **union manifest** the env
   points at (`RIG_MSGS_MANIFEST`, or `FLEET_MSGS_MANIFEST` standalone — same schema as the
-  per-service block). Until rig renders the union itself, author it by hand in the deployment
-  (e.g. `config/msgs.yaml`). An empty manifest is refused; the same repo at two different refs is a
-  refusal, not a manifest-order guess. The manifest is baked at `/opt/fleet-msgs/manifest.yaml` as
-  provenance for a future `rig image audit` check.
+  per-service block). rig >= v0.2.28 renders the union itself and runs this build right after the
+  base stage (the zenoh-router + ros2-bag-logger riggings declare it as `build.msgs_overlay`);
+  standalone, author the union by hand in the deployment (e.g. `config/msgs.yaml`). An empty
+  manifest is refused; the same repo at two different refs is a refusal, not a manifest-order
+  guess. The manifest is baked at `/opt/fleet-msgs/manifest.yaml` as provenance for a future
+  `rig image audit` check.
 - **Consumed.** The ros2 bag logger's compose resolves
   `BAG_LOGGER_IMAGE → RIG_MSGS_IMAGE → RIG_BASE_IMAGE → composed fleet-ros ref`. The moment an
   overlay exists and `RIG_MSGS_IMAGE` names it, the logger records the fleet's custom types — no
-  config change. rig does not export `RIG_MSGS_IMAGE` yet; until it does, export it yourself (or
-  set `BAG_LOGGER_IMAGE`). With no overlay, everything degrades to the bare base, which is correct.
+  config change. rig >= v0.2.28 exports `RIG_MSGS_IMAGE` whenever the fleet's riggings declare
+  `msgs:` blocks; on older rigs or standalone, export it yourself (or set `BAG_LOGGER_IMAGE`).
+  With no overlay, everything degrades to the bare base, which is correct.
 - **Pin discipline.** A `source:` ref that drifts from what the declaring service builds against
   means the overlay's definitions are wire-incompatible with what the service publishes — and the
   failure (schema mismatch in the bag) is silent. The pin in the `msgs:` block must move with the
@@ -135,8 +139,9 @@ The fix is one thin image, never a fat one: `fleet-ros-msgs` = the deployment's 
 - **ROS 1 is exempt.** `rosbag record` embeds message definitions from the connection headers on the
   wire — `ros1-bag-logger` needs none of this.
 
-The rig-side aggregation (union rendering, `provides`-style role, `RIG_MSGS_IMAGE` export) is queued
-as a rig feature; the handoff spec lives at `../rig-msgs-image-handoff.md` in the parent workspace.
+The rig-side aggregation shipped in rig v0.2.28 (`msgs:` union + the `build.msgs_overlay` trigger +
+`RIG_MSGS_IMAGE` export; doctor WARNs when `msgs:` is declared with no overlay mechanism wired).
+The contract handoff lives at `../rig-msgs-image-handoff.md` in the parent workspace.
 
 Use from a rig deployment (clone as a sibling):
 
