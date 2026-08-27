@@ -12,6 +12,16 @@ rig-driven build refuse the same manifests the same way:
   - the same repo declared at two different refs is a REFUSAL, not a manifest-order guess (two
     services disagreeing on a pin is the version skew this image exists to prevent — align the
     riggings); the same repo at the SAME ref from several services merges (packages union).
+
+Provenance: alongside the install prefix this writes <prefix>/provenance.yaml — one entry per
+source repo recording the declared ref AND the commit SHA it resolved to at build time
+(`git rev-parse HEAD` on the very clone that was built, so the record cannot drift from the build).
+That is the overlay's half of the fleet-msgs provenance convention (schema:
+provenance.example.yaml); the symbolic ref alone is not content identity — a moved tag or a
+re-built branch gives a different tree under the same name, and the SHA is what lets `rig image
+audit` catch that against the declaring service's own provenance. Always written, even with no
+`source:` entries (`source: []`) — an overlay image without the file is a pre-provenance build,
+not a source-less one.
 """
 import os
 import subprocess
@@ -41,6 +51,7 @@ def main() -> None:
 
     os.makedirs(prefix, exist_ok=True)  # the final stage COPYs this even when source: is empty
     if not source:
+        write_provenance(prefix, [])
         return
 
     pins: dict[str, str] = {}       # repo -> ref (conflict refusal)
@@ -61,11 +72,16 @@ def main() -> None:
     ws = "/tmp/msgs_ws"
     src = os.path.join(ws, "src")
     os.makedirs(src, exist_ok=True)
+    provenance = []
     for i, (repo, ref) in enumerate(pins.items()):
         dest = os.path.join(src, f"repo{i}")
         # full clone (no --depth): `ref` may be a tag, branch, or bare SHA — all must resolve
         subprocess.run(["git", "clone", repo, dest], check=True)
         subprocess.run(["git", "-C", dest, "checkout", "--detach", ref], check=True)
+        # rev-parse the clone that will be BUILT — the truth, not a re-echo of the declaration
+        rev = subprocess.run(["git", "-C", dest, "rev-parse", "HEAD"], check=True,
+                             capture_output=True, text=True).stdout.strip()
+        provenance.append({"repo": repo, "ref": ref, "rev": rev, "packages": packages[repo]})
 
     wanted = sorted({p for pkgs in packages.values() for p in pkgs})
     # --packages-up-to: an interface package may depend on sibling interface packages in the same
@@ -78,6 +94,12 @@ def main() -> None:
     missing = [p for p in wanted if not os.path.isdir(os.path.join(prefix, "share", p))]
     if missing:
         die(f"declared packages not present after build: {missing} — wrong `packages:` names?")
+    write_provenance(prefix, provenance)  # after the build: the file describes a COMPLETE prefix
+
+
+def write_provenance(prefix: str, source: list) -> None:
+    with open(os.path.join(prefix, "provenance.yaml"), "w") as f:
+        yaml.safe_dump({"version": 1, "source": source}, f, sort_keys=False)
 
 
 if __name__ == "__main__":

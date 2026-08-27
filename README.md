@@ -136,6 +136,17 @@ The fix is one thin image, never a fat one: `fleet-ros-msgs` = the deployment's 
   means the overlay's definitions are wire-incompatible with what the service publishes — and the
   failure (schema mismatch in the bag) is silent. The pin in the `msgs:` block must move with the
   service's own pin, in the same change.
+- **Provenance — pin skew made detectable.** Every image that *builds* declared interface repos
+  bakes `/opt/fleet-msgs/provenance.yaml`: per repo, the ref the checkout actually used and the
+  commit SHA it resolved to (a symbolic ref is not content identity — a moved tag or a re-built
+  branch is a different tree under the same name). The overlay writes it automatically
+  (`build_msgs.py`); service Dockerfiles use the copyable `msgs/provenance-record.sh` right after
+  each checkout — and multi-stage builds must `COPY` the file into the final image. Two rules:
+  write the *truth* (the very variable that drove the checkout, never a re-echo of the rigging
+  value — that makes the check circular), and record `rev: unknown` explicitly for vendored
+  snapshots (unverifiable beats invisible). apt-installed interface packages need nothing — dpkg is
+  their record. Schema + doctrine: `msgs/provenance.example.yaml`; consumed by `rig image audit`
+  (rig ≥ v0.2.30: absent file WARNs, ref mismatch ERRORs, same-ref-different-SHA ERRORs).
 - **ROS 1 is exempt.** `rosbag record` embeds message definitions from the connection headers on the
   wire — `ros1-bag-logger` needs none of this.
 

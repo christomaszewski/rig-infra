@@ -1,0 +1,56 @@
+# fleet-msgs provenance — /opt/fleet-msgs/provenance.yaml, schema version 1.
+#
+# WHY: the msgs doctrine says a `msgs.source.ref` must equal the pin the declaring service itself
+# builds against — drift means the overlay's message definitions are wire-incompatible with what
+# the service publishes, and the failure (schema mismatch in the recorded bag) is SILENT. dpkg
+# cannot see source builds, package.xml versions don't move with every ref, and a symbolic ref is
+# not content identity (a moved tag, or a branch built twice, is a different tree under the same
+# name). So every image that BUILDS declared interface repos bakes this small file: which repos, at
+# which declared ref, resolved to which commit SHA. `rig image audit` (>= v0.2.30) probes it and
+# compares service images against the rigging declarations and the overlay's own copy.
+#
+# WHO writes it, ONE well-known path for all images:
+#   - the fleet-ros-msgs overlay: automatically (build_msgs.py), ALWAYS — `source: []` when the
+#     union has no source entries. An overlay image without the file is a pre-provenance build,
+#     not a source-less one. (In the overlay, /opt/fleet-msgs is also the install prefix; in
+#     service images the directory exists only to carry this file — that asymmetry is deliberate,
+#     one probe path beats two.)
+#   - service images that build declared interface repos: via the copyable provenance-record.sh
+#     (sibling file), called right after each checkout, in the same stage. Multi-stage builds MUST
+#     COPY the file into the final image — provenance dying with a throwaway builder stage is the
+#     default failure mode.
+#   - images that only apt-install interface packages: NOTHING to write — dpkg already is their
+#     record, and audit reads it directly.
+#
+# THE ONE RULE: write the TRUTH, not the declaration. `ref` is whatever actually drove the
+# checkout; `rev` is `git rev-parse HEAD` on the very tree that was built. Re-echoing the rigging's
+# declared value makes the audit circular — it would compare the declaration against itself and
+# real drift stays invisible.
+#
+# How audit consumes it (for reference; the check lives in rig):
+#   file absent on a service image     -> WARN  (provenance not adopted; pin skew unverifiable)
+#   declared repo missing from file    -> ERROR (the image didn't build what the rigging declares)
+#   ref mismatch vs declaration        -> ERROR naming both sides
+#   rev present on both sides, unequal -> ERROR even when refs agree ("same ref, different tree —
+#                                         rebuild the older side"); this is the tier only SHAs give
+#   rev: unknown                       -> WARN  (adopted but unverifiable — vendored snapshot)
+# Join key: `repo`, normalized — scheme and `git@host:` form dropped, trailing `.git` dropped,
+# host case-insensitive — so https/ssh spellings of one repo match; genuinely different remotes
+# don't, and that mismatch is worth surfacing.
+
+version: 1                # schema version — lets the probe evolve without breaking old images
+source:
+  - repo: https://github.com/PX4/px4_msgs.git
+    #                       REQUIRED — the repo URL as the rigging's `msgs.source.repo` declares it
+    #                       (the audit join key). If the build clones a MIRROR of the declared
+    #                       upstream, keep the upstream here and name the mirror in `cloned_from`.
+    ref: v1.16.0          # REQUIRED — the symbolic ref the checkout actually used (truth rule).
+    rev: 8f3ce2a09b41a0eb69041d1a08d7cb1857c00c92
+    #                       REQUIRED — `git rev-parse HEAD` of the built tree: content identity.
+    #                       A vendored snapshot with no git identity writes the literal `unknown`
+    #                       (explicit unknown proves adoption and marks the gap; absence reads as
+    #                       non-adoption).
+    packages: [px4_msgs]  # optional — the interface packages built from this repo (the overlay
+    #                       always records it; a hand-written service entry may omit it).
+    # cloned_from: https://git.internal/mirrors/px4_msgs.git
+    #                       optional — the remote actually cloned, when it differs from `repo`.

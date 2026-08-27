@@ -11,9 +11,17 @@
 # INPUT: msgs-manifest.yaml (staged into the context by build-msgs.sh) — the UNION of the `msgs:`
 # blocks declared by the deployment's service riggings (see msgs-manifest.example.yaml for the
 # schema). `apt:` entries install dpkg-tracked into /opt/ros/<distro>; `source:` entries are built in
-# a throwaway builder stage and land in /opt/fleet-msgs (merge-install). The manifest itself is baked
-# at /opt/fleet-msgs/manifest.yaml as provenance — the natural hook for a future `rig image audit`
-# check (does the overlay carry what the riggings declare, at the declared pins?).
+# a throwaway builder stage and land in /opt/fleet-msgs (merge-install).
+#
+# TWO RECORDS BAKED, two different consumers — keep them separate:
+#   /opt/fleet-msgs/manifest.yaml    the DECLARED union, verbatim (COPYd below) — rig >= v0.2.29's
+#                                    stale-overlay check diffs it against the current riggings.
+#   /opt/fleet-msgs/provenance.yaml  what the build RESOLVED: per source repo, the declared ref plus
+#                                    the commit SHA actually checked out (written by build_msgs.py in
+#                                    the builder stage; rides the prefix COPY below). The service-side
+#                                    half of the same convention lives in provenance-record.sh /
+#                                    provenance.example.yaml; `rig image audit` (>= v0.2.30) compares
+#                                    the two to catch pin skew symbolic refs cannot show.
 #
 # ENV BAKED IN: AMENT_PREFIX_PATH=/opt/fleet-msgs + LD_LIBRARY_PATH=/opt/fleet-msgs/lib. The ros
 # entrypoint's `source /opt/ros/<distro>/setup.bash` PREPENDS the distro prefix to whatever is

@@ -38,3 +38,9 @@ source:
     #                         at two DIFFERENT refs across services is refused at build time.
     packages: [px4_msgs]    # colcon --packages-up-to selection — sibling interface packages these
     #                         depend on inside the repo are pulled in automatically.
+
+# Pin-skew detection: the overlay build records what it ACTUALLY checked out per source repo —
+# declared ref + resolved commit SHA — at /opt/fleet-msgs/provenance.yaml, and service images that
+# build the same repos bake the same record (provenance-record.sh). Schema + doctrine:
+# provenance.example.yaml. `rig image audit` (>= v0.2.30) compares the two against these
+# declarations to catch drifted pins that symbolic refs cannot show.
