@@ -1,0 +1,40 @@
+# fleet-ros-msgs manifest — the interface packages a fleet's custom types come from.
+#
+# ONE schema, used in TWO places:
+#   1. Per-service declaration: a service that publishes non-common_interfaces types carries this
+#      as a top-level `msgs:` block in ITS rigging.yaml (current rig ignores unknown top-level
+#      keys, so the block is inert until rig learns to aggregate it — self-documenting meanwhile).
+#   2. The union manifest: the deduped union of every service's block, which msgs/build-msgs.sh
+#      turns into the fleet-ros-msgs image (env RIG_MSGS_MANIFEST / FLEET_MSGS_MANIFEST points at
+#      it — rig will render the union itself once it owns the aggregation; until then author it by
+#      hand in the deployment, e.g. config/msgs.yaml).
+#
+# What belongs here: interface packages ONLY — the packages whose .msg/.srv/.action definitions the
+# fleet's topics use and the bag logger must load to record them. Never driver stacks: the overlay
+# exists so a ~1 GB logger image doesn't become a 3 GB one. What does NOT belong here: anything in
+# ros-base/common_interfaces (sensor_msgs, geometry_msgs, nav_msgs, tf2_msgs, ...) — the base
+# already carries those.
+#
+# An empty manifest is refused by the build: no declarations = no overlay = the loggers fall back
+# to the bare base image, which is correct.
+
+# Interface packages released into the distro's apt repo. ROS package names (underscores) — the
+# build maps them to ros-<distro>-<name, '_' -> '-'>, the same mapping base/build.sh uses for the
+# rmw, and installs them dpkg-tracked into /opt/ros/<distro> at the distro repo's version.
+apt:
+  - mavros_msgs
+  # - vision_msgs
+  # - foxglove_msgs
+
+# Interface packages built from source (not apt-released, or the fleet pins its own fork). Built in
+# a throwaway stage and merge-installed into /opt/fleet-msgs; AMENT_PREFIX_PATH/LD_LIBRARY_PATH in
+# the image already point there.
+source:
+  - repo: https://github.com/PX4/px4_msgs.git
+    ref: v1.16.0            # REQUIRED — tag, branch, or SHA. Must match the pin the declaring
+    #                         service itself builds against: a drifted pin means the overlay's
+    #                         definitions are wire-incompatible with what the service publishes,
+    #                         and the failure (schema mismatch in the bag) is silent. The same repo
+    #                         at two DIFFERENT refs across services is refused at build time.
+    packages: [px4_msgs]    # colcon --packages-up-to selection — sibling interface packages these
+    #                         depend on inside the repo are pulled in automatically.

@@ -26,6 +26,10 @@ one in CI).
   distro and the rmw come from vehicle.yaml — `ros.distro` as `ROS_DISTRO` (rig ≥ v0.1.29; a doctor
   ERROR flags a vehicle whose services target a different distro) and `ros.rmw` as `RIG_ROS_RMW`
   (rig ≥ v0.2.23). `provides: base` makes fleet-ros the whole deployment's base image — see below.
+- **`msgs/`** — the `fleet-ros-msgs` interface overlay: the base image + the custom message packages
+  the fleet's services publish, which the bag logger must have installed to record their topics.
+  Built from the union of the services' `msgs:` declarations — see
+  [Custom message types](#custom-message-types--the-fleet-ros-msgs-overlay).
 
 ## The deployment's base image (`RIG_BASE_IMAGE`, rig ≥ v0.2.23)
 
@@ -92,6 +96,47 @@ path that never touches the base image: the standalone `eclipse/zenoh` route doc
 `zenoh-router/rigging.yaml` and `docker/compose.deploy.yaml` — point `ZENOH_ROUTER_IMAGE` at a pinned
 `eclipse/zenoh`, comment out the `command:`, and swap the `build:` for a `mirror:`. That is the
 configuration to reach for; the doctor WARN is the preflight that sends you here.
+
+## Custom message types — the `fleet-ros-msgs` overlay
+
+rosbag2 records raw CDR and never deserializes — but it still **refuses any topic whose message
+package is not installed** ("Topic … has unknown type … Only topics with known type are supported"):
+the recorder needs the typesupport library to create its subscription and the `.msg`/`.idl` sources
+to embed the mcap schema. Verified live against fleet-ros v1.3.0 / rosbag2 0.33.3; the REP 2011
+type-description plumbing ships in the distro but rosbag2 does not use it. The failure is **quiet**:
+in `all`/`exclude` mode the recorder logs one WARN, skips the topic, and the bag silently lacks it.
+Everything in ros-base/common_interfaces (`sensor_msgs`, `geometry_msgs`, `nav_msgs`, `tf2_msgs`, …)
+is covered by the base image; anything custom (`px4_msgs`, vendor msgs, your own packages) is not.
+
+The fix is one thin image, never a fat one: `fleet-ros-msgs` = the deployment's base + the fleet's
+*interface packages only* (tens of MB, not a 3 GB driver image).
+
+- **Declared, per service.** A service that publishes custom types carries a top-level `msgs:` block
+  in its rigging.yaml naming the interface packages — `apt:` for distro-released ones, `source:`
+  (repo + **mandatory** ref pin + packages) for source-built ones. Schema and rules:
+  `msgs/msgs-manifest.example.yaml`. Current rig ignores unknown top-level keys, so the block is
+  inert (and self-documenting) until rig aggregates it.
+- **Built.** `msgs/build-msgs.sh <registry> [tag]` (the rig build contract shape) builds
+  `<registry>/fleet-ros-msgs:<tag>` `FROM ${RIG_BASE_IMAGE}` out of the **union manifest** the env
+  points at (`RIG_MSGS_MANIFEST`, or `FLEET_MSGS_MANIFEST` standalone — same schema as the
+  per-service block). Until rig renders the union itself, author it by hand in the deployment
+  (e.g. `config/msgs.yaml`). An empty manifest is refused; the same repo at two different refs is a
+  refusal, not a manifest-order guess. The manifest is baked at `/opt/fleet-msgs/manifest.yaml` as
+  provenance for a future `rig image audit` check.
+- **Consumed.** The ros2 bag logger's compose resolves
+  `BAG_LOGGER_IMAGE → RIG_MSGS_IMAGE → RIG_BASE_IMAGE → composed fleet-ros ref`. The moment an
+  overlay exists and `RIG_MSGS_IMAGE` names it, the logger records the fleet's custom types — no
+  config change. rig does not export `RIG_MSGS_IMAGE` yet; until it does, export it yourself (or
+  set `BAG_LOGGER_IMAGE`). With no overlay, everything degrades to the bare base, which is correct.
+- **Pin discipline.** A `source:` ref that drifts from what the declaring service builds against
+  means the overlay's definitions are wire-incompatible with what the service publishes — and the
+  failure (schema mismatch in the bag) is silent. The pin in the `msgs:` block must move with the
+  service's own pin, in the same change.
+- **ROS 1 is exempt.** `rosbag record` embeds message definitions from the connection headers on the
+  wire — `ros1-bag-logger` needs none of this.
+
+The rig-side aggregation (union rendering, `provides`-style role, `RIG_MSGS_IMAGE` export) is queued
+as a rig feature; the handoff spec lives at `../rig-msgs-image-handoff.md` in the parent workspace.
 
 Use from a rig deployment (clone as a sibling):
 
