@@ -33,6 +33,16 @@ jobs:
           ./.rig/rig certify --repo zenoh-router --config /tmp/zr.yaml
       - name: certify ros2-bag-logger
         run: ./.rig/rig certify --repo ros2-bag-logger
+      # The logger's second config path: a `graph:` block gates the graph-snapshotter sidecar
+      # (profile-gated compose service + GRAPH_SNAPSHOT_* env exports).
+      - name: certify ros2-bag-logger (graph path)
+        run: |
+          printf 'service: ros2-bag-logger\nname: bl\ngraph:\n  enabled: true\n  interval_s: 30\n' > /tmp/bl.yaml
+          ./.rig/rig certify --repo ros2-bag-logger --config /tmp/bl.yaml
+      # The graph-snapshotter's pure core (epoch dedup/hash/schema — the rig v0.2.32 reader is
+      # built against fixtures of exactly this schema) and the `graph:` config gate.
+      - name: ros2-bag-logger unit tests
+        run: python3 ros2-bag-logger/tests/test_graph_snapshot.py
       - name: certify ros1-bag-logger
         run: ./.rig/rig certify --repo ros1-bag-logger
       # RIG_BASE_IMAGE, consumer side: with a base exported the stacks RUN it; with none — certify's

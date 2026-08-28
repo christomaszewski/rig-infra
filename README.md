@@ -17,7 +17,10 @@ one in CI).
   recording can be gated at runtime through rosbag2's own services
   (`/bag_logger/{pause,resume,split_bagfile,stop,…}`); trigger *policy* (arm/disarm, geofence)
   belongs in a separate node that calls them — see the example config. Default image: `fleet-ros`
-  (rosbag2 + mcap + rmw_zenoh, ~1 GB — no camera image needed on camera-less vehicles).
+  (rosbag2 + mcap + rmw_zenoh, ~1 GB — no camera image needed on camera-less vehicles). A
+  `graph:` block in the config additionally starts the **graph-snapshotter sidecar**, recording
+  the live graph *topology* (who talked to what) beside the bags — see
+  [Graph topology capture](#graph-topology-capture--the-graph-snapshotter-sidecar).
 - **`ros1-bag-logger/`** — the ROS 1 sibling (`rosbag record`), for ROS 1 fleets with a roscore.
 - **`base/`** — the `fleet-ros` image: `ros:<distro>-ros-base` + the fleet's rmw + `rosbag2` (+ mcap).
   `base/build.sh <registry> [tag]` follows the rig build contract; the router and ros2 bag logger
@@ -153,6 +156,44 @@ The fix is one thin image, never a fat one: `fleet-ros-msgs` = the deployment's 
 The rig-side aggregation shipped in rig v0.2.28 (`msgs:` union + the `build.msgs_overlay` trigger +
 `RIG_MSGS_IMAGE` export; doctor WARNs when `msgs:` is declared with no overlay mechanism wired).
 The contract handoff lives at `../rig-msgs-image-handoff.md` in the parent workspace.
+
+## Graph topology capture — the graph-snapshotter sidecar
+
+Bags record data, not topology: rosbag2 keeps topic names and types but no node identity, nothing
+about subscribers, and no services — so a run's bag cannot answer *who talked to what*, and in
+particular a service's **inputs** are invisible from its own run (which is exactly what
+`rig replay` needs). The live graph API is the instrument: a `graph:` block in the ros2 bag
+logger's config starts a second, compose-profile-gated container beside the recorder that walks
+the graph every `interval_s` (via `get_node_names_and_namespaces` + the four per-node NodeGraph
+calls — works under rmw_zenoh, whose graph cache rides liveliness tokens) and records per-node
+**pubs / subs / service servers (`provides:`) / clients (`requires:`)**, with a type on every
+edge.
+
+**The artifact — append-only, change-deduped epochs.** One YAML file per distinct graph state at
+`<run>/graph/<name>/epoch_<UTCstamp>.yaml` (the pinned open run; flat `<data>/graph/<name>`
+without a run registry — mirrors `bags/`), carrying its validity window:
+
+- Each tick the observed graph is canonicalized and hashed (the hash covers the `nodes:` body
+  only). Unchanged → the SAME file is atomically rewritten with `last:` bumped — the liveness
+  signal; a crash loses at most one interval. Changed → a NEW file opens (`first:` = now) and the
+  old one is never touched again, so a flapping node *looks different* from a stable one.
+- A sidecar (re)start always opens a new epoch — no file is ever read back, trusted, or resumed.
+  Overlapping epochs are harmless: readers dedup by content.
+- **Self-exclusion only.** The snapshotter drops its own node (a measurement artifact) and
+  nothing else. Notably the bag recorder itself IS recorded, as the graph sees it: subscriptions
+  to everything it records, its control services (`/<node>/pause`, …), and its
+  `/events/rosbag2_messages_lost` / `/events/write_split` publishers. Writer dumb, reader smart:
+  no filtering, no namespace→instance grouping — rig derives every view (union across epochs,
+  instance grouping, declared-vs-observed checks) at read time (`rig graph`, rig ≥ v0.2.32).
+
+**Enabling.** Uncomment `graph:` in the example config (`enabled: true`; `interval_s`, `settle_s`
+knobs documented there). The launcher gates the sidecar by compose profile: `--profile graph` on
+`up` only when enabled, and unconditionally on `down`/`status`/`logs`/`ps` — a sidecar left
+running from a since-disabled config is still torn down and visible. No `graph:` block = no
+sidecar, byte-identical behavior to earlier releases. The sidecar reuses the logger's image chain
+and env (`ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`, the data-root mount) — custom-type introspection
+works wherever the recorder's does, and there are no new rig-owned env vars. Cost is negligible:
+a ~28-node graph walks in single-digit milliseconds per tick and writes ~35 KB per epoch.
 
 Use from a rig deployment (clone as a sibling):
 

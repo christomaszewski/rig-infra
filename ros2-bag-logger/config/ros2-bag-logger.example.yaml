@@ -78,3 +78,21 @@ output:
 #       link: { rx: { buffer_size: 1048576 } }   # per-link read buffer (default 64 KiB): helps
 #                          # sustained ingest of big topics arriving over TCP (one buffer per peer
 #                          # link; topics riding SHM bypass this path entirely)
+
+# Graph topology capture (the graph-snapshotter sidecar). Bags record data, not topology — no node
+# identity, no subscribers, no services — so nothing says who talked to what during a run. Enabling
+# this starts a second, profile-gated container beside the recorder that walks the live graph every
+# interval_s and records per-node pubs/subs/service servers/clients as append-only, change-deduped
+# EPOCH files at <run>/graph/<name>/epoch_<UTCstamp>.yaml (flat graph/<name> without a run
+# registry — mirrors bags/). An unchanged graph bumps the open epoch's `last:` in place (the
+# liveness signal); any change opens a new file; a restart always opens a new epoch. `rig graph` /
+# `rig replay` consume the files and derive all views (union, instance grouping) at read time.
+# ABSENT block = off; existing configs and deployments are unchanged.
+# graph:
+#   enabled: true
+#   interval_s: 60         # seconds between graph walks (a walk is 4 graph-API calls per node —
+#                          # cheap; sub-minute intervals only sharpen epoch edges, not coverage)
+#   settle_s: 2            # discovery warm-up before the first walk. Measured: the zenoh graph
+#                          # cache is fully replayed by the time the node exists (the router
+#                          # replays liveliness tokens during session open) — 2 s is pure margin
+#                          # for a loaded router at boot

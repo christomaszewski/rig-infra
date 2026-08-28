@@ -13,16 +13,30 @@ CONFIG="${1:?usage: ros2-bag-logger-up <config.yaml> [up [-d]|down|status|logs|c
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 
 # config -> the exact `ros2 bag record` command, rendered to var/run/<name>/record.sh (captured by
-# `rig bake` like any launcher-rendered file). bag_cmd prints "<name>\t<script-path>\t<shm-flag>";
-# the flag ("shm" when zenoh shared memory is EFFECTIVELY on) gates the ipc:host compose overlay —
-# the container only gives up IPC-namespace isolation when SHM can actually use it.
+# `rig bake` like any launcher-rendered file). bag_cmd prints
+# "<name>\t<script-path>\t<shm-flag>\t<graph-flag>\t<interval_s>\t<settle_s>": the shm flag ("shm"
+# when zenoh shared memory is EFFECTIVELY on) gates the ipc:host compose overlay — the container
+# only gives up IPC-namespace isolation when SHM can actually use it — and the graph fields carry
+# the `graph:` block (the graph-snapshotter sidecar gate; empty interval/settle = tool defaults).
 NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/bag_cmd.py" "$CONFIG_ABS" "$REPO")"
-NAME="${NAME_AND_SCRIPT%%$'\t'*}"
-REST="${NAME_AND_SCRIPT#*$'\t'}"
-SCRIPT="${REST%%$'\t'*}"
-SHM_FLAG="${REST#*$'\t'}"
+# split on tabs by hand — `read` with a whitespace IFS collapses runs of tabs, losing empty fields
+REST="$NAME_AND_SCRIPT"
+NAME="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+SCRIPT="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+SHM_FLAG="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+GRAPH_FLAG="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+GRAPH_INTERVAL="${REST%%$'\t'*}"
+GRAPH_SETTLE="${REST#*$'\t'}"
 export BAG_LOGGER_NAME="$NAME"
 export BAG_RECORD_SCRIPT="$SCRIPT"
+
+# The graph-snapshotter sidecar (profiles: ["graph"]): its parameters travel by env, no render
+# step. The profile flag goes on `up` only when the config enables it — but UNCONDITIONALLY on
+# down/status/logs/ps, so a sidecar left running from a since-disabled (or since-removed) config
+# is still torn down and visible; a profile matching no container is harmless.
+export GRAPH_SNAPSHOT_NAME="$NAME"
+[ -n "$GRAPH_INTERVAL" ] && export GRAPH_SNAPSHOT_INTERVAL_S="$GRAPH_INTERVAL"
+[ -n "$GRAPH_SETTLE" ] && export GRAPH_SNAPSHOT_SETTLE_S="$GRAPH_SETTLE"
 
 # rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros2-bag-logger_${NAME}}"
@@ -30,5 +44,11 @@ FILES=(-f "$REPO/docker/compose.deploy.yaml")
 [ "$SHM_FLAG" = "shm" ] && FILES+=(-f "$REPO/docker/compose.shm.yaml")
 ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
 [ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
-echo "ros2-bag-logger-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} script=$SCRIPT${SHM_FLAG:+ shm=on}" >&2
-exec docker compose "${FILES[@]}" "${ARGS[@]}"
+PROFILE=()
+case "${ARGS[0]}" in
+  up) [ "$GRAPH_FLAG" = "graph" ] && PROFILE=(--profile graph) ;;
+  down|ps|logs) PROFILE=(--profile graph) ;;
+esac
+echo "ros2-bag-logger-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} script=$SCRIPT${SHM_FLAG:+ shm=on}${GRAPH_FLAG:+ graph=on}" >&2
+# ${PROFILE[@]+...}: an EMPTY array under `set -u` is an error on bash < 4.4 (macOS dev boxes)
+exec docker compose "${FILES[@]}" ${PROFILE[@]+"${PROFILE[@]}"} "${ARGS[@]}"

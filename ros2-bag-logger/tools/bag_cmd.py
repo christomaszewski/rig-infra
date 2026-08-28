@@ -230,6 +230,30 @@ def zenoh_env_lines(cfg: dict, warns: list[str]) -> tuple[str, bool]:
     ), shm_on
 
 
+def graph_params(cfg: dict) -> tuple[bool, str, str]:
+    """`graph:` (the graph-snapshotter sidecar gate) -> (enabled, interval_s, settle_s) — the
+    values ros2-bag-logger-up exports as GRAPH_SNAPSHOT_INTERVAL_S / GRAPH_SNAPSHOT_SETTLE_S
+    (GRAPH_SNAPSHOT_NAME is the config `name`). Absent block = disabled, defaults untouched —
+    existing configs and deployments stay byte-identical. Strict on keys, like `zenoh:`: a typo'd
+    knob must not silently run the sidecar at defaults. Pure — no I/O."""
+    g = cfg.get("graph")
+    if g is None:
+        return False, "", ""
+    if not isinstance(g, dict):
+        raise SystemExit("bag_cmd: `graph` must be a mapping")
+    unknown = set(g) - {"enabled", "interval_s", "settle_s"}
+    if unknown:
+        raise SystemExit(f"bag_cmd: unknown graph key(s): {', '.join(sorted(unknown))} "
+                         "(graph.enabled, graph.interval_s, graph.settle_s)")
+    for key, lo in (("interval_s", 1), ("settle_s", 0)):
+        val = g.get(key)
+        if val is not None and (not isinstance(val, (int, float)) or isinstance(val, bool)
+                                or val < lo):
+            raise SystemExit(f"bag_cmd: graph.{key} must be a number >= {lo}")
+    fmt = lambda v: "" if v is None else f"{float(v):g}"  # noqa: E731 — "" = tool default
+    return bool(g.get("enabled")), fmt(g.get("interval_s")), fmt(g.get("settle_s"))
+
+
 def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str, bool]:
     """Write var/run/<name>/record.sh and return (name, script-path, shm-enabled)."""
     name, subdir, node, args, warns = build_args(cfg)
@@ -268,7 +292,9 @@ def main() -> int:
         return 2
     cfg = yaml.safe_load(open(sys.argv[1])) or {}
     name, script, shm_on = render(cfg, pathlib.Path(sys.argv[2]))
-    print(name + "\t" + script + "\t" + ("shm" if shm_on else ""))
+    graph_on, interval_s, settle_s = graph_params(cfg)
+    print("\t".join([name, script, "shm" if shm_on else "",
+                     "graph" if graph_on else "", interval_s, settle_s]))
     return 0
 
 

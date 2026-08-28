@@ -37,3 +37,33 @@ services:
       - ${RIG_DATA_DIR:-/data}:/data
       - ${BAG_RECORD_SCRIPT:?set by ros2-bag-logger-up}:/record.sh:ro
     command: ["/bin/bash", "/record.sh"]   # bash, not sh: record.sh sources ROS `setup.bash` (bash-only)
+
+  # graph-snapshotter — the logger's topology sidecar: records the live ROS 2 graph (per-node
+  # pubs/subs/service servers/clients) as append-only, change-deduped epoch files at
+  # <data>/current/graph/<name>/epoch_<UTCstamp>.yaml (flat graph/<name> without a run registry) —
+  # bags record data, this records who talked to what; `rig graph` / `rig replay` consume the YAML.
+  # Profile-gated: ros2-bag-logger-up adds `--profile graph` on `up` when the config's `graph:`
+  # block enables it (and unconditionally on down/status/logs/ps, so a sidecar from a
+  # since-disabled config is still torn down). Same image chain and env as the logger — the sidecar
+  # introspects custom types wherever the recorder does; parameters travel by env, no render step.
+  graph-snapshotter:
+    profiles: ["graph"]
+    image: ${BAG_LOGGER_IMAGE:-${RIG_MSGS_IMAGE:-${RIG_BASE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}}}
+    network_mode: host            # observe the same graph the drivers are on
+    restart: unless-stopped       # a restart opens a NEW epoch by design (never resumes a file)
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      RIG_BAG_ROOT: /data
+      GRAPH_SNAPSHOT_NAME: ${GRAPH_SNAPSHOT_NAME:-bag_logger}
+      GRAPH_SNAPSHOT_INTERVAL_S: ${GRAPH_SNAPSHOT_INTERVAL_S:-60}
+      GRAPH_SNAPSHOT_SETTLE_S: ${GRAPH_SNAPSHOT_SETTLE_S:-2}
+    volumes:
+      - ${RIG_DATA_DIR:-/data}:/data
+      - ../tools/graph_snapshot.py:/graph_snapshot.py:ro   # static tool — no render, mounted from the repo
+    # Source ROS defensively before exec'ing python3 (the record.sh pattern — the image's
+    # entrypoint usually did it already, since we run as `command:`). $$ = literal $ for the
+    # container shell: these expand IN the container, never at compose-interpolation time.
+    command: ["/bin/bash", "-c",
+              "[ -n \"$${ROS_DISTRO:-}\" ] && [ -f \"/opt/ros/$$ROS_DISTRO/setup.bash\" ] && . \"/opt/ros/$$ROS_DISTRO/setup.bash\"; exec python3 /graph_snapshot.py"]
