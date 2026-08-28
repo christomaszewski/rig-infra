@@ -1,0 +1,27 @@
+# rig descriptor for the SIL replay bag player. tier: autonomy is LOAD-BEARING, not cosmetic: the
+# vehicle.yaml row lives in the `autonomy:` list with a high order (rig replay declares it
+# enabled: false, order ~999 — explicit names win in selection), so the player comes up LAST
+# (the services under test have their subscriptions standing before data flows; volatile
+# durability would silently drop the bag head) and goes down FIRST (stop feeding before stopping
+# consumers). The player never decides what to play — `rig replay` (or the standalone config)
+# hands it the set; see config/ros2-bag-player.example.yaml.
+service: ros2-bag-player
+launcher: ros2-bag-player-up
+verbs:
+  up: "up -d"
+  down: "down"
+  status: "ps"
+  logs: "logs"
+  config: "config"
+ros_distro: lyrical
+tier: autonomy
+examples: [config/ros2-bag-player.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
+# Default image: the shared fleet-ros base — the SAME image (and msgs overlay preference, see the
+# compose) the bag logger records under, so every recorded type deserializes by construction. No
+# new image and no `provides: base` here: the player rides whatever base the fleet's
+# logger/router riggings already provide; declaring the build ref only names the fallback build.
+build: { command: ../base/build.sh, images: [fleet-ros] }
+launch_surface:
+  - ros2-bag-player-up
+  - tools/play_cmd.py
+  - docker/compose.deploy.yaml

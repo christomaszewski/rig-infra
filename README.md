@@ -21,6 +21,11 @@ one in CI).
   `graph:` block in the config additionally starts the **graph-snapshotter sidecar**, recording
   the live graph *topology* (who talked to what) beside the bags — see
   [Graph topology capture](#graph-topology-capture--the-graph-snapshotter-sidecar).
+- **`ros2-bag-player/`** — the SIL replay player (`autonomy` tier): joins the graph like any
+  service and plays a selected topic subset from a SOURCE run's bags, mounted read-only. It never
+  decides what to play — `rig replay` (or the standalone config) hands it the set. An exited
+  player is a finished replay, not a failure. See
+  [SIL replay](#sil-replay--the-ros2-bag-player-service).
 - **`ros1-bag-logger/`** — the ROS 1 sibling (`rosbag record`), for ROS 1 fleets with a roscore.
 - **`base/`** — the `fleet-ros` image: `ros:<distro>-ros-base` + the fleet's rmw + `rosbag2` (+ mcap).
   `base/build.sh <registry> [tag]` follows the rig build contract; the router and ros2 bag logger
@@ -156,6 +161,78 @@ The fix is one thin image, never a fat one: `fleet-ros-msgs` = the deployment's 
 The rig-side aggregation shipped in rig v0.2.28 (`msgs:` union + the `build.msgs_overlay` trigger +
 `RIG_MSGS_IMAGE` export; doctor WARNs when `msgs:` is declared with no overlay mechanism wired).
 The contract handoff lives at `../rig-msgs-image-handoff.md` in the parent workspace.
+
+## SIL replay — the ros2-bag-player service
+
+A sealed run dir holds everything a software-in-the-loop test needs — rendered configs, pins,
+mcap bags recorded under the msgs overlay, graph epochs saying who consumed what — but nothing
+feeds that data back through an updated autonomy service. `ros2-bag-player` is that piece: a
+normal rig service (a launcher + rigging, certified like the rest) that joins the graph and plays
+a **selected topic subset** from a source run's bags. Division of labor, on purpose: rig owns run
+selection, topic-set computation, and the safety guards; this service owns only the playback
+mechanics. The player never decides what to play. Replay is *current code against old data* —
+tag pins, not digests; never bit-exact reproduction.
+
+**The selector env contract** (`rig replay`, rig ≥ v0.2.33, exports these; all absent under every
+other verb):
+
+- `RIG_REPLAY_SOURCE` — absolute host path to the source run, mounted **read-only** at `/replay`
+  (verified: the player cannot write it). This var is **fleet-general**, not player-private: rig
+  sends it to every launcher in a replay up-set, and a future per-sensor replay source (e.g.
+  camera-service replaying its own recordings, paced against the same clock) consumes the same
+  var the same way — this player is merely its first consumer. Standalone use sets the config's
+  `source.run` instead.
+- `RIG_REPLAY_TOPICS` (space-separated allow-list, from graph epochs) **xor**
+  `RIG_REPLAY_EXCLUDE` (one regex, the pre-epoch namespace fallback). Exactly one is ever set;
+  the launcher refuses both-set as defense in depth. Either shadows the config's `play.topics`
+  (WARN). The config's `play.exclude` regexes apply in both modes — they *filter* the allow-list
+  before `--topics` (an emptied selection is refused: a bare `ros2 bag play` would play
+  everything), or merge into the exclude alternation. Topics named but absent from the bag are
+  tolerated (rig's selector may include topics the bag never captured).
+- `RIG_SIM_TIME=1` → the player adds `--clock` (verified: 40 Hz `/clock` by default, and sim
+  time scales with `play.rate` — rate 2.0 advances sim exactly 2× wall). There is **no**
+  `play.clock` config knob and one is refused at parse: clock coherence is one rig-owned token
+  with two consumers (`--clock` here, `use_sim_time` in the services under test) — the
+  incoherent state is unrepresentable.
+
+Playback knobs (`rate`, `loop`, `start_offset_s`, `start_paused`) live in the **config**, not rig
+CLI flags, so rig's run snapshot records every experiment's parameters — the run self-documents.
+Session resolution is host-side at render (the source run is static, unlike the logger's live
+`current`): `session: latest` picks the greatest stamp, multiple sessions WARN naming the skipped
+ones, and a recording split into many files plays as **one** session (verified across a 4-way
+split).
+
+**Ordering is load-bearing.** The rigging says `tier: autonomy` and the vehicle.yaml row takes a
+high `order` (rig replay declares it `enabled: false`, order ~999 — explicit names win at
+dispatch, so a normal `rig up` never starts it): the player comes up **last**, after the services
+under test, so their subscriptions are standing before data flows — volatile durability would
+silently drop the head of the bag — and goes down **first**, so consumers are never stopped while
+still being fed.
+
+**Exit semantics.** `restart: "no"` (the logger's `unless-stopped` would loop the bag
+invisibly): the bag ends → the container exits 0 → the replay is **finished**, not failed. A
+finished player disappears from plain `status` (`ps` hides exited containers) — `status -a`
+shows the `Exited (0)` row. `loop: true` is for soak only and the launcher WARNs: `down` becomes
+the only exit, and `/clock` jumps backwards at every wrap (verified — TF and anything stateful
+will object).
+
+**Standalone invocation** (no rig — this is also the SIL path before rig v0.2.33 lands):
+
+```bash
+ROS_DOMAIN_ID=7 RMW_IMPLEMENTATION=rmw_zenoh_cpp BAG_PLAYER_IMAGE=<registry>/fleet-ros-msgs:<tag> \
+  ./ros2-bag-player/ros2-bag-player-up my-replay.yaml up -d
+```
+
+with `source.run` set to the run dir's absolute path and `play.topics`/`play.exclude` selecting;
+or hand-export the `RIG_REPLAY_*` vars to exercise the rig channel.
+
+Findings worth knowing (verified on lyrical): recorded QoS restores durability on play — a
+subscriber joining mid-replay still receives `/tf_static`-style transient-local messages, even
+from a split recording; but `start_offset_s` **skips** latched messages recorded before the
+offset (the same gap that motivated the logger's `repeat_transient_local` knob — recording with
+it narrows the loss to the current split). Player memory is dominated by rosbag2's read-ahead
+queue (1000 messages): ~1 GB on a bag of ~1 MB messages, trivial on telemetry-sized ones; a
+900 MB mcap starts feeding subscribers ~2.7 s after `up` (dev-box numbers).
 
 ## Graph topology capture — the graph-snapshotter sidecar
 

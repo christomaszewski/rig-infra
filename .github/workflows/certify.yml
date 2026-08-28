@@ -43,6 +43,18 @@ jobs:
       # built against fixtures of exactly this schema) and the `graph:` config gate.
       - name: ros2-bag-logger unit tests
         run: python3 ros2-bag-logger/tests/test_graph_snapshot.py
+      # The player renders against a source run (session resolution is host-side, §1.3 of the
+      # replay handoff) and the example config's source.run is empty ON PURPOSE — the source is
+      # rig's channel. Certify passes the caller's env through, so hand it a fabricated run.
+      - name: certify ros2-bag-player
+        run: |
+          mkdir -p /tmp/replay-src/bags/bag_logger/bag_logger_20260101T000000Z
+          touch /tmp/replay-src/bags/bag_logger/bag_logger_20260101T000000Z/certify_0.mcap
+          RIG_REPLAY_SOURCE=/tmp/replay-src ./.rig/rig certify --repo ros2-bag-player
+      # The player's pure core — the selector doctrine (TOPICS xor EXCLUDE, allow-mode filtering,
+      # clock-knob refusal) rig v0.2.33's `rig replay` is built against.
+      - name: ros2-bag-player unit tests
+        run: python3 ros2-bag-player/tests/test_play_cmd.py
       - name: certify ros1-bag-logger
         run: ./.rig/rig certify --repo ros1-bag-logger
       # RIG_BASE_IMAGE, consumer side: with a base exported the stacks RUN it; with none — certify's

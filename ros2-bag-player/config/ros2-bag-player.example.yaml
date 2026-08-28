@@ -1,0 +1,37 @@
+# SIL replay: play a selected topic subset from a SOURCE run's bags into the live graph. Under
+# `rig replay` this row lives in vehicle.yaml `autonomy:` with enabled: false and a HIGH order
+# (~999): the player must come up LAST (subscribers exist before data flows) and go down FIRST —
+# rig names it explicitly, so the disabled row never starts on a normal `rig up`. The player
+# never decides what to play: rig exports RIG_REPLAY_SOURCE + RIG_REPLAY_TOPICS (allow-list from
+# graph epochs) | RIG_REPLAY_EXCLUDE (namespace-heuristic fallback) — exactly one, both-set is
+# refused — and everything below is the STANDALONE fallback for driving the player by hand.
+# An exited (0) player is a FINISHED replay, not a failure.
+service: ros2-bag-player
+name: bag_player
+
+source:
+  run: ""                # abs host path to a run dir — STANDALONE use only; RIG_REPLAY_SOURCE wins.
+  #                        Mounted READ-ONLY at /replay; the player cannot write the source run.
+  logger: bag_logger     # which bags/<logger>/ tree of the source run to play (the logger config's `name`)
+  session: latest        # latest | <UTCstamp> — the stamped recording dir under bags/<logger>/.
+  #                        latest = lexically-greatest stamp; multiple sessions WARN naming the
+  #                        skipped ones (each is one recording; play them one `up` at a time).
+  #                        A recording split into multiple files plays as ONE session.
+
+play:
+  topics: []             # standalone allow-list (exact topic names); RIG_REPLAY_TOPICS shadows it
+  #                        (WARN). Empty + no excludes = play everything in the session.
+  #                        Topics named here but absent from the bag are tolerated, not an error.
+  exclude: []            # regex excludes — applied in BOTH modes: they FILTER the allow-list
+  #                        before --topics (never an allow flag and an exclude flag together), or
+  #                        merge with RIG_REPLAY_EXCLUDE into one alternation for -x.
+  rate: 1.0              # playback speed multiplier (> 0). Also scales /clock under sim time.
+  loop: false            # wrap forever — soak testing, NOT fidelity: /clock jumps backwards at
+  #                        the wrap (TF and anything stateful will object), and with the
+  #                        compose's restart: "no" `down` becomes the only exit (the launcher WARNs)
+  start_offset_s: 0      # skip this many seconds into the recording (float ok)
+  start_paused: false    # come up subscribed but hold data until resumed via rosbag2's own player
+  #                        services (/rosbag2_player/{pause,resume,toggle_paused,...})
+  # NO clock knob, on purpose: --clock derives from rig's RIG_SIM_TIME alone (one rig-owned
+  # token, two consumers — the player's /clock and the services' use_sim_time). Declaring
+  # play.clock here is refused at parse; standalone sim-time runs export RIG_SIM_TIME=1 instead.

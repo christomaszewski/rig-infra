@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Launcher for the SIL replay bag player (autonomy tier — up LAST, down FIRST, so the services
+# under test have their subscriptions standing before data flows and stop being fed before they
+# stop). Plays a selected topic subset from a SOURCE run's bags, mounted read-only at /replay.
+# The player never decides what to play: `rig replay` exports RIG_REPLAY_SOURCE +
+# RIG_REPLAY_TOPICS|RIG_REPLAY_EXCLUDE (+ RIG_SIM_TIME); standalone use sets source.run and
+# play.topics/exclude in the config. SELECTS + PARAMETERIZES `ros2 bag play` — no compose is
+# generated.
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${BAG_PLAYER_PYTHON:-python3}"
+
+CONFIG="${1:?usage: ros2-bag-player-up <config.yaml> [up [-d]|down|status|logs|config|...]}"; shift || true
+[ -f "$CONFIG" ] || { echo "ros2-bag-player-up: config not found: $CONFIG" >&2; exit 1; }
+CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+
+# config + replay env -> the exact `ros2 bag play` command, rendered to var/run/<name>/play.sh
+# (captured by `rig bake` like any launcher-rendered file; session resolution is HOST-side at
+# render — the source run is static). play_cmd prints "<name>\t<script>\t<host-source>"; the
+# third field is the RESOLVED source run (RIG_REPLAY_SOURCE, or the config's source.run
+# standalone) — exported below so the compose's ro mount interpolates either way.
+NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/play_cmd.py" "$CONFIG_ABS" "$REPO")"
+NAME="${NAME_AND_SCRIPT%%$'\t'*}"
+REST="${NAME_AND_SCRIPT#*$'\t'}"
+SCRIPT="${REST%%$'\t'*}"
+SOURCE="${REST#*$'\t'}"
+export BAG_PLAYER_NAME="$NAME"
+export BAG_PLAY_SCRIPT="$SCRIPT"
+export RIG_REPLAY_SOURCE="$SOURCE"
+
+# rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros2-bag-player_${NAME}}"
+FILES=(-f "$REPO/docker/compose.deploy.yaml")
+ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+echo "ros2-bag-player-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} source=$SOURCE script=$SCRIPT" >&2
+exec docker compose "${FILES[@]}" "${ARGS[@]}"

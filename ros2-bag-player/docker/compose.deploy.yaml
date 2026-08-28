@@ -1,0 +1,32 @@
+# The SIL replay bag player (autonomy tier) — plays a selected topic subset from a SOURCE run's
+# bags into the live graph, so updated services consume a past run's data. ONE per replay; rig
+# brings it up LAST (subscribers exist before data flows — volatile durability would silently
+# drop the bag head) and down FIRST (stop feeding before stopping consumers).
+#
+# restart: "no" is load-bearing: play ends when the bag ends, and the container must NOT relaunch
+# (the logger's unless-stopped would loop the bag invisibly). An EXITED (0) player in `status` is
+# a FINISHED replay, not a failure.
+#
+# The source run mounts READ-ONLY at /replay — the player must be unable to write the source run.
+# RIG_REPLAY_SOURCE is exported by `rig replay` (fleet-general: every launcher in a replay up-set
+# receives it), or by ros2-bag-player-up from the config's source.run standalone.
+#
+# IMAGE: same fallback chain as the bag logger, so every type recorded under the msgs overlay
+# deserializes by construction: BAG_PLAYER_IMAGE (this instance's explicit override) ->
+# RIG_MSGS_IMAGE (fleet-ros-msgs, the fleet's custom interface packages) -> RIG_BASE_IMAGE (the
+# deployment's base) -> the composed fleet-ros pull ref (certify's view, and standalone
+# `docker compose`). The player runs via `command:` so the image's ROS-sourcing entrypoint still
+# runs; play.sh also sources ROS defensively.
+services:
+  bag-player:
+    image: ${BAG_PLAYER_IMAGE:-${RIG_MSGS_IMAGE:-${RIG_BASE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}}}
+    network_mode: host            # join the graph / reach the zenoh router at localhost:7447
+    restart: "no"                 # bag ends -> container exits 0 -> replay is FINISHED (never loop it back up)
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+    volumes:
+      - ${RIG_REPLAY_SOURCE:?exported by rig replay, or by ros2-bag-player-up from source.run}:/replay:ro
+      - ${BAG_PLAY_SCRIPT:?set by ros2-bag-player-up}:/play.sh:ro
+    command: ["/bin/bash", "/play.sh"]   # bash, not sh: play.sh sources ROS `setup.bash` (bash-only)
