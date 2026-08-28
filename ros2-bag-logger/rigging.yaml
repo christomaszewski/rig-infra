@@ -31,6 +31,11 @@ examples: [config/ros2-bag-logger.example.yaml]   # default config for `rig cert
 # `images.base` skips the base build but NOT the overlay (built FROM the external ref).
 build: { command: ../base/build.sh, images: [fleet-ros], provides: base,
          msgs_overlay: { command: ../msgs/build-msgs.sh, image: fleet-ros-msgs } }
+# Replay sim-time adoption (rig >= v0.2.34): bag_cmd fills `control.use_sim_time`'s DEFAULT from
+# rig's RIG_SIM_TIME token (explicit config wins both ways) — under `rig replay` the recorder then
+# stamps the replay run's bag on BAG time (/clock from the player, same token) and the
+# source/replay A/B pair aligns by timestamp. Older rigs ignore this key (declaration-as-docs).
+replay: { sim_time: true }
 launch_surface:
   - ros2-bag-logger-up
   - tools/bag_cmd.py

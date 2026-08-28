@@ -61,8 +61,11 @@ def _all_or_names(args: list[str], val, key: str, all_flag: str, list_flag: str)
         raise SystemExit(f"bag_cmd: record.{key} must be 'all' or a list of names")
 
 
-def build_args(cfg: dict) -> tuple[str, str, str, list[str], list[str]]:
-    """(name, output-subdir, node-name, ros2-bag-record argv WITHOUT -o, warnings). Pure — no I/O."""
+def build_args(cfg: dict, sim_time_env: str | None = None) -> tuple[str, str, str, list[str], list[str]]:
+    """(name, output-subdir, node-name, ros2-bag-record argv WITHOUT -o, warnings). Pure — no I/O.
+    `sim_time_env` is the caller's RIG_SIM_TIME (rig's one clock token, exported under
+    `rig replay`): it fills the use_sim_time DEFAULT when the config doesn't set
+    `control.use_sim_time` — an explicit config value wins both ways."""
     name = str(cfg.get("name") or "bag_logger")
     rec = cfg.get("record") or {}
     out = cfg.get("output") or {}
@@ -160,7 +163,11 @@ def build_args(cfg: dict) -> tuple[str, str, str, list[str], list[str]]:
         args.append("--start-paused")
     if ctl.get("snapshot"):
         args.append("--snapshot-mode")
-    if ctl.get("use_sim_time"):
+    # Sim time (rigging declares `replay: {sim_time: true}` on the strength of this): explicit
+    # `control.use_sim_time` wins BOTH ways; absent, rig's RIG_SIM_TIME fills the default — under
+    # `rig replay` the player publishes /clock from the SAME token, so the recorder stamps the
+    # replay run's bag on BAG time and the source/replay A/B pair aligns by timestamp.
+    if ctl.get("use_sim_time") if "use_sim_time" in ctl else sim_time_env:
         args.append("--use-sim-time")
 
     if cfg.get("services"):
@@ -254,9 +261,10 @@ def graph_params(cfg: dict) -> tuple[bool, str, str]:
     return bool(g.get("enabled")), fmt(g.get("interval_s")), fmt(g.get("settle_s"))
 
 
-def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str, bool]:
+def render(cfg: dict, repo: pathlib.Path,
+           sim_time_env: str | None = None) -> tuple[str, str, bool]:
     """Write var/run/<name>/record.sh and return (name, script-path, shm-enabled)."""
-    name, subdir, node, args, warns = build_args(cfg)
+    name, subdir, node, args, warns = build_args(cfg, sim_time_env)
     shm, shm_on = zenoh_env_lines(cfg, warns)
     for w in warns:
         sys.stderr.write("ros2-bag-logger: " + w + "\n")
@@ -290,8 +298,10 @@ def main() -> int:
     if len(sys.argv) != 3:
         sys.stderr.write("usage: bag_cmd.py <config.yaml> <repo-dir>\n")
         return 2
+    import os
     cfg = yaml.safe_load(open(sys.argv[1])) or {}
-    name, script, shm_on = render(cfg, pathlib.Path(sys.argv[2]))
+    name, script, shm_on = render(cfg, pathlib.Path(sys.argv[2]),
+                                  sim_time_env=os.environ.get("RIG_SIM_TIME"))
     graph_on, interval_s, settle_s = graph_params(cfg)
     print("\t".join([name, script, "shm" if shm_on else "",
                      "graph" if graph_on else "", interval_s, settle_s]))

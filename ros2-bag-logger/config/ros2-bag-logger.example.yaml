@@ -52,7 +52,9 @@ output:
 #                          # the default false = record unless told otherwise, fail-recording)
 #   snapshot: true         # keep only the last max_cache_mb of messages in RAM; dump to disk on
 #                          # .../snapshot (incident capture — nothing is written until triggered)
-#   use_sim_time: false    # SITL/sim rigs: stamp messages from /clock
+#   use_sim_time: false    # stamp from /clock. DEFAULT follows rig's RIG_SIM_TIME token
+#                          # (set under `rig replay` -> replay bags record on BAG time);
+#                          # an explicit value here wins both ways
 
 # Zenoh session tweaks (rmw_zenoh only; inert under other RMWs). Rendered into record.sh as one
 # ZENOH_CONFIG_OVERRIDE export — rmw_zenoh applies the pairs ON TOP of the session config it loads
