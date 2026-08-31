@@ -10,28 +10,59 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="${BAG_PLAYER_PYTHON:-python3}"
 
-CONFIG="${1:?usage: ros2-bag-player-up <config.yaml> [up [-d]|down|status|logs|config|...]}"; shift || true
+CONFIG="${1:?usage: ros2-bag-player-up <config.yaml> [up [-d]|down|status|logs|config|export-calls|...]}"; shift || true
 [ -f "$CONFIG" ] || { echo "ros2-bag-player-up: config not found: $CONFIG" >&2; exit 1; }
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 
 # config + replay env -> the exact `ros2 bag play` command, rendered to var/run/<name>/play.sh
 # (captured by `rig bake` like any launcher-rendered file; session resolution is HOST-side at
-# render — the source run is static). play_cmd prints "<name>\t<script>\t<host-source>"; the
-# third field is the RESOLVED source run (RIG_REPLAY_SOURCE, or the config's source.run
-# standalone) — exported below so the compose's ro mount interpolates either way.
+# render — the source run is static). play_cmd prints
+# "<name>\t<script>\t<host-source>\t<container-session-path>\t<services-source>\t<calls>":
+# the host source (RIG_REPLAY_SOURCE, or the config's source.run standalone) is exported for the
+# compose's ro mount; the session path + services source feed the export-calls one-shot; `calls`
+# (RIG_REPLAY_CALLS, or the config's `calls:` path — env wins, play_cmd WARNs) may be EMPTY and
+# gates the call-injector's compose profile. Split on tabs by hand — `read` with a whitespace
+# IFS collapses runs of tabs, losing empty fields.
 NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/play_cmd.py" "$CONFIG_ABS" "$REPO")"
-NAME="${NAME_AND_SCRIPT%%$'\t'*}"
-REST="${NAME_AND_SCRIPT#*$'\t'}"
-SCRIPT="${REST%%$'\t'*}"
-SOURCE="${REST#*$'\t'}"
+REST="$NAME_AND_SCRIPT"
+NAME="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+SCRIPT="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+SOURCE="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+SESSION="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+SVC_SOURCE="${REST%%$'\t'*}"
+CALLS="${REST#*$'\t'}"
 export BAG_PLAYER_NAME="$NAME"
 export BAG_PLAY_SCRIPT="$SCRIPT"
 export RIG_REPLAY_SOURCE="$SOURCE"
+# The injector writes <run>/calls/<NAME>/ — the player config's name, run-dir doctrine.
+export CALL_INJECTOR_NAME="$NAME"
+[ -n "$CALLS" ] && export RIG_REPLAY_CALLS="$CALLS"
 
 # rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros2-bag-player_${NAME}}"
 FILES=(-f "$REPO/docker/compose.deploy.yaml")
 ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
 [ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
-echo "ros2-bag-player-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} source=$SOURCE script=$SCRIPT" >&2
-exec docker compose "${FILES[@]}" "${ARGS[@]}"
+
+# export-calls (rig-replay-calls-handoff §1.3): one-shot container over the SAME resolved
+# session the play verb would use — server-side `_service_event` topics (or client-side, per
+# play.services_source) -> schema-v1 call-script YAML on STDOUT (redirect it, edit, replay with
+# `calls:`). -T keeps stdout clean for the redirect; compose chatter goes to stderr.
+if [ "${ARGS[0]}" = "export-calls" ]; then
+  echo "ros2-bag-player-up: export-calls session=$SESSION requests-source=$SVC_SOURCE" >&2
+  exec docker compose "${FILES[@]}" run --rm --no-deps -T \
+    -e CALL_EXPORT_SOURCE="$SVC_SOURCE" bag-player python3 /export_calls.py "$SESSION"
+fi
+
+# The call-injector (profiles: ["calls"]): the profile flag goes on `up` only when a call script
+# is in play — but UNCONDITIONALLY on down/status/logs/ps, so an injector left running from a
+# since-disabled (or since-removed) config is still torn down and visible; a profile matching no
+# container is harmless (the graph-snapshotter pattern).
+PROFILE=()
+case "${ARGS[0]}" in
+  up) [ -n "$CALLS" ] && PROFILE=(--profile calls) ;;
+  down|ps|logs) PROFILE=(--profile calls) ;;
+esac
+echo "ros2-bag-player-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} source=$SOURCE script=$SCRIPT${CALLS:+ calls=$CALLS}" >&2
+# ${PROFILE[@]+...}: an EMPTY array under `set -u` is an error on bash < 4.4 (macOS dev boxes)
+exec docker compose "${FILES[@]}" ${PROFILE[@]+"${PROFILE[@]}"} "${ARGS[@]}"

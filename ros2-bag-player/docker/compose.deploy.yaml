@@ -29,4 +29,44 @@ services:
     volumes:
       - ${RIG_REPLAY_SOURCE:?exported by rig replay, or by ros2-bag-player-up from source.run}:/replay:ro
       - ${BAG_PLAY_SCRIPT:?set by ros2-bag-player-up}:/play.sh:ro
+      - ../tools/export_calls.py:/export_calls.py:ro   # the export-calls one-shot's tool (static, launcher-invoked via `compose run`)
     command: ["/bin/bash", "/play.sh"]   # bash, not sh: play.sh sources ROS `setup.bash` (bash-only)
+    # The injector must have its /clock subscription standing before play starts (t=0 is the
+    # FIRST sample it observes). `required: false` keeps the dependency inert whenever the
+    # `calls` profile is inactive — a topic-only replay behaves exactly as before.
+    depends_on:
+      call-injector:
+        condition: service_started
+        required: false
+
+  # call-injector — the scripted half of service replay (rig-replay-calls-handoff §1.2):
+  # executes a schema-v1 call-script YAML (recorded calls exported via `export-calls` and
+  # retimed/edited, or brand-new ones) against the LIVE graph's servers, on the replay clock
+  # (`t` counts from the first /clock sample under RIG_SIM_TIME; wall time from start under
+  # --wall-clock replays). Results append to <run>/calls/<name>/results.yaml — so unlike the
+  # player it mounts the DATA ROOT rw and resolves `current` once at start (record.sh doctrine).
+  # Profile-gated: ros2-bag-player-up adds `--profile calls` on `up` only when RIG_REPLAY_CALLS
+  # (or the config's `calls:` path) is set — and unconditionally on down/status/logs/ps, so an
+  # injector from a since-disabled config is still torn down and visible. The /dev/null default
+  # keeps the un-profiled interpolation quiet. restart: "no" — exit 0 = the timeline is
+  # exhausted, a FINISHED injection (the player exit-semantics doctrine, never relaunch).
+  call-injector:
+    profiles: ["calls"]
+    image: ${BAG_PLAYER_IMAGE:-${RIG_MSGS_IMAGE:-${RIG_BASE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}}}
+    network_mode: host            # call servers on the same graph the player feeds
+    restart: "no"                 # timeline exhausted -> exit 0 -> injection FINISHED (never loop it back up)
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      RIG_BAG_ROOT: /data
+      RIG_SIM_TIME: ${RIG_SIM_TIME:-}                      # one rig-owned clock token, third consumer
+      CALL_INJECTOR_NAME: ${CALL_INJECTOR_NAME:-bag_player}
+    volumes:
+      - ${RIG_DATA_DIR:-/data}:/data                       # rw: results.yaml lands in the run dir
+      - ${RIG_REPLAY_CALLS:-/dev/null}:/calls.yaml:ro      # default keeps un-profiled interpolation quiet
+      - ../tools/call_injector.py:/call_injector.py:ro     # static tool — no render, mounted from the repo
+    # Source ROS defensively before exec'ing python3 (the record.sh pattern). $$ = literal $ for
+    # the container shell: these expand IN the container, never at compose-interpolation time.
+    command: ["/bin/bash", "-c",
+              "[ -n \"$${ROS_DISTRO:-}\" ] && [ -f \"/opt/ros/$$ROS_DISTRO/setup.bash\" ] && . \"/opt/ros/$$ROS_DISTRO/setup.bash\"; exec python3 /call_injector.py"]

@@ -35,7 +35,9 @@ def _ls(fs):
 def _build(cfg=None, env=None, fs=None):
     cfg = {"service": "ros2-bag-player", "name": "bag_player",
            "source": {"run": RUN}, **(cfg or {})}
-    return play_cmd.build_args(cfg, env or {}, _ls(_fs() if fs is None else fs))
+    # v1.10.0 grew a 6th element (extras: calls path + services_source) — sliced off here so the
+    # frozen v1.8.0 assertions stay verbatim; test_play_cmd_services.py covers the extras.
+    return play_cmd.build_args(cfg, env or {}, _ls(_fs() if fs is None else fs))[:5]
 
 
 def _expect_exit(needle, **kw):

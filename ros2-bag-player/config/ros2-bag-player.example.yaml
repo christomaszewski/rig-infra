@@ -32,6 +32,25 @@ play:
   start_offset_s: 0      # skip this many seconds into the recording (float ok)
   start_paused: false    # come up subscribed but hold data until resumed via rosbag2's own player
   #                        services (/rosbag2_player/{pause,resume,toggle_paused,...})
+  services: []           # VERBATIM service playback: recorded requests re-issued at live servers
+  #                        (--publish-service-requests + this allow-list). Standalone only;
+  #                        RIG_REPLAY_SERVICES shadows it (WARN — rig computes the with-set's
+  #                        observed provides minus requires). Services absent from the bag are
+  #                        tolerated. Responses go to the PLAYER, not to original callers — this
+  #                        replays calls AT servers. Mutually exclusive with `calls:` below.
+  services_source: service  # service | client — which side's recorded `_service_event`s requests
+  #                        are reconstructed from (servers under test adopted introspection; their
+  #                        callers may not have). Also governs the `export-calls` verb.
   # NO clock knob, on purpose: --clock derives from rig's RIG_SIM_TIME alone (one rig-owned
   # token, two consumers — the player's /clock and the services' use_sim_time). Declaring
   # play.clock here is refused at parse; standalone sim-time runs export RIG_SIM_TIME=1 instead.
+
+# calls: /abs/path/to/calls.yaml
+#                      # The CALL INJECTOR (script mode — subsumes verbatim playback, and setting
+#                        both this and play.services is refused): a schema-v1 call-script YAML
+#                        (bootstrap one with `ros2-bag-player-up <config> export-calls`, then
+#                        retime/edit/inject), executed on the replay clock — `t` counts from the
+#                        first /clock sample under RIG_SIM_TIME, wall time from injector start
+#                        otherwise. Mounted read-only; results append to
+#                        <run>/calls/<name>/results.yaml. Standalone only; RIG_REPLAY_CALLS
+#                        shadows it (WARN). Injector exit 0 = a finished timeline, not a failure.

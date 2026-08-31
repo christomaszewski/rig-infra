@@ -24,8 +24,10 @@ one in CI).
 - **`ros2-bag-player/`** — the SIL replay player (`autonomy` tier): joins the graph like any
   service and plays a selected topic subset from a SOURCE run's bags, mounted read-only. It never
   decides what to play — `rig replay` (or the standalone config) hands it the set. An exited
-  player is a finished replay, not a failure. See
-  [SIL replay](#sil-replay--the-ros2-bag-player-service).
+  player is a finished replay, not a failure. Also carries the service-call half of replay:
+  verbatim service playback (recorded requests re-issued at live servers) and the **call
+  injector** (a YAML timeline of calls executed on the replay clock, bootstrapped by the
+  `export-calls` verb). See [SIL replay](#sil-replay--the-ros2-bag-player-service).
 - **`ros1-bag-logger/`** — the ROS 1 sibling (`rosbag record`), for ROS 1 fleets with a roscore.
 - **`base/`** — the `fleet-ros` image: `ros:<distro>-ros-base` + the fleet's rmw + `rosbag2` (+ mcap).
   `base/build.sh <registry> [tag]` follows the rig build contract; the router and ros2 bag logger
@@ -233,6 +235,78 @@ offset (the same gap that motivated the logger's `repeat_transient_local` knob �
 it narrows the loss to the current split). Player memory is dominated by rosbag2's read-ahead
 queue (1000 messages): ~1 GB on a bag of ~1 MB messages, trivial on telemetry-sized ones; a
 900 MB mcap starts feeding subscribers ~2.7 s after `up` (dev-box numbers).
+
+### Service replay — verbatim playback and the call injector
+
+Topics feed a service under test its *data*; its **service calls** are the other half of a SIL
+session. Both capabilities land in `ros2-bag-player` (contract frozen in
+`rig-replay-calls-handoff.md` §1; rig ≥ v0.2.37 drives them), and both replay calls **at**
+servers: responses go to the **player/injector, not to original callers** — the with-set's own
+clients re-issue their calls live. Recording is upstream: the bag logger's
+`record.services`/`record.actions` capture per-service `…/_service_event` topics, which exist
+only for servers/clients that enabled introspection (**CONTENTS** level — metadata-only events
+record nothing replayable; `service-introspection-adoption-prompt.md` is the per-service
+adoption recipe).
+
+**Verbatim playback** (`RIG_REPLAY_SERVICES`, or standalone `play.services`): recorded requests
+re-issued at the live servers, mapped to rosbag2's service playback
+(`--publish-service-requests` + the `--services` allow-list — greedy like `--topics`, and the
+two filters compose). rig computes the set as the with-set's observed `provides` minus its
+observed `requires` (the self-echo twin: replaying a with-set client's own calls would
+double-call). Only ever set **alongside a topic selector mode** — services replay within a topic
+session; SERVICES alone is refused. Services absent from the bag are tolerated. The
+`play.services_source` knob (`service` | `client`, default `service`) picks which side's
+recorded events requests are reconstructed from — servers under test adopted introspection;
+their callers may not have. The env var shadows `play.services` with a WARN, the topics pattern.
+
+**The call injector** (`RIG_REPLAY_CALLS`, or standalone `calls:` — env wins, WARN): a
+schema-v1 YAML timeline of calls, executed on the replay clock by a second compose service
+(profile `calls`, activated by the launcher when a script is in play; `restart: "no"`). Script
+mode **subsumes** verbatim playback — setting both is refused (double-call discipline). The
+schema (strict — unknown keys fail loudly):
+
+```yaml
+schema: 1
+timeout_s: 5                 # per-call default; a call NEVER stalls the timeline
+calls:
+  - {t: 12.5, service: /planner/set_mode, type: my_msgs/srv/SetMode, request: {mode: AUTO}}
+  - {t: 47.0, service: /planner/set_mode, type: my_msgs/srv/SetMode, request: {mode: RTL},
+     timeout_s: 10}
+```
+
+`t` counts from the **first `/clock` sample** the injector observes (≈ play start; under
+`start_offset_s` the zero shifts with it) when `RIG_SIM_TIME=1` — so `-r` scales the call
+timeline exactly like the bag — and from injector start under `--wall-clock` replays. The
+injector sorts by `t` (authors may append out of order), validates every `type`/`request`
+against the installed srv types **at load** — a type missing from the image refuses before the
+first call, naming the msgs-overlay fix — and appends
+`{t, service, ok, latency_s, response|error}` per call to `<run>/calls/<name>/results.yaml`
+(data root mounted rw, `current` resolved once at start; responses capped at 4 KB with
+`truncated: true` — results are a log, the replay run's own service events are the full
+record). **Exit 0 = the timeline is exhausted**: a finished injection, not a failure, exactly
+like the player's own exit semantics.
+
+**`export-calls` — the bootstrap.** `ros2-bag-player-up <config> export-calls` resolves the
+source session exactly as `up` would, reads its `…/_service_event` topics in a one-shot
+container, and emits a schema-v1 script on **stdout** — redirect, edit (retime one call, drop
+one, inject a new one), replay with it. Events without request contents export as YAML comments
+naming the service — visible, never silently dropped. An exported-but-unedited script, injected,
+reproduces verbatim playback (same calls, same order, times within pacing tolerance) — that
+round-trip is what lets an operator edit *one* call without perturbing the rest. rig adds no
+verb: ROS stays on this side of the line.
+
+Findings worth knowing (verified live on lyrical): a **slow server does not stall the topic
+timeline** — the player publishes requests per the bag timeline, fire-and-forget, and exits 0
+without waiting for outstanding responses (a blocked single-threaded server just queues them);
+lyrical's `-x/--exclude-regex` excludes topics, **services and actions alike** — an exclude-mode
+replay with services should keep its regex away from service names; a topic-only replay never
+touches services (the bag's `…/_service_event` channels replay as calls only under
+`--publish-service-requests`, and in allow mode they are not in the `--topics` list); the
+round-trip holds to tens of milliseconds — the injector pins `t=0` within one or two 40 Hz
+`/clock` samples of play start (the player compose `depends_on` the injector, so the
+subscription is standing first), and an unedited export re-fires within ~20 ms of the recorded
+offsets, `-r 2` compressing wall time exactly 2×. A timed-out call blocks the timeline for at
+most its own `timeout_s` (calls are sequential — script accordingly).
 
 ## Graph topology capture — the graph-snapshotter sidecar
 

@@ -51,10 +51,28 @@ jobs:
           mkdir -p /tmp/replay-src/bags/bag_logger/bag_logger_20260101T000000Z
           touch /tmp/replay-src/bags/bag_logger/bag_logger_20260101T000000Z/certify_0.mcap
           RIG_REPLAY_SOURCE=/tmp/replay-src ./.rig/rig certify --repo ros2-bag-player
-      # The player's pure core — the selector doctrine (TOPICS xor EXCLUDE, allow-mode filtering,
-      # clock-knob refusal) rig v0.2.33's `rig replay` is built against.
+      # The player's service-call paths (rig-replay-calls-handoff §1, rig >= v0.2.37): verbatim
+      # service playback rides the topic session's env; a call script activates the injector's
+      # `calls` compose profile (gated on `up` only — `config` renders the player alone, like
+      # the logger's graph path).
+      - name: certify ros2-bag-player (services + calls paths)
+        run: |
+          printf 'schema: 1\ncalls: []\n' > /tmp/calls.yaml
+          RIG_REPLAY_SOURCE=/tmp/replay-src RIG_REPLAY_TOPICS="/a /b" \
+            RIG_REPLAY_SERVICES="/planner/set_mode" ./.rig/rig certify --repo ros2-bag-player
+          RIG_REPLAY_SOURCE=/tmp/replay-src RIG_REPLAY_CALLS=/tmp/calls.yaml \
+            ./.rig/rig certify --repo ros2-bag-player
+      # The player's pure cores — the selector doctrine (TOPICS xor EXCLUDE, allow-mode
+      # filtering, clock-knob refusal) rig v0.2.33's `rig replay` is built against, plus the
+      # v1.10.0 service-call layer: the §1.1 refusal matrix, the injector's strict script
+      # schema + results contract, and export-calls' schema-v1 emission (round-tripped through
+      # the injector's own parser) rig v0.2.37 is built against.
       - name: ros2-bag-player unit tests
-        run: python3 ros2-bag-player/tests/test_play_cmd.py
+        run: |
+          python3 ros2-bag-player/tests/test_play_cmd.py
+          python3 ros2-bag-player/tests/test_play_cmd_services.py
+          python3 ros2-bag-player/tests/test_call_injector.py
+          python3 ros2-bag-player/tests/test_export_calls.py
       - name: certify ros1-bag-logger
         run: ./.rig/rig certify --repo ros1-bag-logger
       # RIG_BASE_IMAGE, consumer side: with a base exported the stacks RUN it; with none — certify's

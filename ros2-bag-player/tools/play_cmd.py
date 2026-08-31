@@ -20,6 +20,20 @@ EVERYTHING). Exclude mode merges ``RIG_REPLAY_EXCLUDE`` + ``play.exclude`` into 
 ``--clock`` derives from ``RIG_SIM_TIME`` alone; a ``play.clock`` config key is REFUSED at parse —
 clock coherence is one rig-owned token and the incoherent state stays unrepresentable.
 
+Service playback + the call injector (rig-replay-calls-handoff §1, frozen; rig >= v0.2.37):
+``RIG_REPLAY_SERVICES`` (space-separated service names, same grammar as TOPICS — rig computes the
+with-set's observed ``provides`` minus its observed ``requires``) maps to rosbag2's service
+playback; it is REFUSED without a topic selector mode (services replay only within a topic
+session) and REFUSED alongside ``RIG_REPLAY_CALLS`` (script mode subsumes verbatim — a scripted
+call plus its recorded twin would double-call). Standalone: ``play.services`` allow-list, shadowed
+by the env var with a WARN — exactly the topics pattern. ``play.services_source``
+(``service`` | ``client``, default ``service``) picks which side's recorded events requests are
+reconstructed from — servers under test adopted introspection; their callers may not have.
+``RIG_REPLAY_CALLS`` (or a standalone top-level ``calls:`` path — env wins, WARN) names the
+call-script YAML; the launcher activates the injector's compose profile on it, and play.sh itself
+emits NO service flags in calls mode. Services absent from the bag are tolerated (rig's selector
+may name services no caller exercised).
+
 Session resolution (§1.3) happens HOST-side at render — the source run is static (unlike
 record.sh's live ``current``), so the container path ``/replay/bags/<logger>/<session>`` is baked
 into play.sh. ``session: latest`` = the lexically-greatest stamped dir (stamps sort
@@ -32,6 +46,13 @@ Flag spellings track the fleet-ros distro (lyrical, verified live against rosbag
 path), ``-x/--exclude-regex REGEX`` (one regex string; pre-Iron play spelled it ``--exclude``),
 ``--start-offset SECONDS`` (float ok), ``--clock`` (bare = act as ROS time source; optionally
 takes a rate in Hz — we emit it bare), ``-l/--loop``, ``-p/--start-paused``, ``-r RATE``.
+Service playback (pinned live on lyrical, v1.10.0): ``--publish-service-requests`` (reconstruct
+recorded REQUESTS from the bag's ``…/_service_event`` topics and CALL live servers, instead of
+republishing the event topics as plain messages), ``--services s [s ...]`` (space-delimited,
+GREEDY like ``--topics`` — emitted just BEFORE the topic selector so the selector stays last and
+each greedy list is terminated by the next flag), ``--service-requests-source
+{service_introspection,client_introspection}`` (rosbag2's own default is service_introspection —
+we emit the flag only for ``client``, the defaults-emit-nothing pattern).
 """
 from __future__ import annotations
 
@@ -110,13 +131,17 @@ def resolve_session(source: str, logger: str, session: str, ls, warns: list[str]
     return chosen
 
 
-def build_args(cfg: dict, env: dict, ls=_ls) -> tuple[str, str, str, list[str], list[str]]:
-    """(name, host-source-dir, container-session-path, play argv AFTER the path, warnings).
-    Pure modulo the injected `ls`."""
+def build_args(cfg: dict, env: dict, ls=_ls) -> tuple[str, str, str, list[str], list[str], dict]:
+    """(name, host-source-dir, container-session-path, play argv AFTER the path, warnings,
+    extras). `extras` carries what the LAUNCHER (not play.sh) consumes: `calls` (the resolved
+    call-script host path, empty when calls mode is off — gates the injector's compose profile)
+    and `services_source` (`service`|`client` — also wired to export-calls). Pure modulo the
+    injected `ls`."""
     name = str(cfg.get("name") or "bag_player")
     src = _strict(cfg.get("source"), "source", {"run", "logger", "session"})
     play = _strict(cfg.get("play"), "play",
                    {"topics", "exclude", "rate", "loop", "start_offset_s", "start_paused",
+                    "services", "services_source",
                     "clock"})  # `clock` recognized only to refuse it by name below
     warns: list[str] = []
 
@@ -156,6 +181,60 @@ def build_args(cfg: dict, env: dict, ls=_ls) -> tuple[str, str, str, list[str], 
         warns.append("play.topics is ignored under RIG_REPLAY_EXCLUDE (rig chose exclude mode)")
     allow = t_env or ([] if x_env else cfg_topics)
 
+    # --- service playback XOR the call injector (rig-replay-calls-handoff §1.1–§1.2) ----------
+    svc_env = str(env.get("RIG_REPLAY_SERVICES") or "").split()
+    calls_env = str(env.get("RIG_REPLAY_CALLS") or "").strip()
+    cfg_services = play.get("services") or []
+    if not isinstance(cfg_services, list):
+        raise SystemExit("play_cmd: play.services must be a list of service names")
+    cfg_services = [str(s) for s in cfg_services]
+    src_mode = str(play.get("services_source") or "service")
+    if src_mode not in ("service", "client"):
+        raise SystemExit(f"play_cmd: play.services_source must be `service` or `client` (got "
+                         f"{src_mode!r}) — which side's recorded events requests are "
+                         "reconstructed from")
+    calls_cfg = cfg.get("calls")
+    if calls_cfg is not None and not isinstance(calls_cfg, str):
+        raise SystemExit("play_cmd: `calls` must be a string — the call-script YAML's absolute "
+                         "host path")
+    calls_cfg = str(calls_cfg or "").strip()
+
+    if svc_env and calls_env:
+        raise SystemExit("play_cmd: RIG_REPLAY_SERVICES and RIG_REPLAY_CALLS are both set — "
+                         "script mode subsumes verbatim playback (a scripted call plus its "
+                         "recorded twin would double-call); rig never sets both, refusing "
+                         "rather than guessing")
+
+    calls, services = "", []
+    if calls_env:
+        calls = calls_env
+        if calls_cfg:
+            warns.append("`calls` config path is shadowed by RIG_REPLAY_CALLS (rig's script "
+                         "governs)")
+        if cfg_services:
+            warns.append("play.services is suppressed under RIG_REPLAY_CALLS (script mode "
+                         "subsumes verbatim playback — no service flags are emitted)")
+    elif svc_env:
+        services = svc_env
+        if not t_env and not x_env:
+            raise SystemExit("play_cmd: RIG_REPLAY_SERVICES without a topic selector mode — "
+                             "services replay only within a topic session; rig always pairs it "
+                             "with RIG_REPLAY_TOPICS or RIG_REPLAY_EXCLUDE")
+        if cfg_services:
+            warns.append("play.services is shadowed by RIG_REPLAY_SERVICES (rig's selection "
+                         "governs)")
+        if calls_cfg:
+            warns.append("`calls` config path is ignored under RIG_REPLAY_SERVICES (rig chose "
+                         "verbatim mode — the injector is not activated)")
+    else:
+        if calls_cfg and cfg_services:
+            raise SystemExit("play_cmd: `calls` and play.services are both set — script mode "
+                             "subsumes verbatim playback (double-call discipline); drop one")
+        calls, services = calls_cfg, cfg_services
+    if calls and not os.path.isabs(calls):
+        raise SystemExit(f"play_cmd: the call script must be an absolute host path (got "
+                         f"{calls!r}) — it is bind-mounted read-only into the injector")
+
     args: list[str] = []
     try:  # `or`-defaulting would turn an explicit rate: 0 into 1.0 instead of a refusal
         rate = 1.0 if play.get("rate") is None else float(play.get("rate"))
@@ -180,6 +259,16 @@ def build_args(cfg: dict, env: dict, ls=_ls) -> tuple[str, str, str, list[str], 
     if str(env.get("RIG_SIM_TIME") or "") == "1":
         args.append("--clock")
 
+    # Verbatim service playback, just BEFORE the topic selector: --services is greedy like
+    # --topics, so the next flag terminates it and the selector stays last. Requests come from
+    # server-side events unless the config says client (rosbag2's own default is
+    # service_introspection — the flag is emitted only for the non-default).
+    if services:
+        args.append("--publish-service-requests")
+        if src_mode == "client":
+            args += ["--service-requests-source", "client_introspection"]
+        args += ["--services"] + services
+
     # Selector LAST: --topics is greedy (nargs+), nothing may follow it.
     if allow:
         kept = [t for t in allow if not any(re.search(p, t) for p in cfg_excl)]
@@ -195,14 +284,16 @@ def build_args(cfg: dict, env: dict, ls=_ls) -> tuple[str, str, str, list[str], 
         if pats:
             args += ["--exclude-regex", "|".join(f"(?:{p})" for p in pats)]
 
-    return name, source, container_path, args, warns
+    return name, source, container_path, args, warns, {"calls": calls,
+                                                       "services_source": src_mode}
 
 
-def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, str, str]:
-    """Write var/run/<name>/play.sh and return (name, script-path, host-source-dir). Everything is
-    resolved here at render time — the script is static (no runtime stamps: playback writes
-    nothing), captured by `rig bake` like any launcher-rendered file."""
-    name, source, path, args, warns = build_args(cfg, env)
+def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, str, str, str, str, str]:
+    """Write var/run/<name>/play.sh and return (name, script-path, host-source-dir,
+    container-session-path, services-source, calls-path-or-empty). Everything is resolved here at
+    render time — the script is static (no runtime stamps: playback writes nothing), captured by
+    `rig bake` like any launcher-rendered file."""
+    name, source, path, args, warns, extras = build_args(cfg, env)
     for w in warns:
         sys.stderr.write("ros2-bag-player: " + w + "\n")
     argv = " ".join(shlex.quote(a) for a in args)
@@ -220,7 +311,7 @@ def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, str, str]:
         f"exec ros2 bag play {shlex.quote(path)}{' ' + argv if argv else ''}\n"
     )
     script.chmod(0o755)
-    return name, str(script), source
+    return name, str(script), source, path, extras["services_source"], extras["calls"]
 
 
 def main() -> int:
@@ -228,8 +319,8 @@ def main() -> int:
         sys.stderr.write("usage: play_cmd.py <config.yaml> <repo-dir>\n")
         return 2
     cfg = yaml.safe_load(open(sys.argv[1])) or {}
-    name, script, source = render(cfg, dict(os.environ), pathlib.Path(sys.argv[2]))
-    print(name + "\t" + script + "\t" + source)
+    # Tab-separated for the launcher's hand-split; `calls` LAST because it may be empty.
+    print("\t".join(render(cfg, dict(os.environ), pathlib.Path(sys.argv[2]))))
     return 0
 
 

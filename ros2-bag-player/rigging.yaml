@@ -24,4 +24,6 @@ build: { command: ../base/build.sh, images: [fleet-ros] }
 launch_surface:
   - ros2-bag-player-up
   - tools/play_cmd.py
+  - tools/call_injector.py   # the call injector's tool (mounted, not rendered — the graph-snapshotter pattern)
+  - tools/export_calls.py    # the export-calls one-shot's tool (mounted into the player)
   - docker/compose.deploy.yaml
