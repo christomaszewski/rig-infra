@@ -77,7 +77,29 @@ def main() -> None:
         dest = os.path.join(src, f"repo{i}")
         # full clone (no --depth): `ref` may be a tag, branch, or bare SHA — all must resolve
         subprocess.run(["git", "clone", repo, dest], check=True)
-        subprocess.run(["git", "-C", dest, "checkout", "--detach", ref], check=True)
+        # Resolve BEFORE checkout: a NON-DEFAULT branch exists only as origin/<ref> in a fresh
+        # clone, and `checkout --detach <ref>` disables the DWIM (modern git dies 128 with
+        # "'--detach' cannot be used with '-b'"). Tags/SHAs/the default branch hit the first
+        # candidate; branches the second; neither = a pointed error naming what IS there.
+        sha = None
+        for cand in (ref, f"origin/{ref}"):
+            probe = subprocess.run(["git", "-C", dest, "rev-parse", "--verify", "--quiet",
+                                    cand + "^{commit}"], capture_output=True, text=True)
+            if probe.returncode == 0:
+                sha = probe.stdout.strip()
+                break
+        if sha is None:
+            tags = subprocess.run(["git", "-C", dest, "tag", "-l"], capture_output=True,
+                                  text=True).stdout.split()
+            branches = [b.strip() for b in subprocess.run(
+                ["git", "-C", dest, "branch", "-r"], capture_output=True, text=True
+            ).stdout.splitlines() if "->" not in b]
+            raise SystemExit(
+                f"build_msgs: ref '{ref}' not found in {repo} — not a tag, branch, or commit "
+                f"there. The rigging's msgs.source ref must be the pin the service builds "
+                f"against.\n  branches: {', '.join(branches) or 'none'}"
+                f"\n  tags: {', '.join(tags[:20]) or 'none'}{' …' if len(tags) > 20 else ''}")
+        subprocess.run(["git", "-C", dest, "checkout", "--detach", sha], check=True)
         # rev-parse the clone that will be BUILT — the truth, not a re-echo of the declaration
         rev = subprocess.run(["git", "-C", dest, "rev-parse", "HEAD"], check=True,
                              capture_output=True, text=True).stdout.strip()
