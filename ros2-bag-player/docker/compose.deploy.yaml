@@ -69,4 +69,4 @@ services:
     # Source ROS defensively before exec'ing python3 (the record.sh pattern). $$ = literal $ for
     # the container shell: these expand IN the container, never at compose-interpolation time.
     command: ["/bin/bash", "-c",
-              "[ -n \"$${ROS_DISTRO:-}\" ] && [ -f \"/opt/ros/$$ROS_DISTRO/setup.bash\" ] && . \"/opt/ros/$$ROS_DISTRO/setup.bash\"; exec python3 /call_injector.py"]
+              "[ -n \"$${ROS_DISTRO:-}\" ] && [ -f \"/opt/ros/$$ROS_DISTRO/setup.bash\" ] && . \"/opt/ros/$$ROS_DISTRO/setup.bash\"; [ -f /opt/fleet-msgs/setup.bash ] && . /opt/fleet-msgs/setup.bash; exec python3 /call_injector.py"]

@@ -50,8 +50,13 @@ ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
 # `calls:`). -T keeps stdout clean for the redirect; compose chatter goes to stderr.
 if [ "${ARGS[0]}" = "export-calls" ]; then
   echo "ros2-bag-player-up: export-calls session=$SESSION requests-source=$SVC_SOURCE" >&2
+  # bash -c wrapper: export_calls is PYTHON — a SOURCE-built overlay srv has no Python
+  # typesupport until /opt/fleet-msgs/setup.bash is sourced (the overlay bakes AMENT_PREFIX_PATH
+  # for C++ but deliberately NOT PYTHONPATH; apt-side types never notice). Distro first, overlay
+  # second, both defensive — the record.sh pattern extended.
   exec docker compose "${FILES[@]}" run --rm --no-deps -T \
-    -e CALL_EXPORT_SOURCE="$SVC_SOURCE" bag-player python3 /export_calls.py "$SESSION"
+    -e CALL_EXPORT_SOURCE="$SVC_SOURCE" bag-player /bin/bash -c \
+    '[ -n "${ROS_DISTRO:-}" ] && [ -f "/opt/ros/$ROS_DISTRO/setup.bash" ] && . "/opt/ros/$ROS_DISTRO/setup.bash"; [ -f /opt/fleet-msgs/setup.bash ] && . /opt/fleet-msgs/setup.bash; exec python3 /export_calls.py "$1"' -- "$SESSION"
 fi
 
 # The call-injector (profiles: ["calls"]): the profile flag goes on `up` only when a call script
