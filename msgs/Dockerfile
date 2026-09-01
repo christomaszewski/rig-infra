@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1
-# (the >=1.2 frontend: the builder RUN below uses --mount=type=ssh)
+# check=skip=InvalidDefaultArgInFrom
+# (^ parser directives, contiguous at the top by requirement. syntax: the >=1.2 frontend for the
+# builder RUN's --mount=type=ssh. check-skip: BASE_IMAGE has no default ON PURPOSE — build-msgs.sh
+# always passes it, and a hand-run `docker build` without it must fail LOUDLY rather than silently
+# compile against some default; the base image is the fleet's version authority.)
 # fleet-ros-msgs — the deployment's interface-package overlay on its base image.
 #
 # WHY: the ros2 bag logger records raw CDR and never deserializes, but Lyrical rosbag2 still refuses
