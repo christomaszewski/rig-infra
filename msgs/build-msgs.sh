@@ -50,9 +50,28 @@ trap 'rm -rf "$ctx"' EXIT
 cp "$msgs_dir/Dockerfile" "$msgs_dir/build_msgs.py" "$ctx/"
 cp "$manifest" "$ctx/msgs-manifest.yaml"
 
-echo "fleet-ros-msgs: building ${ref} FROM ${base} (manifest=${manifest})${RIG_BUILD_NO_CACHE:+ --no-cache}" >&2
+# ssh-form source repos clone inside the builder via BuildKit agent forwarding — the invoking
+# machine's keys, never baked into a layer (msgs/Dockerfile's --mount=type=ssh RUN). The flag is
+# passed only when the manifest needs it, so https-only fleets and agent-less CI are untouched.
+# An EMPTY agent forwards fine and then fails the clone confusingly (macOS git uses key files
+# directly, but BuildKit forwards the AGENT) — hence the ssh-add -l identity check, not just
+# a socket check.
+ssh_flag=""
+if grep -Eq '^[[:space:]]*-?[[:space:]]*repo:[[:space:]]*["'"'"']?(git@|ssh://)' "$ctx/msgs-manifest.yaml"; then
+    if [ -z "${SSH_AUTH_SOCK:-}" ] || ! ssh-add -l >/dev/null 2>&1; then
+        echo "build-msgs.sh: the manifest declares ssh-form source repos, but no ssh-agent with" >&2
+        echo "  loaded identities is available for BuildKit to forward. Fix on the build machine:" >&2
+        echo "    eval \"\$(ssh-agent)\"   # if no agent is running" >&2
+        echo "    ssh-add               # load the key that can clone those repos" >&2
+        echo "  (keys are FORWARDED into the builder stage only — never baked into the image)" >&2
+        exit 1
+    fi
+    ssh_flag="--ssh default"
+fi
+
+echo "fleet-ros-msgs: building ${ref} FROM ${base} (manifest=${manifest})${RIG_BUILD_NO_CACHE:+ --no-cache}${ssh_flag:+ ${ssh_flag}}" >&2
 # Unquoted on purpose: ${VAR:+word} expands to exactly one word or none (safe under `set -u`).
-docker build ${RIG_BUILD_NO_CACHE:+--no-cache} \
+docker build ${RIG_BUILD_NO_CACHE:+--no-cache} ${ssh_flag} \
     --build-arg "BASE_IMAGE=${base}" \
     --build-arg "ROS_DISTRO=${distro}" \
     -t "$ref" "$ctx"

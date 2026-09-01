@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+# (the >=1.2 frontend: the builder RUN below uses --mount=type=ssh)
 # fleet-ros-msgs — the deployment's interface-package overlay on its base image.
 #
 # WHY: the ros2 bag logger records raw CDR and never deserializes, but Lyrical rosbag2 still refuses
@@ -39,12 +41,20 @@ ARG ROS_DISTRO=lyrical
 # packages (rosidl generators' deps among them) are held at the base's versions; only what the base
 # lacks (the toolchain) installs fresh.
 RUN apt-get update && apt-get install -y --no-install-recommends --no-upgrade \
-        git build-essential cmake ros-dev-tools \
+        git openssh-client build-essential cmake ros-dev-tools \
         ros-${ROS_DISTRO}-rosidl-default-generators \
     && rm -rf /var/lib/apt/lists/*
 COPY msgs-manifest.yaml /msgs/manifest.yaml
 COPY build_msgs.py /msgs/build_msgs.py
-RUN . /opt/ros/${ROS_DISTRO}/setup.sh && python3 /msgs/build_msgs.py /msgs/manifest.yaml /opt/fleet-msgs
+# --mount=type=ssh forwards the INVOKING machine's ssh-agent into THIS RUN only — keys never
+# enter a layer or the image history. build-msgs.sh passes `--ssh default` iff the manifest
+# declares ssh-form repos (git@… / ssh://…); the mount is optional-by-default, so https-only
+# fleets (and agent-less CI) build exactly as before. accept-new: a fresh container has no
+# known_hosts, and the build's provenance record pins the resolved SHA anyway — TOFU is the
+# right posture here.
+RUN --mount=type=ssh . /opt/ros/${ROS_DISTRO}/setup.sh \
+    && GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
+       python3 /msgs/build_msgs.py /msgs/manifest.yaml /opt/fleet-msgs
 
 FROM ${BASE_IMAGE}
 ARG ROS_DISTRO=lyrical
