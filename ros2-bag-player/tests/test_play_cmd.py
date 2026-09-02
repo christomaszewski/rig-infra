@@ -19,6 +19,15 @@ import play_cmd
 RUN = "/data/runs/run-042"
 TREE = os.path.join(RUN, "bags", "bag_logger")
 S1, S2 = "bag_logger_20260827T100000Z", "bag_logger_20260828T090000Z"
+# v1.12.0: an offset/window (or a call script) reads the session's metadata.yaml host-side — the
+# injected reader serves this 120 s recording so the frozen v1.8.0 knob assertions stay verbatim.
+META = """rosbag2_bagfile_information:
+  version: 9
+  storage_identifier: mcap
+  duration: {nanoseconds: 120000000000}
+  starting_time: {nanoseconds_since_epoch: 1788361659604888347}
+  topics_with_message_count: []
+"""
 
 
 def _fs(sessions=(S1,), files=("meta.yaml",), bag="x_0.mcap"):
@@ -32,12 +41,16 @@ def _ls(fs):
     return lambda path: fs.get(path)
 
 
+def _read(path):
+    return META if path.endswith("metadata.yaml") else None
+
+
 def _build(cfg=None, env=None, fs=None):
     cfg = {"service": "ros2-bag-player", "name": "bag_player",
            "source": {"run": RUN}, **(cfg or {})}
     # v1.10.0 grew a 6th element (extras: calls path + services_source) — sliced off here so the
     # frozen v1.8.0 assertions stay verbatim; test_play_cmd_services.py covers the extras.
-    return play_cmd.build_args(cfg, env or {}, _ls(_fs() if fs is None else fs))[:5]
+    return play_cmd.build_args(cfg, env or {}, _ls(_fs() if fs is None else fs), _read)[:5]
 
 
 def _expect_exit(needle, **kw):

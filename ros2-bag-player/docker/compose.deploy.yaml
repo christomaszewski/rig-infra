@@ -22,18 +22,21 @@ services:
     image: ${BAG_PLAYER_IMAGE:-${RIG_MSGS_IMAGE:-${RIG_BASE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}}}
     network_mode: host            # join the graph / reach the zenoh router at localhost:7447
     restart: "no"                 # bag ends -> container exits 0 -> replay is FINISHED (never loop it back up)
-    environment:
-      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
-      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
-      VEHICLE_ID: ${VEHICLE_ID:-}
     volumes:
       - ${RIG_REPLAY_SOURCE:?exported by rig replay, or by ros2-bag-player-up from source.run}:/replay:ro
       - ${BAG_PLAY_SCRIPT:?set by ros2-bag-player-up}:/play.sh:ro
       - ../tools/export_calls.py:/export_calls.py:ro   # the export-calls one-shot's tool (static, launcher-invoked via `compose run`)
+      - ../tools/latch_restore.py:/latch_restore.py:ro # the latch pre-pass (rig-replay-window-handoff §1.2): play.sh
+                                                       # backgrounds it before a WINDOWED play (from > 0), never otherwise
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      BAG_PLAYER_NAME: ${BAG_PLAYER_NAME:-bag_player}   # the latch pre-pass node's namespace (/<name>/latch_restore)
     command: ["/bin/bash", "/play.sh"]   # bash, not sh: play.sh sources ROS `setup.bash` (bash-only)
-    # The injector must have its /clock subscription standing before play starts (t=0 is the
-    # FIRST sample it observes). `required: false` keeps the dependency inert whenever the
-    # `calls` profile is inactive — a topic-only replay behaves exactly as before.
+    # The injector must have its /clock subscription standing before play starts (it waits for
+    # the FIRST sample, expected at ≈ bag_start + from). `required: false` keeps the dependency
+    # inert whenever the `calls` profile is inactive — a topic-only replay behaves exactly as before.
     depends_on:
       call-injector:
         condition: service_started
@@ -41,10 +44,14 @@ services:
 
   # call-injector — the scripted half of service replay (rig-replay-calls-handoff §1.2):
   # executes a schema-v1 call-script YAML (recorded calls exported via `export-calls` and
-  # retimed/edited, or brand-new ones) against the LIVE graph's servers, on the replay clock
-  # (`t` counts from the first /clock sample under RIG_SIM_TIME; wall time from start under
-  # --wall-clock replays). Results append to <run>/calls/<name>/results.yaml — so unlike the
-  # player it mounts the DATA ROOT rw and resolves `current` once at start (record.sh doctrine).
+  # retimed/edited, or brand-new ones) against the LIVE graph's servers, on the replay clock.
+  # ONE zero — bag start (rig-replay-window-handoff §1.3): `t` counts from the session's
+  # starting_time, handed over by the launcher as CALL_INJECTOR_BAG_START_NS (sim time:
+  # t = /clock − bag start; --wall-clock: t = from + wall elapsed, approximate); the zero never
+  # shifts with a window, and the window (RIG_REPLAY_FROM_S / RIG_REPLAY_TO_S — rig's, or the
+  # launcher's re-export of the config's start/end offsets, clamped) FILTERS the script. Results
+  # append to <run>/calls/<name>/results.yaml — so unlike the player it mounts the DATA ROOT rw
+  # and resolves `current` once at start (record.sh doctrine).
   # Profile-gated: ros2-bag-player-up adds `--profile calls` on `up` only when RIG_REPLAY_CALLS
   # (or the config's `calls:` path) is set — and unconditionally on down/status/logs/ps, so an
   # injector from a since-disabled config is still torn down and visible. The /dev/null default
@@ -62,6 +69,9 @@ services:
       RIG_BAG_ROOT: /data
       RIG_SIM_TIME: ${RIG_SIM_TIME:-}                      # one rig-owned clock token, third consumer
       CALL_INJECTOR_NAME: ${CALL_INJECTOR_NAME:-bag_player}
+      CALL_INJECTOR_BAG_START_NS: ${CALL_INJECTOR_BAG_START_NS:-}   # the session's starting_time (ns) — the one zero; launcher-private, from metadata.yaml
+      RIG_REPLAY_FROM_S: ${RIG_REPLAY_FROM_S:-}            # the window, as resolved by the launcher (absent/empty = 0 / the bag end)
+      RIG_REPLAY_TO_S: ${RIG_REPLAY_TO_S:-}
     volumes:
       - ${RIG_DATA_DIR:-/data}:/data                       # rw: results.yaml lands in the run dir
       - ${RIG_REPLAY_CALLS:-/dev/null}:/calls.yaml:ro      # default keeps un-profiled interpolation quiet

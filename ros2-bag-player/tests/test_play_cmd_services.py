@@ -20,6 +20,14 @@ RUN = "/data/runs/run-042"
 TREE = os.path.join(RUN, "bags", "bag_logger")
 S1 = "bag_logger_20260827T100000Z"
 CALLS = "/deploy/scripts/calls.yaml"
+# v1.12.0: calls mode reads the session's metadata.yaml host-side (the injector's bag-start zero)
+META = """rosbag2_bagfile_information:
+  version: 9
+  storage_identifier: mcap
+  duration: {nanoseconds: 120000000000}
+  starting_time: {nanoseconds_since_epoch: 1788361659604888347}
+  topics_with_message_count: []
+"""
 
 
 def _fs():
@@ -30,7 +38,8 @@ def _build(cfg=None, env=None):
     cfg = {"service": "ros2-bag-player", "name": "bag_player",
            "source": {"run": RUN}, **(cfg or {})}
     fs = _fs()
-    return play_cmd.build_args(cfg, env or {}, lambda p: fs.get(p))
+    return play_cmd.build_args(cfg, env or {}, lambda p: fs.get(p),
+                               lambda p: META if p.endswith("metadata.yaml") else None)
 
 
 def _expect_exit(needle, **kw):
@@ -50,7 +59,8 @@ def test_rig_services_ride_alongside_the_topic_allow_list():
     assert args == ["--publish-service-requests",
                     "--services", "/planner/set_mode", "/planner/arm",
                     "--topics", "/gnss/fix", "/imu/data"]   # selector stays LAST (greedy)
-    assert extras == {"calls": "", "services_source": "service"}
+    assert (extras["calls"], extras["services_source"]) == ("", "service")
+    # v1.12.0 grew extras (bag_start_ns, from_s, to_s, latch) — test_play_cmd_window.py covers them
     assert not warns
 
 

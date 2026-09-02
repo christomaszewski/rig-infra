@@ -10,8 +10,10 @@ Requests are reconstructed from SERVER-side events by default (``CALL_EXPORT_SOU
 ``service`` | ``client`` — the launcher wires ``play.services_source`` through; servers under
 test adopted introspection, their callers may not have): ``service`` exports REQUEST_RECEIVED
 events, ``client`` REQUEST_SENT. ``t`` = the event's bag-receive stamp minus the session's
-metadata ``starting_time`` — the same zero rosbag2's ``--clock`` starts publishing from, so an
-exported ``t`` lands where the recording put it. Events without request CONTENTS (metadata-only
+metadata ``starting_time`` — BAG START, the ONE zero the injector counts from too
+(rig-replay-window-handoff §1.3: ``/clock − bag_start`` under sim time), so an exported ``t``
+lands where the recording put it under ANY replay window (``--from``/``--to`` count from the same
+zero; a window merely skips the calls outside it). Events without request CONTENTS (metadata-only
 introspection) export as YAML comments naming the service — visible, never silently dropped.
 
 Split like the siblings: a pure core (events -> script text, unit-tested in ``../tests/``
@@ -58,8 +60,9 @@ def script_text(calls: list[tuple], missing: dict, source_mode: str, session: st
         "# exported by ros2-bag-player export-calls — call-script schema v1 "
         "(rig-replay-calls-handoff §1.2)",
         f"# source: {session} (requests from {source_mode}-side events)",
-        "# `t` = seconds from play start on the replay clock; edit/retime/inject, then replay "
-        "with `calls:` / RIG_REPLAY_CALLS",
+        "# `t` = seconds from BAG START (metadata starting_time) — the one zero shared with "
+        "--from/--to and results.yaml; edit/retime/inject, then replay with `calls:` / "
+        "RIG_REPLAY_CALLS",
         "schema: 1",
         f"timeout_s: {DEFAULT_TIMEOUT_S}",
     ]

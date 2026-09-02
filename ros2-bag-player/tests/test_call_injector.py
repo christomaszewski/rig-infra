@@ -6,6 +6,10 @@ the file stays parseable through a mid-timeline SIGTERM, and `response` is cappe
 `truncated: true` degrading it to a clipped string (never a half-open YAML block). rig v0.2.37
 shallow-validates the same schema (schema/t) — a change that breaks these tests is a contract
 renegotiation, not a refactor.
+v1.12.0 adds the window half (rig-replay-window-handoff §1.3): the ONE zero (`t` = /clock −
+bag start under sim time, from + elapsed under wall time — never the first sample), the window
+as a FILTER (t < from skipped, t >= to never reached, t == from IN), and the ONE leading
+`# window:` comment line results.yaml carries before its first entry.
 Run: `python3 tests/test_call_injector.py` (no ROS — the rclpy shell imports lazily)."""
 import pathlib
 import sys
@@ -132,6 +136,52 @@ def test_plain_strips_message_containers():
     assert call_injector.plain(obj) == {"a": [1, 2], "b": [[3, 4]], "c": [{"d": 1}]}
     # yaml.safe_dump accepts the result (would refuse OrderedDict/array outright)
     yaml.safe_dump(call_injector.plain(obj))
+
+
+# --- the window filter + the one zero (rig-replay-window-handoff §1.3) --------------------------
+
+def _calls(*ts):
+    return _load(_script([{**CALL, "t": t} for t in ts]))
+
+
+def test_window_filters_before_after_and_keeps_t_equal_from():
+    calls = _calls(2, 8, 30, 32, 38, 44)
+    inside, before, after = call_injector.apply_window(calls, 30.0, 40.0)
+    assert [c["t"] for c in inside] == [30, 32, 38]             # t == from fires at window start
+    assert [c["t"] for c in before] == [2, 8]
+    assert [c["t"] for c in after] == [44]                      # t >= to is never reached
+    inside, before, after = call_injector.apply_window(calls, 0.0, None)   # unwindowed: all fire
+    assert len(inside) == 6 and not before and not after
+    inside, _, after = call_injector.apply_window(calls, 0.0, 44.0)        # to is EXCLUSIVE
+    assert [c["t"] for c in inside] == [2, 8, 30, 32, 38] and [c["t"] for c in after] == [44]
+    assert call_injector.apply_window([], 30.0, 40.0) == ([], [], [])
+
+
+def test_window_comment_line_names_the_skipped_calls():
+    calls = _calls(2, 8, 30, 32, 38, 44)
+    _, before, after = call_injector.apply_window(calls, 30.0, 40.0)
+    line = call_injector.window_comment(30.0, 40.0, before, after)
+    assert line == "# window: from=30 to=40; skipped: t=2 t=8 (before), t=44 (after)\n"
+    assert call_injector.window_comment(0.0, None, [], []) \
+        == "# window: from=0 to=end; skipped: none\n"
+    assert call_injector.window_comment(30.0, None, before, []) \
+        == "# window: from=30 to=end; skipped: t=2 t=8 (before)\n"
+    # the line is a YAML comment: prepended to appended entries, the file still parses as a list
+    text = line + call_injector.render_result(30.0, "/s", True, 0.001, response={"i": 1})
+    assert [e["t"] for e in yaml.safe_load(text)] == [30.0]
+    assert yaml.safe_load(line) is None                         # comment-only file = nothing fired
+
+
+def test_the_one_zero_never_shifts_with_the_window():
+    bag_start = 1788361659.604888347
+    # sim time: the first /clock sample under --start-offset 30 is ≈ bag_start + 30 -> t ≈ 30,
+    # NOT 0 (the pre-v1.12.0 bug: pinning t=0 at that sample fired everything 30 s late)
+    assert abs(call_injector.sim_now(bag_start + 30.0, bag_start) - 30.0) < 1e-6
+    assert abs(call_injector.sim_now(bag_start + 47.25, bag_start) - 47.25) < 1e-6
+    assert call_injector.sim_now(bag_start, bag_start) == 0.0   # unwindowed: first sample ≈ 0
+    # wall time: from + elapsed (approximate by construction)
+    assert call_injector.wall_now(2.5, 30.0) == 32.5
+    assert call_injector.wall_now(2.5, 0.0) == 2.5              # unwindowed: v1.10.x's elapsed
 
 
 if __name__ == "__main__":

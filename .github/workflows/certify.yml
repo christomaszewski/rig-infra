@@ -50,6 +50,10 @@ jobs:
         run: |
           mkdir -p /tmp/replay-src/bags/bag_logger/bag_logger_20260101T000000Z
           touch /tmp/replay-src/bags/bag_logger/bag_logger_20260101T000000Z/certify_0.mcap
+          # v1.12.0: a window or a call script reads the session's metadata.yaml host-side (the
+          # bag start is the injector's one zero; the duration bounds the window) — fabricate it.
+          printf 'rosbag2_bagfile_information:\n  version: 9\n  storage_identifier: mcap\n  duration: {nanoseconds: 120000000000}\n  starting_time: {nanoseconds_since_epoch: 1767225600000000000}\n  topics_with_message_count: []\n' \
+            > /tmp/replay-src/bags/bag_logger/bag_logger_20260101T000000Z/metadata.yaml
           RIG_REPLAY_SOURCE=/tmp/replay-src ./.rig/rig certify --repo ros2-bag-player
       # The player's service-call paths (rig-replay-calls-handoff §1, rig >= v0.2.37): verbatim
       # service playback rides the topic session's env; a call script activates the injector's
@@ -62,17 +66,28 @@ jobs:
             RIG_REPLAY_SERVICES="/planner/set_mode" ./.rig/rig certify --repo ros2-bag-player
           RIG_REPLAY_SOURCE=/tmp/replay-src RIG_REPLAY_CALLS=/tmp/calls.yaml \
             ./.rig/rig certify --repo ros2-bag-player
+      # The window path (rig-replay-window-handoff §1, rig >= v0.2.46): RIG_REPLAY_FROM_S/TO_S ->
+      # --start-offset + --playback-duration, validated against the fabricated metadata.yaml, and
+      # play.sh grows the latch pre-pass block (tools/latch_restore.py mounted into the player).
+      - name: certify ros2-bag-player (window path)
+        run: |
+          RIG_REPLAY_SOURCE=/tmp/replay-src RIG_REPLAY_FROM_S=30 RIG_REPLAY_TO_S=45 \
+            RIG_REPLAY_TOPICS="/a /b" ./.rig/rig certify --repo ros2-bag-player
       # The player's pure cores — the selector doctrine (TOPICS xor EXCLUDE, allow-mode
       # filtering, clock-knob refusal) rig v0.2.33's `rig replay` is built against, plus the
       # v1.10.0 service-call layer: the §1.1 refusal matrix, the injector's strict script
       # schema + results contract, and export-calls' schema-v1 emission (round-tripped through
-      # the injector's own parser) rig v0.2.37 is built against.
+      # the injector's own parser) rig v0.2.37 is built against — plus the v1.12.0 window layer
+      # (env -> flags, refuse/clamp against metadata, the latch topic-set intersection, the
+      # injector's window filter + one-zero time base) rig v0.2.46 is built against.
       - name: ros2-bag-player unit tests
         run: |
           python3 ros2-bag-player/tests/test_play_cmd.py
           python3 ros2-bag-player/tests/test_play_cmd_services.py
           python3 ros2-bag-player/tests/test_call_injector.py
           python3 ros2-bag-player/tests/test_export_calls.py
+          python3 ros2-bag-player/tests/test_play_cmd_window.py
+          python3 ros2-bag-player/tests/test_latch_restore.py
       - name: certify ros1-bag-logger
         run: ./.rig/rig certify --repo ros1-bag-logger
       # RIG_BASE_IMAGE, consumer side: with a base exported the stacks RUN it; with none — certify's

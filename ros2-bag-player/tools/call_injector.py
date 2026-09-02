@@ -11,13 +11,31 @@ Split like ``graph_snapshot.py``: a pure core (script parse/validate/sort + resu
 unit-tested in ``../tests/`` without ROS) and a thin rclpy shell (clock waiter, typed caller,
 results appender). rclpy imports lazily so the core stays importable on a dev box without ROS.
 
-Time base — one clock doctrine, third consumer: under ``RIG_SIM_TIME=1``, ``t`` counts from the
-FIRST ``/clock`` sample this process observes (≈ play start; under ``play.start_offset_s`` the
-zero shifts with it), so ``-r`` scales the timeline exactly like the bag. Without it
-(``--wall-clock`` replays), ``t`` counts from injector start. The compose gives the injector a
-head start (the player ``depends_on`` it, ``required: false``) and rosbag2 needs seconds to open
-a bag, so the subscription stands before the first sample; a missing ``/clock`` refuses after
-``CALL_INJECTOR_CLOCK_TIMEOUT_S`` (default 60) rather than hanging a replay forever.
+Time base — ONE zero, bag start (rig-replay-window-handoff §1.3, which replaced the calls
+handoff's first-sample rule): ``t`` counts from the session's ``starting_time`` (metadata.yaml),
+always — the same zero ``export-calls`` writes, ``--from``/``--to`` count in, and results.yaml
+reports. Under ``RIG_SIM_TIME=1``: ``now() = latest /clock − bag_start``, with the bag start
+handed over by the launcher (``CALL_INJECTOR_BAG_START_NS``, from the host-side metadata read),
+so ``-r`` scales the timeline exactly like the bag and a window NEVER shifts the zero (the first
+``/clock`` sample under ``--start-offset`` is ≈ ``bag_start + from``, and the injector logs the
+observed-vs-expected offset as a sanity line). Without ``/clock`` (``--wall-clock`` replays):
+``now() = from + wall-elapsed-since-injector-start`` — approximate by construction. The compose
+gives the injector a head start (the player ``depends_on`` it, ``required: false``) and rosbag2
+needs seconds to open a bag, so the subscription stands before the first sample; a missing
+``/clock`` refuses after ``CALL_INJECTOR_CLOCK_TIMEOUT_S`` (default 60) rather than hanging a
+replay forever. (Before v1.12.0 the zero was the first ``/clock`` sample — under an offset that
+is bag_start+offset, so an exported script replayed with any offset fired every call late by
+exactly the offset: two zeros in one contract. Fixed here.)
+
+The window is a FILTER over the script (``RIG_REPLAY_FROM_S`` / ``RIG_REPLAY_TO_S``, passed
+through by the launcher — the resolved, clamped values; standalone config windows arrive the
+same way): calls with ``t < from`` are SKIPPED, calls with ``t >= to`` are never reached; both
+are named in ONE leading ``# window: …; skipped: …`` comment line written to results.yaml before
+the first entry (results stay a list of FIRED calls — no schema change) and on stderr. A call at
+exactly ``t == from`` fires at window start, right after the first sample — the operator's tool
+for re-establishing the state a window cut. The injector exits 0 after the LAST in-window call;
+it never waits for ``to``, and a script with every call outside the window exits 0 right after
+the comment.
 
 Doctrine pins:
   - Type validation refuses at LOAD, before rclpy even initializes — a bad type or a request
@@ -168,6 +186,47 @@ def render_result(t: float, service: str, ok: bool, latency_s: float,
     return yaml.safe_dump([entry], default_flow_style=False, sort_keys=False)
 
 
+def apply_window(calls: list[dict], from_s: float, to_s: float | None
+                 ) -> tuple[list[dict], list[dict], list[dict]]:
+    """(in-window, skipped-before, skipped-after) over t-SORTED calls: `t < from` is before,
+    `t >= to` is after (to = None means the bag end — nothing is after), `t == from` is IN (it
+    fires at window start). Pure."""
+    before = [c for c in calls if c["t"] < from_s]
+    after = [] if to_s is None else [c for c in calls if c["t"] >= to_s]
+    inside = [c for c in calls if c["t"] >= from_s and (to_s is None or c["t"] < to_s)]
+    return inside, before, after
+
+
+def _ts(calls: list[dict]) -> str:
+    return " ".join(f"t={c['t']:g}" for c in calls)
+
+
+def window_comment(from_s: float, to_s: float | None, before: list[dict],
+                   after: list[dict]) -> str:
+    """The ONE leading results.yaml line (§1.3): `# window: from=<f> to=<t>; skipped: …`. Named
+    calls are the skipped ones by `t`; `to=end` when the window runs to the bag end; `skipped:
+    none` when every scripted call is inside. Always written — an unwindowed replay's line reads
+    `# window: from=0 to=end; skipped: none`, so results files self-describe either way."""
+    parts = []
+    if before:
+        parts.append(f"{_ts(before)} (before)")
+    if after:
+        parts.append(f"{_ts(after)} (after)")
+    to_txt = "end" if to_s is None else f"{to_s:g}"
+    return f"# window: from={from_s:g} to={to_txt}; skipped: {', '.join(parts) or 'none'}\n"
+
+
+def sim_now(clock_s: float, bag_start_s: float) -> float:
+    """`t` on the sim clock: the latest /clock sample minus the bag start — the one zero."""
+    return clock_s - bag_start_s
+
+
+def wall_now(elapsed_s: float, from_s: float) -> float:
+    """`t` without /clock: the window start plus wall time since the injector started
+    (approximate — no rate, no pacing information without a clock)."""
+    return from_s + elapsed_s
+
+
 # ---------------------------------------------------------------------------------------------
 # Shell — typed validation at load, clock waiter, caller, results appender.
 # ---------------------------------------------------------------------------------------------
@@ -218,6 +277,29 @@ def main() -> int:
     clock_timeout = float(os.environ.get("CALL_INJECTOR_CLOCK_TIMEOUT_S") or 60)
     root = os.environ.get("RIG_BAG_ROOT") or "/data"
 
+    def _env_seconds(key: str):
+        raw = str(os.environ.get(key) or "").strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            raise SystemExit(f"call_injector: {key} must be a number of seconds (got {raw!r})")
+    from_s = _env_seconds("RIG_REPLAY_FROM_S") or 0.0
+    to_s = _env_seconds("RIG_REPLAY_TO_S") or None      # 0/absent = the bag end
+    raw_start = str(os.environ.get("CALL_INJECTOR_BAG_START_NS") or "").strip()
+    bag_start_s = None
+    if raw_start:
+        try:
+            bag_start_s = int(raw_start) / 1e9
+        except ValueError:
+            raise SystemExit(f"call_injector: CALL_INJECTOR_BAG_START_NS must be integer ns "
+                             f"(got {raw_start!r})")
+    if sim and bag_start_s is None:
+        raise SystemExit("call_injector: RIG_SIM_TIME=1 but no CALL_INJECTOR_BAG_START_NS — the "
+                         "launcher (ros2-bag-player-up >= v1.12.0) hands over the session's bag "
+                         "start so `t` counts from it; without it the timeline has no zero")
+
     try:
         with open(script_path) as f:
             doc = yaml.safe_load(f)
@@ -225,6 +307,9 @@ def main() -> int:
         raise SystemExit(f"call_injector: cannot load call script {script_path}: {exc}")
     calls = load_script(doc)
     types = resolve_types(calls)       # the at-LOAD refusal — before init, before the first call
+    calls, before, after = apply_window(calls, from_s, to_s)
+    comment = window_comment(from_s, to_s, before, after)
+    sys.stderr.write("call-injector: " + comment[2:])
 
     out_dir = resolve_out_dir(root, name)
     os.makedirs(out_dir, exist_ok=True)
@@ -261,7 +346,12 @@ def main() -> int:
     interrupted = False
     fd = os.open(results, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
-        # --- the zero: first /clock sample (sim) or injector start (wall) --------------------
+        os.write(fd, comment.encode("utf-8"))   # the ONE leading line, before any entry
+        if not calls:
+            sys.stderr.write("call-injector: no call inside the window — nothing to fire\n")
+            return 0
+        # --- the zero: BAG START. Sim: wait for the first /clock sample (expected at
+        # ≈ bag_start + from) and count from bag_start; wall: from + elapsed. -------------------
         if sim:
             deadline = time.monotonic() + clock_timeout
             while latest["clock"] is None:
@@ -270,16 +360,18 @@ def main() -> int:
                                      f"{clock_timeout:g}s — is the player up with "
                                      "RIG_SIM_TIME=1 (--clock)?")
                 rclpy.spin_once(node, timeout_sec=0.05)
-            t0 = latest["clock"]
-            sys.stderr.write(f"call-injector: first /clock sample {t0:.3f} — t=0 pinned\n")
+            first_t = sim_now(latest["clock"], bag_start_s)
+            sys.stderr.write(f"call-injector: first /clock sample at t={first_t:.3f}s from bag "
+                             f"start (expected ≈ from={from_s:g}s; offset {first_t - from_s:+.3f}s)"
+                             " — t=0 is the bag start\n")
 
             def now() -> float:
-                return latest["clock"] - t0
+                return sim_now(latest["clock"], bag_start_s)
         else:
             start = time.monotonic()
 
             def now() -> float:
-                return time.monotonic() - start
+                return wall_now(time.monotonic() - start, from_s)
 
         # --- the timeline --------------------------------------------------------------------
         for c in calls:
@@ -318,7 +410,8 @@ def main() -> int:
     if interrupted:
         sys.stderr.write("call-injector: interrupted before the timeline finished\n")
         return 1
-    sys.stderr.write("call-injector: timeline exhausted — a finished injection, not a failure\n")
+    sys.stderr.write("call-injector: timeline exhausted (last in-window call fired) — a finished "
+                     "injection, not a failure\n")
     return 0
 
 

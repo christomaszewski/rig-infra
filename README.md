@@ -197,8 +197,10 @@ other verb):
   with two consumers (`--clock` here, `use_sim_time` in the services under test) — the
   incoherent state is unrepresentable.
 
-Playback knobs (`rate`, `loop`, `start_offset_s`, `start_paused`) live in the **config**, not rig
-CLI flags, so rig's run snapshot records every experiment's parameters — the run self-documents.
+Playback knobs (`rate`, `loop`, `start_offset_s`/`end_offset_s`, `start_paused`) live in the
+**config**, not rig CLI flags, so rig's run snapshot records every experiment's parameters — the
+run self-documents. (The one exception is a replay **window**, which is *selection*: `rig replay
+--from/--to` exports it as env and records it in the replay manifest — see below.)
 Session resolution is host-side at render (the source run is static, unlike the logger's live
 `current`): `session: latest` picks the greatest stamp, multiple sessions WARN naming the skipped
 ones, and a recording split into many files plays as **one** session (verified across a 4-way
@@ -230,11 +232,75 @@ or hand-export the `RIG_REPLAY_*` vars to exercise the rig channel.
 
 Findings worth knowing (verified on lyrical): recorded QoS restores durability on play — a
 subscriber joining mid-replay still receives `/tf_static`-style transient-local messages, even
-from a split recording; but `start_offset_s` **skips** latched messages recorded before the
-offset (the same gap that motivated the logger's `repeat_transient_local` knob — recording with
-it narrows the loss to the current split). Player memory is dominated by rosbag2's read-ahead
-queue (1000 messages): ~1 GB on a bag of ~1 MB messages, trivial on telemetry-sized ones; a
-900 MB mcap starts feeding subscribers ~2.7 s after `up` (dev-box numbers).
+from a split recording; but rosbag2's `--start-offset` **skips** latched messages recorded
+before the offset (the same gap that motivated the logger's `repeat_transient_local` knob) —
+which is why every windowed replay runs the **latch pre-pass** described below. Player memory
+is dominated by rosbag2's read-ahead queue (1000 messages): ~1 GB on a bag of ~1 MB messages,
+trivial on telemetry-sized ones; a 900 MB mcap starts feeding subscribers ~2.7 s after `up`
+(dev-box numbers).
+
+### Replay windows — `--from` / `--to`, the latch pre-pass, and the one zero
+
+A replay can play a **section** of the source recording (contract frozen in
+`rig-replay-window-handoff.md` §1; rig ≥ v0.2.46 drives it): `rig replay <run> <names…> --from S
+--to S` exports **`RIG_REPLAY_FROM_S`** / **`RIG_REPLAY_TO_S`** — float seconds from **bag
+start** (the session's `metadata.yaml` `starting_time`), `to` exclusive — and the player maps
+them to `--start-offset <from>` + `--playback-duration <to − from>`. Standalone, the config's
+`play.start_offset_s` / `play.end_offset_s` (0/absent = the bag end) are the same knobs; each
+env key shadows a non-zero config value with a WARN, exactly the topics pattern. Sweeps are shell
+loops over windows, and `--auto-end` composes for free: the player exits 0 at the window end.
+
+Validation is **host-side at render**, against the session's `metadata.yaml` (a rosbag2
+recording always has one; a window — or a call script, see below — refuses without it, naming
+the path): `from` at or past the bag's duration **refuses** ("window starts after the bag ends"),
+`from >= to` **refuses** (empty window), and `to` past the bag end **WARNs and clamps** to it —
+fixed-step sweeps hit the end naturally, and a clamped end emits no flag at all (the bag's own
+end is the bound). The end flag pinned live on lyrical: `--playback-duration` counts
+**recorded** seconds from the (offset) start, independent of `-r` and of `--clock`, so
+`[from, to)` means the same thing at any rate; its sibling `--playback-until-sec` is the same
+bound as an absolute epoch stamp (rosbag2 takes the later of the two) and stays unused.
+
+**The latch pre-pass.** rosbag2's `--start-offset` skips every transient-local message recorded
+before the offset, so a windowed replay of a planner would run without its `/tf_static` — a
+silently broken experiment. With `from > 0`, `play.sh` therefore starts
+`tools/latch_restore.py` in the background *before* `exec ros2 bag play` (same container, dies
+with it): it takes the recording's transient-local topics (every offered QoS profile
+`transient_local` in `metadata.yaml`; a topic with mixed offers plays volatile under rosbag2 and
+is not restored either), intersects them with **the main play's own selection** (the identical
+`--topics`/`--exclude-regex` argv — it can never publish a topic the main play would not, so
+rig's self-echo subtraction holds for latches too), reads the bag up to the window start and
+keeps the **last** message per topic before it, publishes each once with the recorded QoS
+(transient-local, the recorded reliability, depth 1) from `/<name>/latch_restore` — a node that
+groups under the player instance in rig's epoch reader (verified with `rig graph`; note that
+rosbag2's own `/rosbag2_player` and the injector's `/call_injector_<name>` sit at the root and
+show as unassigned — lyrical's `ros2 bag play` accepts no namespace) — and **stays alive** for the session, so
+a subscriber joining later still receives it (durability is the point; publish-and-exit would
+lose it). `play.sh` waits (bounded, 60 s) for the pre-pass's ready marker before starting the
+main play, so a newer in-window sample can never be clobbered by an older pre-window one; a
+topic with no message before `from` publishes nothing; nothing runs at `from == 0`, and an
+unwindowed `play.sh` is byte-identical to earlier releases.
+
+**Windows cut service STATE, and nothing mechanical fixes that.** A service's mode at `from` is
+whatever it boots into, not what it was at `from` in the source run — a mode set at t=29.5 is
+simply not set in a replay from t=30. Choose quiescent `from` points, or script the
+state-setting calls at `t == from` in a call script: they fire at window start.
+
+**One zero — bag start — everywhere.** Call-script `t`, `--from`/`--to`, `export-calls` output
+and results.yaml `t` all count from the session's `starting_time`. Under sim time the injector
+computes `t = /clock − bag start` (the launcher hands it `CALL_INJECTOR_BAG_START_NS` from the
+host-side metadata read) — the zero **never shifts with a window**, so an exported script means
+the same thing under any window, results stay comparable to the source run's service events,
+and retiming edits survive a change of window. (Before v1.12.0 the injector pinned `t=0` at the
+first `/clock` sample, which under an offset is bag start + offset: an exported script replayed
+with any offset fired every call late by exactly the offset. Fixed.) The window is a **filter**
+over the script: calls with `t < from` are skipped, calls with `t >= to` are never reached, a
+call at exactly `t == from` fires at window start, and one leading comment line in results.yaml —
+`# window: from=30 to=40; skipped: t=2 t=8 (before), t=44 (after)` — names both (results stay a
+list of fired calls; a results file holding only that line means nothing fired). The injector
+exits 0 after the last in-window call and never waits for `to`. Under `--wall-clock` the
+timeline is `from + wall elapsed` — approximate by construction. Chaining is unchanged: a
+windowed replay's own bag starts at (source start + `from`) in absolute stamps, so scripts
+exported from *it*, and windows on it, are relative to its own start.
 
 ### Service replay — verbatim playback and the call injector
 
@@ -274,10 +340,12 @@ calls:
      timeout_s: 10}
 ```
 
-`t` counts from the **first `/clock` sample** the injector observes (≈ play start; under
-`start_offset_s` the zero shifts with it) when `RIG_SIM_TIME=1` — so `-r` scales the call
-timeline exactly like the bag — and from injector start under `--wall-clock` replays. The
-injector sorts by `t` (authors may append out of order), validates every `type`/`request`
+`t` counts from **bag start** — the session's `starting_time`, the one zero shared with
+`--from`/`--to`, `export-calls` and results.yaml (see the windows section above): under
+`RIG_SIM_TIME=1` the injector computes `t = /clock − bag start`, so `-r` scales the call
+timeline exactly like the bag and a window never shifts the zero; under `--wall-clock` replays
+it is `from + wall elapsed` from injector start. The injector sorts by `t` (authors may append
+out of order), filters by the window, validates every `type`/`request`
 against the installed srv types **at load** — a type missing from the image refuses before the
 first call, naming the msgs-overlay fix — and appends
 `{t, service, ok, latency_s, response|error}` per call to `<run>/calls/<name>/results.yaml`
@@ -302,10 +370,15 @@ lyrical's `-x/--exclude-regex` excludes topics, **services and actions alike** �
 replay with services should keep its regex away from service names; a topic-only replay never
 touches services (the bag's `…/_service_event` channels replay as calls only under
 `--publish-service-requests`, and in allow mode they are not in the `--topics` list); the
-round-trip holds to tens of milliseconds — the injector pins `t=0` within one or two 40 Hz
-`/clock` samples of play start (the player compose `depends_on` the injector, so the
-subscription is standing first), and an unedited export re-fires within ~20 ms of the recorded
-offsets, `-r 2` compressing wall time exactly 2×. A timed-out call blocks the timeline for at
+exclude regex is a **full match** (`-x tick` plays `/toy/tick`; `-x /toy/tick` and `-x .*tick`
+exclude it — the latch pre-pass mirrors that exactly, while `play.exclude` filtering of an
+allow-list is a search, so write anchored patterns to mean the same thing in both modes); the
+round-trip holds to tens of milliseconds — the injector observes its first 40 Hz `/clock`
+sample within one or two samples of play start (the player compose `depends_on` the injector,
+so the subscription is standing first) and counts from bag start from then on, and an unedited
+export re-fires within ~20 ms of the recorded offsets, `-r 2` compressing wall time exactly 2×
+— under a window too (verified with `--from 30`: pre-window calls named in the comment line,
+in-window calls at their recorded offsets, not shifted). A timed-out call blocks the timeline for at
 most its own `timeout_s` (calls are sequential — script accordingly).
 
 ## Graph topology capture — the graph-snapshotter sidecar

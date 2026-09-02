@@ -29,7 +29,22 @@ play:
   loop: false            # wrap forever — soak testing, NOT fidelity: /clock jumps backwards at
   #                        the wrap (TF and anything stateful will object), and with the
   #                        compose's restart: "no" `down` becomes the only exit (the launcher WARNs)
-  start_offset_s: 0      # skip this many seconds into the recording (float ok)
+  start_offset_s: 0      # STANDALONE window start: seconds from BAG START (metadata starting_time;
+  #                        float ok). Under `rig replay --from S` RIG_REPLAY_FROM_S shadows a
+  #                        non-zero value here (WARN) — windows are SELECTION, so rig records them
+  #                        in the replay manifest instead. >= the bag's duration is refused. With a
+  #                        start > 0 play.sh first runs the LATCH PRE-PASS (tools/latch_restore.py):
+  #                        rosbag2's --start-offset skips every transient-local message recorded
+  #                        before the offset (/tf_static, maps…), so each SELECTED latched topic's
+  #                        last pre-window value is republished with its recorded QoS from a node
+  #                        that stays alive for the session. NOTE a window cuts service STATE —
+  #                        a mode set at t=29.5 is not set in a replay from t=30; script such
+  #                        calls at t == start in a call script (they fire at window start).
+  end_offset_s: 0        # STANDALONE window end, EXCLUSIVE, seconds from bag start; 0 = the bag
+  #                        end. RIG_REPLAY_TO_S shadows a non-zero value (WARN). Past the bag end
+  #                        WARNs and clamps to it (sweeps hit the end naturally); <= the start is
+  #                        an empty window and refused. Maps to --playback-duration (end − start),
+  #                        RECORDED seconds; the player exits 0 at the window end.
   start_paused: false    # come up subscribed but hold data until resumed via rosbag2's own player
   #                        services (/rosbag2_player/{pause,resume,toggle_paused,...})
   services: []           # VERBATIM service playback: recorded requests re-issued at live servers
@@ -49,8 +64,12 @@ play:
 #                      # The CALL INJECTOR (script mode — subsumes verbatim playback, and setting
 #                        both this and play.services is refused): a schema-v1 call-script YAML
 #                        (bootstrap one with `ros2-bag-player-up <config> export-calls`, then
-#                        retime/edit/inject), executed on the replay clock — `t` counts from the
-#                        first /clock sample under RIG_SIM_TIME, wall time from injector start
-#                        otherwise. Mounted read-only; results append to
+#                        retime/edit/inject), executed on the replay clock — `t` counts from
+#                        BAG START (the one zero: metadata starting_time, the same zero
+#                        export-calls writes and the window above counts in; /clock − bag start
+#                        under RIG_SIM_TIME, start + wall elapsed otherwise). A window FILTERS
+#                        the script: calls before the start are skipped, calls at/after the end
+#                        never reached — both named in one leading `# window:` comment line of
+#                        results.yaml. Mounted read-only; results append to
 #                        <run>/calls/<name>/results.yaml. Standalone only; RIG_REPLAY_CALLS
 #                        shadows it (WARN). Injector exit 0 = a finished timeline, not a failure.
