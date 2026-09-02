@@ -271,9 +271,10 @@ is not restored either), intersects them with **the main play's own selection** 
 rig's self-echo subtraction holds for latches too), reads the bag up to the window start and
 keeps the **last** message per topic before it, publishes each once with the recorded QoS
 (transient-local, the recorded reliability, depth 1) from `/<name>/latch_restore` — a node that
-groups under the player instance in rig's epoch reader (verified with `rig graph`; note that
-rosbag2's own `/rosbag2_player` and the injector's `/call_injector_<name>` sit at the root and
-show as unassigned — lyrical's `ros2 bag play` accepts no namespace) — and **stays alive** for the session, so
+groups under the player instance in rig's epoch reader, as does the injector's
+`/<name>/call_injector` (verified with `rig graph`; rosbag2's own `/rosbag2_player` sits at the
+root and shows as unassigned — lyrical's `ros2 bag play` accepts no namespace) — and **stays
+alive** for the session, so
 a subscriber joining later still receives it (durability is the point; publish-and-exit would
 lose it). `play.sh` waits (bounded, 60 s) for the pre-pass's ready marker before starting the
 main play, so a newer in-window sample can never be clobbered by an older pre-window one; a

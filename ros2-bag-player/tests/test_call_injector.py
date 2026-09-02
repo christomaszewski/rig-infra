@@ -184,6 +184,13 @@ def test_the_one_zero_never_shifts_with_the_window():
     assert call_injector.wall_now(2.5, 0.0) == 2.5              # unwindowed: v1.10.x's elapsed
 
 
+def test_injector_node_groups_under_the_player_instance():
+    # /<name>/call_injector — rig's epoch reader groups by instance namespace (v1.12.1; the
+    # latch pre-pass node is /<name>/latch_restore the same way)
+    assert call_injector.node_identity("bag_player") == ("call_injector", "/bag_player")
+    assert call_injector.node_identity("bag-player.2") == ("call_injector", "/bag_player_2")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

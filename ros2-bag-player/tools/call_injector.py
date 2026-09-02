@@ -216,6 +216,15 @@ def window_comment(from_s: float, to_s: float | None, before: list[dict],
     return f"# window: from={from_s:g} to={to_txt}; skipped: {', '.join(parts) or 'none'}\n"
 
 
+def node_identity(name: str) -> tuple[str, str]:
+    """(node name, namespace) for the injector: `call_injector` under `/<name>` — the player
+    config's name is the ROS namespace, so rig's epoch reader groups the node under the player
+    INSTANCE (the latch pre-pass node is `/<name>/latch_restore` the same way; v1.12.1 — before,
+    `/call_injector_<name>` sat at the root and showed as unassigned). Sanitized like every
+    sibling tool: anything outside [A-Za-z0-9_] becomes `_`."""
+    return "call_injector", "/" + re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
 def sim_now(clock_s: float, bag_start_s: float) -> float:
     """`t` on the sim clock: the latest /clock sample minus the bag start — the one zero."""
     return clock_s - bag_start_s
@@ -321,7 +330,8 @@ def main() -> int:
     from rosidl_runtime_py.convert import message_to_ordereddict
 
     rclpy.init()
-    node = rclpy.create_node("call_injector_" + re.sub(r"[^A-Za-z0-9_]", "_", name))
+    node_name, namespace = node_identity(name)
+    node = rclpy.create_node(node_name, namespace=namespace)
     sys.stderr.write(f"call-injector: {len(calls)} call(s) from {script_path} -> {results} "
                      f"(clock={'sim' if sim else 'wall'})\n")
 
