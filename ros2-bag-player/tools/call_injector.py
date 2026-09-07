@@ -27,6 +27,16 @@ replay forever. (Before v1.12.0 the zero was the first ``/clock`` sample — und
 is bag_start+offset, so an exported script replayed with any offset fired every call late by
 exactly the offset: two zeros in one contract. Fixed here.)
 
+The RELEASE GATE (v1.13.0; rig-sensor-replay-plan §5): under ``RIG_REPLAY_START_AT_UNIX_S`` the
+player comes up paused and resumes itself at that instant (``release_gate.py``). Sim time needs
+nothing here — ``t = /clock − bag_start`` is anchored to the bag, and rosbag2 publishes a
+CONSTANT ``/clock`` (= bag_start + from) while holding, so the first sample arrives before the
+release and the zero is untouched (a call at ``t == from`` therefore fires during the hold —
+state-setting before data flows, like the latch pre-pass). The ``/clock`` wait deadline grows
+by the distance to the instant so a long ``--start-delay`` cannot time it out. Under wall clock
+the zero is the INSTANT, not injector start: ``now() = from + (wall − instant)`` — without that
+every call would fire early by the whole gate.
+
 The window is a FILTER over the script (``RIG_REPLAY_FROM_S`` / ``RIG_REPLAY_TO_S``, passed
 through by the launcher — the resolved, clamped values; standalone config windows arrive the
 same way): calls with ``t < from`` are SKIPPED, calls with ``t >= to`` are never reached; both
@@ -231,9 +241,18 @@ def sim_now(clock_s: float, bag_start_s: float) -> float:
 
 
 def wall_now(elapsed_s: float, from_s: float) -> float:
-    """`t` without /clock: the window start plus wall time since the injector started
-    (approximate — no rate, no pacing information without a clock)."""
+    """`t` without /clock: the window start plus wall time since the zero (injector start, or
+    the release instant under a gate — approximate either way: no rate, no pacing information
+    without a clock)."""
     return from_s + elapsed_s
+
+
+def gate_delay(instant: float | None, now: float) -> float:
+    """Seconds from `now` to the release instant — 0 without a gate or once it is past. The
+    wall-clock zero moves by this much; the sim-time /clock wait is extended by it."""
+    if instant is None:
+        return 0.0
+    return max(0.0, float(instant) - float(now))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -296,6 +315,11 @@ def main() -> int:
             raise SystemExit(f"call_injector: {key} must be a number of seconds (got {raw!r})")
     from_s = _env_seconds("RIG_REPLAY_FROM_S") or 0.0
     to_s = _env_seconds("RIG_REPLAY_TO_S") or None      # 0/absent = the bag end
+    instant = _env_seconds("RIG_REPLAY_START_AT_UNIX_S")   # the release gate, None = no gate
+    gate_s = gate_delay(instant, time.time())
+    if instant is not None:
+        sys.stderr.write(f"call-injector: release gate at {instant:.3f} (in {gate_s:.1f}s) — "
+                         f"{'the /clock wait allows for it' if sim else 'the wall zero is the instant'}\n")
     raw_start = str(os.environ.get("CALL_INJECTOR_BAG_START_NS") or "").strip()
     bag_start_s = None
     if raw_start:
@@ -363,7 +387,7 @@ def main() -> int:
         # --- the zero: BAG START. Sim: wait for the first /clock sample (expected at
         # ≈ bag_start + from) and count from bag_start; wall: from + elapsed. -------------------
         if sim:
-            deadline = time.monotonic() + clock_timeout
+            deadline = time.monotonic() + clock_timeout + gate_s
             while latest["clock"] is None:
                 if time.monotonic() > deadline:
                     raise SystemExit(f"call_injector: no /clock sample within "
@@ -378,7 +402,7 @@ def main() -> int:
             def now() -> float:
                 return sim_now(latest["clock"], bag_start_s)
         else:
-            start = time.monotonic()
+            start = time.monotonic() + gate_s   # the zero: the release instant, when gated
 
             def now() -> float:
                 return wall_now(time.monotonic() - start, from_s)

@@ -51,6 +51,22 @@ before ``exec ros2 bag play``: rosbag2's ``--start-offset`` skips every transien
 recorded before the offset, so the pre-pass republishes each SELECTED latched topic's last
 pre-window value with its recorded QoS and stays alive for the session.
 
+The RELEASE GATE (rig-sensor-replay-plan §5; rig >= v0.2.52, handoff §1.1 amended 2026-09-07):
+``RIG_REPLAY_START_AT_UNIX_S`` — the ONE instant every producer of a replay session resumes at
+(unix seconds, three decimals: the up's start + ``--start-delay``, default 20 s; absent at
+``--start-delay 0`` and on every non-replay verb). When set, ``--start-paused`` is rendered
+WHATEVER ``play.start_paused`` says, and play.sh backgrounds ``tools/release_gate.py --at
+<instant>`` before ``exec ros2 bag play``: it waits for the player to hold (services up, paused —
+the seek to ``--start-offset`` is done by then, so a windowed replay releases AT ``from``), holds
+on the wall clock until the instant, and resumes the player through rosbag2's own
+``/rosbag2_player/resume``; an instant already past when the player holds releases at once with
+a WARN naming the lateness. Camera-service sources do the same with their first frame, and the
+bag's ``starting_time`` is the shared zero. The instant is baked into play.sh as rig spelled it
+(static, captured by ``rig bake``); the standalone ``play.start_paused: true`` without the var
+is unchanged (an operator resumes by hand). A match-nothing ``RIG_REPLAY_EXCLUDE`` (rig's
+reproduce with nothing live and no bag index sends ``^$``) plays EVERYTHING: it is emitted
+verbatim as ``--exclude-regex (?:^$)``, which fully matches no topic name (verified live).
+
 Session resolution (§1.3) happens HOST-side at render — the source run is static (unlike
 record.sh's live ``current``), so the container path ``/replay/bags/<logger>/<session>`` is baked
 into play.sh. ``session: latest`` = the lexically-greatest stamped dir (stamps sort
@@ -83,6 +99,7 @@ and needs no epoch arithmetic. Pre-Jazzy rosbag2 lacked the offset+duration comp
 """
 from __future__ import annotations
 
+import math
 import os
 import pathlib
 import re
@@ -151,6 +168,25 @@ def _seconds(val, where: str, allow_none: bool = False):
     if s < 0:
         raise SystemExit(f"play_cmd: {where} must be >= 0 (got {s:g})")
     return s
+
+
+def resolve_start_at(env: dict) -> float | None:
+    """RIG_REPLAY_START_AT_UNIX_S -> the release instant (unix seconds), None when absent or
+    empty (compose-interpolation defaults). Anything that is not a finite positive decimal
+    number is refused by name — a garbled instant must not silently become "play now"."""
+    raw = str(env.get("RIG_REPLAY_START_AT_UNIX_S") or "").strip()
+    if not raw:
+        return None
+    try:
+        t = float(raw)
+    except ValueError:
+        raise SystemExit(f"play_cmd: RIG_REPLAY_START_AT_UNIX_S must be unix seconds as a decimal "
+                         f"number (got {raw!r}) — rig writes the release instant with three "
+                         "decimals")
+    if not math.isfinite(t) or t <= 0:
+        raise SystemExit(f"play_cmd: RIG_REPLAY_START_AT_UNIX_S must be a positive unix time "
+                         f"(got {raw!r})")
+    return t
 
 
 def _num(x: float) -> str:
@@ -263,8 +299,9 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
     compose profile), `services_source` (`service`|`client` — also wired to export-calls),
     `bag_start_ns` (the session's starting_time, None when metadata.yaml was not needed and not
     read), `from_s` / `to_s` (the resolved, validated window; `to_s` None = the bag end) and
-    `latch` (the pre-pass argv after the session path, empty when `from_s == 0`). Pure modulo the
-    injected `ls` / `read`."""
+    `latch` (the pre-pass argv after the session path, empty when `from_s == 0`) and `start_at`
+    (the release instant from RIG_REPLAY_START_AT_UNIX_S, None without a gate — play.sh then
+    starts no companion). Pure modulo the injected `ls` / `read`."""
     name = str(cfg.get("name") or "bag_player")
     src = _strict(cfg.get("source"), "source", {"run", "logger", "session"})
     play = _strict(cfg.get("play"), "play",
@@ -399,7 +436,10 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
         # RECORDED seconds from the (offset) start — pinned live on lyrical, see the docstring.
         # A clamped `to` IS the bag end: no flag, the bag ends by itself.
         args += ["--playback-duration", _num(to_s - from_s)]
-    if play.get("start_paused"):
+    # The release gate holds a PAUSED player: with RIG_REPLAY_START_AT_UNIX_S the flag is
+    # rendered whatever the config says (the gate's companion resumes it at the instant).
+    start_at = resolve_start_at(env)
+    if play.get("start_paused") or start_at is not None:
         args.append("--start-paused")
     if str(env.get("RIG_SIM_TIME") or "") == "1":
         args.append("--clock")
@@ -435,15 +475,18 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
     latch = (["--from", _num(from_s)] + selector) if from_s > 0 else []
     return name, source, container_path, args, warns, {
         "calls": calls, "services_source": src_mode, "bag_start_ns": bag_start_ns,
-        "from_s": from_s, "to_s": to_s, "latch": latch}
+        "from_s": from_s, "to_s": to_s, "latch": latch, "start_at": start_at}
 
 
-def play_script(path: str, args: list[str], latch: list[str]) -> str:
+def play_script(path: str, args: list[str], latch: list[str],
+                start_at: float | None = None) -> str:
     """play.sh text: source ROS, (windowed) start the latch pre-pass and wait — bounded — for it
-    to have published, then exec `ros2 bag play`. Everything is static: no runtime stamps, playback
-    writes nothing. The pre-pass wait exists so the main play can never overtake it: an in-window
-    latched sample published by the player, then clobbered by the pre-pass's OLDER pre-window
-    value, would leave subscribers holding stale state."""
+    to have published, (gated) start the release-gate companion, then exec `ros2 bag play`.
+    Everything is static: no runtime stamps, playback writes nothing — the release instant is a
+    session constant rig chose before the up, spelled as rig spelled it. The pre-pass wait exists
+    so the main play can never overtake it: an in-window latched sample published by the player,
+    then clobbered by the pre-pass's OLDER pre-window value, would leave subscribers holding
+    stale state."""
     argv = " ".join(shlex.quote(a) for a in args)
     lines = [
         "#!/usr/bin/env bash",   # bash: ROS `setup.bash` is bash-only
@@ -475,6 +518,14 @@ def play_script(path: str, args: list[str], latch: list[str]) -> str:
             f'report within {LATCH_WAIT_S}s (crashed, or a very large bag) — starting play anyway;'
             ' latched topics recorded before the window may be missing" >&2',
         ]
+    if start_at is not None:
+        lines += [
+            "# Release gate (rig-sensor-replay-plan §5): every producer of this replay came up",
+            "# paused and rig handed them all ONE instant. The companion waits for the player to",
+            "# hold (--start-paused, rendered whatever the config says), then resumes it at the",
+            "# instant through rosbag2's own /rosbag2_player/resume — it dies with this container.",
+            f"python3 /release_gate.py --at {start_at:.3f} &",
+        ]
     lines.append(f"exec ros2 bag play {shlex.quote(path)}{' ' + argv if argv else ''}")
     return "\n".join(lines) + "\n"
 
@@ -491,7 +542,7 @@ def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, ...]:
     run_dir = pathlib.Path(repo) / "var" / "run" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     script = run_dir / "play.sh"
-    script.write_text(play_script(path, args, extras["latch"]))
+    script.write_text(play_script(path, args, extras["latch"], extras["start_at"]))
     script.chmod(0o755)
     return (name, str(script), source, path, extras["services_source"], extras["calls"],
             "" if extras["bag_start_ns"] is None else str(extras["bag_start_ns"]),

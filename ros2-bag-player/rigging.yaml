@@ -27,4 +27,5 @@ launch_surface:
   - tools/call_injector.py   # the call injector's tool (mounted, not rendered — the graph-snapshotter pattern)
   - tools/export_calls.py    # the export-calls one-shot's tool (mounted into the player)
   - tools/latch_restore.py   # the latch pre-pass of a windowed replay (mounted into the player)
+  - tools/release_gate.py    # the release gate of a gated replay (mounted into the player; RIG_REPLAY_START_AT_UNIX_S)
   - docker/compose.deploy.yaml

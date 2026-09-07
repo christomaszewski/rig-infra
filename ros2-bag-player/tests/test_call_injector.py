@@ -10,6 +10,9 @@ v1.12.0 adds the window half (rig-replay-window-handoff §1.3): the ONE zero (`t
 bag start under sim time, from + elapsed under wall time — never the first sample), the window
 as a FILTER (t < from skipped, t >= to never reached, t == from IN), and the ONE leading
 `# window:` comment line results.yaml carries before its first entry.
+v1.13.0 adds the release gate's two touches: `gate_delay` (a future instant's distance, 0
+otherwise) moves the WALL-clock zero to the instant and extends the sim-time /clock wait; the
+sim-time zero stays the bag start.
 Run: `python3 tests/test_call_injector.py` (no ROS — the rclpy shell imports lazily)."""
 import pathlib
 import sys
@@ -189,6 +192,25 @@ def test_injector_node_groups_under_the_player_instance():
     # latch pre-pass node is /<name>/latch_restore the same way)
     assert call_injector.node_identity("bag_player") == ("call_injector", "/bag_player")
     assert call_injector.node_identity("bag-player.2") == ("call_injector", "/bag_player_2")
+
+
+# --- v1.13.0: the release gate and the injector's zeros -----------------------------------------
+
+def test_gate_delay_moves_only_a_future_instant():
+    assert call_injector.gate_delay(None, 100.0) == 0.0            # no gate: nothing moves
+    assert call_injector.gate_delay(120.0, 100.0) == 20.0          # a future instant: its distance
+    assert call_injector.gate_delay(90.0, 100.0) == 0.0            # a past instant: release now
+
+
+def test_wall_zero_is_the_release_instant_under_a_gate():
+    # wall clock, gate 20 s ahead: t counts from the INSTANT, so a call at t=from fires at release
+    # and not 20 s early; before the instant `now()` is below `from` (the loop keeps waiting)
+    zero = 0.0 + call_injector.gate_delay(120.0, 100.0)
+    assert call_injector.wall_now(5.0 - zero, from_s=30.0) == 15.0      # 15 s before release: t < from
+    assert call_injector.wall_now(20.0 - zero, from_s=30.0) == 30.0     # the instant: t == from
+    assert call_injector.wall_now(27.5 - zero, from_s=30.0) == 37.5
+    # sim time is anchored to the bag whatever the gate does — the one zero never moves
+    assert call_injector.sim_now(1788361689.6, 1788361659.6) == 30.0
 
 
 if __name__ == "__main__":

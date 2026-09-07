@@ -27,7 +27,8 @@ one in CI).
   player is a finished replay, not a failure. Also carries the service-call half of replay:
   verbatim service playback (recorded requests re-issued at live servers) and the **call
   injector** (a YAML timeline of calls executed on the replay clock, bootstrapped by the
-  `export-calls` verb). See [SIL replay](#sil-replay--the-ros2-bag-player-service).
+  `export-calls` verb). Beside per-sensor replay sources it starts paused and resumes itself at
+  rig's one release instant. See [SIL replay](#sil-replay--the-ros2-bag-player-service).
 - **`ros1-bag-logger/`** — the ROS 1 sibling (`rosbag record`), for ROS 1 fleets with a roscore.
 - **`base/`** — the `fleet-ros` image: `ros:<distro>-ros-base` + the fleet's rmw + `rosbag2` (+ mcap).
   `base/build.sh <registry> [tag]` follows the rig build contract; the router and ros2 bag logger
@@ -185,7 +186,9 @@ other verb):
   var the same way — this player is merely its first consumer. Standalone use sets the config's
   `source.run` instead.
 - `RIG_REPLAY_TOPICS` (space-separated allow-list, from graph epochs) **xor**
-  `RIG_REPLAY_EXCLUDE` (one regex, the pre-epoch namespace fallback). Exactly one is ever set;
+  `RIG_REPLAY_EXCLUDE` (one regex, the pre-epoch namespace fallback — and `^$` for a reproduce
+  with nothing live and no bag index: a match-nothing regex plays **everything**, emitted
+  verbatim as `--exclude-regex (?:^$)`, verified live). Exactly one is ever set;
   the launcher refuses both-set as defense in depth. Either shadows the config's `play.topics`
   (WARN). The config's `play.exclude` regexes apply in both modes — they *filter* the allow-list
   before `--topics` (an emptied selection is refused: a bare `ros2 bag play` would play
@@ -196,6 +199,12 @@ other verb):
   `play.clock` config knob and one is refused at parse: clock coherence is one rig-owned token
   with two consumers (`--clock` here, `use_sim_time` in the services under test) — the
   incoherent state is unrepresentable.
+- `RIG_REPLAY_START_AT_UNIX_S` (rig ≥ v0.2.52, player ≥ v1.13.0) — the **release instant**
+  every producer of the session resumes at (unix seconds, three decimals: the up's start +
+  `--start-delay`, default 20 s; absent at `--start-delay 0`). Fleet-general like
+  `RIG_REPLAY_SOURCE`: camera-service sources come up paused on their first frame and resume
+  themselves there; the player starts paused and its companion resumes it there — see
+  [the release gate](#the-release-gate--one-instant-for-every-producer) below.
 
 Playback knobs (`rate`, `loop`, `start_offset_s`/`end_offset_s`, `start_paused`) live in the
 **config**, not rig CLI flags, so rig's run snapshot records every experiment's parameters — the
@@ -303,6 +312,49 @@ timeline is `from + wall elapsed` — approximate by construction. Chaining is u
 windowed replay's own bag starts at (source start + `from`) in absolute stamps, so scripts
 exported from *it*, and windows on it, are relative to its own start.
 
+### The release gate — one instant for every producer
+
+A replay with **per-sensor sources** (rig ≥ v0.2.52; plan `rig-sensor-replay-plan.md` §4–§5)
+has N producers on one timeline: camera-service instances fed from their own recordings, and
+this player. Anchoring fixes *where* each is on the timeline (the bag's `starting_time` is the
+shared zero — a camera frame recorded at t plays `(t − bag_start)/rate` after release); the
+release moment itself still has to be shared, or container-start skew (seconds — the player comes
+up last) becomes timeline skew. So rig hands every launcher **`RIG_REPLAY_START_AT_UNIX_S`** and
+each producer resumes itself there. On the player's side (v1.13.0): when the var is set, `play_cmd`
+renders `--start-paused` **whatever `play.start_paused` says**, and `play.sh` backgrounds
+`tools/release_gate.py --at <instant>` (same container, dies with it — the latch pre-pass
+pattern; the instant is baked into play.sh as rig spelled it, so the captured script shows the
+gate) before `exec ros2 bag play`. The companion waits for the player to **hold** (its
+`/rosbag2_player/{resume,is_paused}` services up and `is_paused` true — the seek to
+`--start-offset` has happened by then, so a windowed gate releases *at* `from`), holds on the
+wall clock until the instant, then calls rosbag2's own `Resume` and confirms with `is_paused`
+(retried until it takes), logging `release gate in N.Ns (<instant>)` … `released at <wall>
+(+0.00Ns from the instant …)`. An instant already past when the player holds releases at once
+with a **WARN naming the lateness** ("the player was ready 8.5s AFTER the release instant …
+pass a larger --start-delay") — rig warns on its side when the up outlasts the gate. Absent
+var: today's behaviour, byte for byte (the config knob alone decides `--start-paused`, no
+companion; a standalone `start_paused: true` is resumed by hand as before). A garbled value
+refuses at render, by name.
+
+Verified live (lyrical, rosbag2 0.33.3, rmw_zenoh; a 38 s toy bag with a 10 Hz tick and a
+latched map; instants 7–12 s ahead of play start): the player holds ~0.2 s after `play.sh`
+starts, and the resume lands **+2–3 ms** after the instant in every case — sim time, wall
+clock, and a `--from 10` window, where the first in-window tick arrived 74 ms after the instant
+with the latch pre-pass having restored the pre-window map *before* the hold. Under
+`RIG_SIM_TIME=1` rosbag2 publishes a **constant** `/clock` while holding — 40 Hz samples all
+equal to bag start (or bag start + `from`), 455 of them over an 11 s hold — and it advances from
+the release (first advancing sample +7 ms; +27 ms windowed). Consequences: sim-time consumers see
+bag time standing still at the zero until the instant; the call injector's zero
+(`CALL_INJECTOR_BAG_START_NS`) is untouched and its first sample arrives *during* the hold at
+`t = from`, so a call scripted at exactly `t == from` fires during the hold — state-setting
+before data flows, like the latch pre-pass — and its `/clock` wait is extended by the gate's
+distance so a long `--start-delay` cannot time it out. Under `--wall-clock` the injector's zero
+is now the **instant** (the compose passes the var through), not injector start — otherwise a
+20 s gate would fire every wall-clock call 20 s early. The bag logger needs nothing: it never
+reads `RIG_REPLAY_*`, and in a reproduce it records the session's outputs on bag time as before.
+Not verified here: a full `rig replay` with camera-service sources beside the player (the skew
+claim is clock agreement between containers on one host — milliseconds).
+
 ### Service replay — verbatim playback and the call injector
 
 Topics feed a service under test its *data*; its **service calls** are the other half of a SIL
@@ -345,7 +397,8 @@ calls:
 `--from`/`--to`, `export-calls` and results.yaml (see the windows section above): under
 `RIG_SIM_TIME=1` the injector computes `t = /clock − bag start`, so `-r` scales the call
 timeline exactly like the bag and a window never shifts the zero; under `--wall-clock` replays
-it is `from + wall elapsed` from injector start. The injector sorts by `t` (authors may append
+it is `from + wall elapsed` from the release instant when the session is gated, else from
+injector start. The injector sorts by `t` (authors may append
 out of order), filters by the window, validates every `type`/`request`
 against the installed srv types **at load** — a type missing from the image refuses before the
 first call, naming the msgs-overlay fix — and appends

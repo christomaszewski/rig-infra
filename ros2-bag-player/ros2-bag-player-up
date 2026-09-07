@@ -3,7 +3,9 @@
 # under test have their subscriptions standing before data flows and stop being fed before they
 # stop). Plays a selected topic subset from a SOURCE run's bags, mounted read-only at /replay.
 # The player never decides what to play: `rig replay` exports RIG_REPLAY_SOURCE +
-# RIG_REPLAY_TOPICS|RIG_REPLAY_EXCLUDE (+ RIG_SIM_TIME, + the RIG_REPLAY_FROM_S/TO_S window);
+# RIG_REPLAY_TOPICS|RIG_REPLAY_EXCLUDE (+ RIG_SIM_TIME, + the RIG_REPLAY_FROM_S/TO_S window,
+# + RIG_REPLAY_START_AT_UNIX_S — the release instant every producer of the session resumes at:
+# the player then starts paused and play.sh's companion resumes it there, v1.13.0);
 # standalone use sets source.run and play.topics/exclude (+ start/end offsets) in the config.
 # SELECTS + PARAMETERIZES `ros2 bag play` — no compose is generated.
 set -euo pipefail
@@ -80,6 +82,8 @@ case "${ARGS[0]}" in
   up) [ -n "$CALLS" ] && PROFILE=(--profile calls) ;;
   down|ps|logs) PROFILE=(--profile calls) ;;
 esac
-echo "ros2-bag-player-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} source=$SOURCE script=$SCRIPT${CALLS:+ calls=$CALLS}${FROM_S:+ from=${FROM_S}s}${TO_S:+ to=${TO_S}s}" >&2
+# The release instant rides rig's env straight into play.sh (baked by play_cmd) and the injector's
+# compose env — nothing to re-export; named in the banner so `logs` readers see the gate was armed.
+echo "ros2-bag-player-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} source=$SOURCE script=$SCRIPT${CALLS:+ calls=$CALLS}${FROM_S:+ from=${FROM_S}s}${TO_S:+ to=${TO_S}s}${RIG_REPLAY_START_AT_UNIX_S:+ release-at=${RIG_REPLAY_START_AT_UNIX_S}}" >&2
 # ${PROFILE[@]+...}: an EMPTY array under `set -u` is an error on bash < 4.4 (macOS dev boxes)
 exec docker compose "${FILES[@]}" ${PROFILE[@]+"${PROFILE[@]}"} "${ARGS[@]}"

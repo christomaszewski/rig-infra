@@ -46,7 +46,14 @@ play:
   #                        an empty window and refused. Maps to --playback-duration (end − start),
   #                        RECORDED seconds; the player exits 0 at the window end.
   start_paused: false    # come up subscribed but hold data until resumed via rosbag2's own player
-  #                        services (/rosbag2_player/{pause,resume,toggle_paused,...})
+  #                        services (/rosbag2_player/{pause,resume,toggle_paused,...}). Under
+  #                        `rig replay` with per-sensor sources (rig >= v0.2.52) the RELEASE GATE
+  #                        overrides this: RIG_REPLAY_START_AT_UNIX_S (the one instant every
+  #                        producer resumes at — up start + --start-delay, default 20 s) renders
+  #                        --start-paused WHATEVER this says, and play.sh's companion
+  #                        (tools/release_gate.py) resumes the player at that instant; a window's
+  #                        seek happens before the hold, so release lands at start_offset. Set
+  #                        here without the var (standalone): the operator resumes by hand.
   services: []           # VERBATIM service playback: recorded requests re-issued at live servers
   #                        (--publish-service-requests + this allow-list). Standalone only;
   #                        RIG_REPLAY_SERVICES shadows it (WARN — rig computes the with-set's

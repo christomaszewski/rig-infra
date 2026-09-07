@@ -40,9 +40,13 @@ jobs:
           printf 'service: ros2-bag-logger\nname: bl\ngraph:\n  enabled: true\n  interval_s: 30\n' > /tmp/bl.yaml
           ./.rig/rig certify --repo ros2-bag-logger --config /tmp/bl.yaml
       # The graph-snapshotter's pure core (epoch dedup/hash/schema — the rig v0.2.32 reader is
-      # built against fixtures of exactly this schema) and the `graph:` config gate.
+      # built against fixtures of exactly this schema) and the `graph:` config gate — plus the
+      # v1.9.0 sim-time adoption (RIG_SIM_TIME fills use_sim_time's default, explicit config
+      # wins both ways: the rigging's `replay: {sim_time: true}` promise rig v0.2.34 relies on).
       - name: ros2-bag-logger unit tests
-        run: python3 ros2-bag-logger/tests/test_graph_snapshot.py
+        run: |
+          python3 ros2-bag-logger/tests/test_graph_snapshot.py
+          python3 ros2-bag-logger/tests/test_bag_cmd_sim_time.py
       # The player renders against a source run (session resolution is host-side, §1.3 of the
       # replay handoff) and the example config's source.run is empty ON PURPOSE — the source is
       # rig's channel. Certify passes the caller's env through, so hand it a fabricated run.
@@ -73,13 +77,43 @@ jobs:
         run: |
           RIG_REPLAY_SOURCE=/tmp/replay-src RIG_REPLAY_FROM_S=30 RIG_REPLAY_TO_S=45 \
             RIG_REPLAY_TOPICS="/a /b" ./.rig/rig certify --repo ros2-bag-player
+      # The release-gate path (rig-sensor-replay-plan §5, rig >= v0.2.52 -> v1.13.0):
+      # RIG_REPLAY_START_AT_UNIX_S forces --start-paused and play.sh backgrounds the companion
+      # (tools/release_gate.py, mounted into the player) with the instant spelled as rig spelled
+      # it; the call injector's compose env carries the var (its wall-clock zero); a match-nothing
+      # RIG_REPLAY_EXCLUDE (`^$`, rig's nothing-live-no-index reproduce) plays everything. Certify
+      # stamps its poison name into the config, so the render lands in var/run/certifyname0/.
+      - name: certify ros2-bag-player (release gate path)
+        run: |
+          set -eu
+          play=ros2-bag-player/var/run/certifyname0/play.sh
+          RIG_REPLAY_SOURCE=/tmp/replay-src RIG_REPLAY_START_AT_UNIX_S=1767225620.500 \
+            RIG_REPLAY_EXCLUDE='^$' ./.rig/rig certify --repo ros2-bag-player
+          grep -qxF 'python3 /release_gate.py --at 1767225620.500 &' "$play" || {
+            echo "::error::play.sh lacks the release-gate companion line"; cat "$play"; exit 1; }
+          grep -qxF "exec ros2 bag play /replay/bags/bag_logger/bag_logger_20260101T000000Z --start-paused --exclude-regex '(?:^\$)'" "$play" || {
+            echo "::error::play.sh: expected a paused play with the match-nothing exclude"; cat "$play"; exit 1; }
+          # the injector (calls profile) receives the instant — its wall-clock zero
+          RIG_REPLAY_SOURCE=/tmp/replay-src BAG_PLAY_SCRIPT="$PWD/$play" RIG_REPLAY_CALLS=/dev/null \
+            RIG_REPLAY_START_AT_UNIX_S=1767225620.500 \
+            docker compose -f ros2-bag-player/docker/compose.deploy.yaml --profile calls config \
+            | grep -q 'RIG_REPLAY_START_AT_UNIX_S: "1767225620.500"' || {
+            echo "::error::the call-injector's compose env lacks RIG_REPLAY_START_AT_UNIX_S"; exit 1; }
+          # absent var: today's behaviour — no companion, no --start-paused
+          RIG_REPLAY_SOURCE=/tmp/replay-src ./.rig/rig certify --repo ros2-bag-player
+          ! grep -qE 'release_gate|--start-paused' "$play" || {
+            echo "::error::play.sh carries the gate without RIG_REPLAY_START_AT_UNIX_S"; cat "$play"; exit 1; }
+          echo "  ok  release gate: companion + forced --start-paused + injector env; absent var inert"
       # The player's pure cores — the selector doctrine (TOPICS xor EXCLUDE, allow-mode
       # filtering, clock-knob refusal) rig v0.2.33's `rig replay` is built against, plus the
       # v1.10.0 service-call layer: the §1.1 refusal matrix, the injector's strict script
       # schema + results contract, and export-calls' schema-v1 emission (round-tripped through
       # the injector's own parser) rig v0.2.37 is built against — plus the v1.12.0 window layer
       # (env -> flags, refuse/clamp against metadata, the latch topic-set intersection, the
-      # injector's window filter + one-zero time base) rig v0.2.46 is built against.
+      # injector's window filter + one-zero time base) rig v0.2.46 is built against — plus the
+      # v1.13.0 release gate (RIG_REPLAY_START_AT_UNIX_S -> a forced --start-paused + the
+      # companion that resumes at the instant; a match-nothing exclude plays everything) rig
+      # v0.2.52's per-sensor replay sources are built against.
       - name: ros2-bag-player unit tests
         run: |
           python3 ros2-bag-player/tests/test_play_cmd.py
@@ -88,6 +122,8 @@ jobs:
           python3 ros2-bag-player/tests/test_export_calls.py
           python3 ros2-bag-player/tests/test_play_cmd_window.py
           python3 ros2-bag-player/tests/test_latch_restore.py
+          python3 ros2-bag-player/tests/test_play_cmd_gate.py
+          python3 ros2-bag-player/tests/test_release_gate.py   # + the wait/hold/release loop, world injected
       - name: certify ros1-bag-logger
         run: ./.rig/rig certify --repo ros1-bag-logger
       # RIG_BASE_IMAGE, consumer side: with a base exported the stacks RUN it; with none — certify's

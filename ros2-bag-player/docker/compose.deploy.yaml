@@ -28,11 +28,13 @@ services:
       - ../tools/export_calls.py:/export_calls.py:ro   # the export-calls one-shot's tool (static, launcher-invoked via `compose run`)
       - ../tools/latch_restore.py:/latch_restore.py:ro # the latch pre-pass (rig-replay-window-handoff §1.2): play.sh
                                                        # backgrounds it before a WINDOWED play (from > 0), never otherwise
+      - ../tools/release_gate.py:/release_gate.py:ro   # the release gate (rig-sensor-replay-plan §5): play.sh backgrounds it
+                                                       # under RIG_REPLAY_START_AT_UNIX_S (baked into play.sh), never otherwise
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
       VEHICLE_ID: ${VEHICLE_ID:-}
-      BAG_PLAYER_NAME: ${BAG_PLAYER_NAME:-bag_player}   # the latch pre-pass node's namespace (/<name>/latch_restore)
+      BAG_PLAYER_NAME: ${BAG_PLAYER_NAME:-bag_player}   # the latch pre-pass + release gate nodes' namespace (/<name>/latch_restore, /<name>/release_gate)
     command: ["/bin/bash", "/play.sh"]   # bash, not sh: play.sh sources ROS `setup.bash` (bash-only)
     # The injector must have its /clock subscription standing before play starts (it waits for
     # the FIRST sample, expected at ≈ bag_start + from). `required: false` keeps the dependency
@@ -72,6 +74,8 @@ services:
       CALL_INJECTOR_BAG_START_NS: ${CALL_INJECTOR_BAG_START_NS:-}   # the session's starting_time (ns) — the one zero; launcher-private, from metadata.yaml
       RIG_REPLAY_FROM_S: ${RIG_REPLAY_FROM_S:-}            # the window, as resolved by the launcher (absent/empty = 0 / the bag end)
       RIG_REPLAY_TO_S: ${RIG_REPLAY_TO_S:-}
+      RIG_REPLAY_START_AT_UNIX_S: ${RIG_REPLAY_START_AT_UNIX_S:-}   # the release gate (rig's, v1.13.0): the WALL-clock zero
+                                                                    # under --wall-clock; sim time is anchored to the bag anyway
     volumes:
       - ${RIG_DATA_DIR:-/data}:/data                       # rw: results.yaml lands in the run dir
       - ${RIG_REPLAY_CALLS:-/dev/null}:/calls.yaml:ro      # default keeps un-profiled interpolation quiet
