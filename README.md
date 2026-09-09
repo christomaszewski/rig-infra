@@ -229,6 +229,16 @@ shows the `Exited (0)` row. `loop: true` is for soak only and the launcher WARNs
 the only exit, and `/clock` jumps backwards at every wrap (verified — TF and anything stateful
 will object).
 
+**Teardown never needs the replay** (player ≥ v1.13.1). The selector env is exported by `rig replay`
+alone — rig strips `RIG_REPLAY_*` on every other verb by design — so the `rig down` that follows a
+finished or half-failed replay reaches the launcher with no source run. `up` and `export-calls`
+refuse without one, naming the reason; `down`, `status`/`ps`, `logs` and `config` need only the
+compose *model* and continue on it: the required interpolations get placeholders
+(`/replay-source-unset`, `/play.sh-unset` — never touched by a teardown, visible in a `config`
+render), the project name comes from rig or the config's `name`, and a note on stderr says why.
+The player's `down` used to die in `play_cmd` before `docker compose down` ever ran, leaving a
+half-up replay with no way down short of hand-exporting the env.
+
 **Standalone invocation** (no rig — this is also the SIL path before rig v0.2.33 lands):
 
 ```bash

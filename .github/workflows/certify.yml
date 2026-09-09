@@ -124,6 +124,11 @@ jobs:
           python3 ros2-bag-player/tests/test_latch_restore.py
           python3 ros2-bag-player/tests/test_play_cmd_gate.py
           python3 ros2-bag-player/tests/test_release_gate.py   # + the wait/hold/release loop, world injected
+          # v1.13.1: down / ps / logs / config on the compose model alone when there is no replay
+          # to render (rig strips RIG_REPLAY_* on every verb but `replay`; a docker stub records
+          # what the launcher ran), and a bare certify -- no source exported -- must pass.
+          python3 ros2-bag-player/tests/test_launcher_verbs.py
+          ./.rig/rig certify --repo ros2-bag-player
       - name: certify ros1-bag-logger
         run: ./.rig/rig certify --repo ros1-bag-logger
       # RIG_BASE_IMAGE, consumer side: with a base exported the stacks RUN it; with none — certify's

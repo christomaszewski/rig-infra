@@ -29,7 +29,28 @@ CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 # RIG_REPLAY_FROM_S/TO_S, or the config's start/end offsets — validated and clamped against the
 # bag host-side) go to the injector (rig-replay-window-handoff §1.1/§1.3). Split on tabs by hand
 # — `read` with a whitespace IFS collapses runs of tabs, losing empty fields.
-NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/play_cmd.py" "$CONFIG_ABS" "$REPO")"
+ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+VERB="${ARGS[0]}"
+
+# The render needs a replay to render: a source run (RIG_REPLAY_SOURCE, or source.run standalone)
+# with a bag session in it, a selector, the window. `up` and `export-calls` cannot do without.
+# Every other verb -- down / ps / logs / config -- needs only the compose MODEL, and reaches here
+# WITHOUT the replay env by design: rig strips RIG_REPLAY_* on every verb but `replay`, so the
+# `rig down` that follows a finished or half-failed replay must still tear the player down. On a
+# failed render those verbs continue with placeholders for the compose's required interpolations
+# (never touched by down/ps/logs; visible in a `config` render), the name read from the config.
+PLAY_ERR="$(mktemp)"; trap 'rm -f "$PLAY_ERR"' EXIT
+if NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/play_cmd.py" "$CONFIG_ABS" "$REPO" 2>"$PLAY_ERR")"; then
+  cat "$PLAY_ERR" >&2   # play_cmd's WARNs (shadowed config keys, ...) still reach the operator
+else
+  case "$VERB" in
+    up|export-calls) cat "$PLAY_ERR" >&2; exit 1 ;;
+  esac
+  NAME_ONLY="$("$PYTHON" "$REPO/tools/play_cmd.py" "$CONFIG_ABS" - --name)"
+  echo "ros2-bag-player-up: no replay to render ($(tr '\n' ' ' <"$PLAY_ERR" | sed 's/ *$//')) -- \`$VERB\` needs only the compose model, continuing" >&2
+  NAME_AND_SCRIPT="$(printf '%s\t%s\t%s\t\t\t\t\t\t' "$NAME_ONLY" /play.sh-unset /replay-source-unset)"
+fi
 REST="$NAME_AND_SCRIPT"
 NAME="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
 SCRIPT="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
@@ -55,8 +76,6 @@ export CALL_INJECTOR_NAME="$NAME"
 # rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros2-bag-player_${NAME}}"
 FILES=(-f "$REPO/docker/compose.deploy.yaml")
-ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
-[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
 
 # export-calls (rig-replay-calls-handoff §1.3): one-shot container over the SAME resolved
 # session the play verb would use — server-side `_service_event` topics (or client-side, per

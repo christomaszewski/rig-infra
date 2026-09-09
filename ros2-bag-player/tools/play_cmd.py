@@ -551,8 +551,15 @@ def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, ...]:
 
 
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[3] == "--name":
+        # The instance name alone -- a pure config read, no env, no filesystem. The launcher's
+        # fallback for the verbs that need only the compose MODEL (down / ps / logs / config)
+        # when there is no replay to render: rig strips RIG_REPLAY_* on every verb but `replay`,
+        # so a `rig down` after a failed or finished replay reaches here with no source run.
+        print(str((yaml.safe_load(open(sys.argv[1])) or {}).get("name") or "bag_player"))
+        return 0
     if len(sys.argv) != 3:
-        sys.stderr.write("usage: play_cmd.py <config.yaml> <repo-dir>\n")
+        sys.stderr.write("usage: play_cmd.py <config.yaml> <repo-dir> | <config.yaml> - --name\n")
         return 2
     cfg = yaml.safe_load(open(sys.argv[1])) or {}
     # Tab-separated for the launcher's hand-split; trailing fields may be empty.
