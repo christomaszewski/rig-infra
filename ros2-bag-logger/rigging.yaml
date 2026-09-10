@@ -36,9 +36,18 @@ build: { command: ../base/build.sh, images: [fleet-ros], provides: base,
 # stamps the replay run's bag on BAG time (/clock from the player, same token) and the
 # source/replay A/B pair aligns by timestamp. Older rigs ignore this key (declaration-as-docs).
 replay: { sim_time: true }
+# Slim exports (rig >= v0.2.54 `rig run export`, v1.14.0): this instance can re-write the sessions
+# it recorded into a run SMALLER — the launcher's `export` verb runs `ros2 bag convert` per session
+# in the logger's image (recompress at the profile's preset, drop topics by regex, cut a window)
+# into the export dir rig names. `data` is where the recorder writes (output.subdir default —
+# a config with another subdir exports nothing and its bags travel as recorded). The profile
+# options rig hands over (vehicle.yaml export_profiles.<p>.ros2-bag-logger): preset, exclude,
+# topics, from_s, to_s — see tools/bag_export.py. Older rigs ignore this key.
+export: { data: "bags/{name}" }
 launch_surface:
   - ros2-bag-logger-up
   - tools/bag_cmd.py
+  - tools/bag_export.py       # the `export` verb's renderer (specs + convert script per run)
   - tools/graph_snapshot.py   # the graph-snapshotter sidecar's tool (mounted, not rendered)
   - docker/compose.deploy.yaml
   - docker/compose.shm.yaml   # applied only when the config effectively enables zenoh shared memory

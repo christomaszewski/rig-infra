@@ -483,6 +483,44 @@ and env (`ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`, the data-root mount) — custom-
 works wherever the recorder's does, and there are no new rig-owned env vars. Cost is negligible:
 a ~28-node graph walks in single-digit milliseconds per tick and writes ~35 KB per epoch.
 
+## Slim exports — the bag logger's `export` verb (v1.14.0, rig ≥ v0.2.54)
+
+A run dir is mostly video and bags, both already compressed, so what shrinks it for the trip
+off the vehicle is leaving data out and re-writing the rest smaller — by the service that wrote
+it. rig's `rig run export <run> --profile <p>` builds `<run>/exports/<p>/` on the vehicle
+(hardlinks where kept, the profile's `omit` globs left out) and invokes the `export` verb of
+every service whose rigging declares `export:`; this logger declares `export: {data: bags/{name}}`
+and re-writes its sessions with **`ros2 bag convert`** in its own image — no new tooling in the
+vehicle image (rosbag2's converter is the recorder's writer run again: zstd chunks in-band, every
+mcap reader takes the result as-is; a `zstd_small` re-write of a `zstd_fast` recording is the
+same data at a ~2–4× smaller size for telemetry-class topics, dropped point clouds are the rest).
+
+```yaml
+# vehicle.yaml — the profile block this launcher receives (verbatim, as RIG_EXPORT_OPTIONS)
+export_profiles:
+  review:
+    omit: ["recordings/**/*.mkv"]           # rig's: files left out of the export entirely
+    ros2-bag-logger:                        # (or the instance name, e.g. bag_logger — wins)
+      preset: zstd_small                    # none | fastwrite | zstd_fast | zstd_small (default)
+      exclude: ['.*/points$', '.*/image_raw(/.*)?$']   # topics DROPPED (one --exclude-regex)
+      # topics: [/gnss/fix, /imu/data]      # an ALLOW list instead (composes with exclude)
+      # from_s: 30                          # a window, from EACH session's bag start
+      # to_s: 900                           #   (its metadata.yaml starting_time — replay's zero)
+```
+
+**Mechanics.** `tools/bag_export.py` (pure, tested) finds the sessions the recorder wrote
+(`<run>/bags/<name>/<name>_<stamp>/` with a `metadata.yaml`), renders one rosbag2 output spec
+per session plus a `convert.sh` under `<export>/.rig/export/<name>/`, and the launcher runs the
+script as a one-off `docker compose run --rm` of the `bag-logger` service with the run mounted
+read-only and the export dir writable **at their host paths** (the specs name host paths). It
+runs beside whatever the logger is recording now — never inside the recorder's container.
+Unknown option keys refuse (a typo must not silently keep the data); a session without a
+`metadata.yaml` (the recorder died) is skipped with the fix named (`ros2 bag reindex` on the
+vehicle); a session already exported is skipped unless `RIG_EXPORT_FORCE=1` (rig's `--force`).
+The channel: `RIG_EXPORT_SOURCE` (run), `RIG_EXPORT_DEST` (export dir, same relative layout),
+`RIG_EXPORT_OPTIONS` (the YAML above), `RIG_EXPORT_PROFILE`, `RIG_EXPORT_FORCE` — rig-owned,
+stripped by rig on every other verb; the verb refuses without them (it is not a standalone tool).
+
 Use from a rig deployment (clone as a sibling):
 
 ```yaml

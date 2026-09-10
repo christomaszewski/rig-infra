@@ -8,9 +8,36 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="${BAG_LOGGER_PYTHON:-python3}"
 
-CONFIG="${1:?usage: ros2-bag-logger-up <config.yaml> [up [-d]|down|status|logs|config|...]}"; shift || true
+CONFIG="${1:?usage: ros2-bag-logger-up <config.yaml> [up [-d]|down|status|logs|config|export|...]}"; shift || true
 [ -f "$CONFIG" ] || { echo "ros2-bag-logger-up: config not found: $CONFIG" >&2; exit 1; }
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+
+# `export` (v1.14.0, rig ≥ v0.2.54 `rig run export`): re-write THIS instance's sessions of a sealed
+# run smaller — `ros2 bag convert` per session (recompress at the profile's preset, drop topics,
+# cut a window) in the logger's own image, into the export dir rig names. bag_export.py renders
+# one spec per session + a convert script under $RIG_EXPORT_DEST/.rig/export/<name>/ and prints
+# "<script>\t<count>\t<name>"; both dirs are mounted at their HOST paths (the script and specs name
+# host paths; the source read-only). A one-off `compose run` beside whatever is recording now —
+# never the recorder's container. Nothing to convert exits 0 without docker.
+if [ "${1:-}" = "export" ]; then
+  # bash 3.2 (macOS dev boxes) chokes on quotes inside ${:?} words — keep these messages plain
+  : "${RIG_EXPORT_SOURCE:?ros2-bag-logger-up export: RIG_EXPORT_SOURCE, the run dir, is unset - rig run export sets it; this verb is not for standalone use}"
+  : "${RIG_EXPORT_DEST:?ros2-bag-logger-up export: RIG_EXPORT_DEST, the export dir, is unset}"
+  PLAN="$("$PYTHON" "$REPO/tools/bag_export.py" "$CONFIG_ABS" "$REPO")"   # "<script>\t<count>\t<name>"
+  REST="$PLAN"
+  SCRIPT="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+  COUNT="${REST%%$'\t'*}"; NAME="${REST#*$'\t'}"
+  if [ "$COUNT" = "0" ]; then
+    echo "ros2-bag-logger-up: export: nothing to convert" >&2
+    exit 0
+  fi
+  export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros2-bag-logger_${NAME}}"
+  export BAG_RECORD_SCRIPT="$SCRIPT"   # satisfies the compose's required mount (unused by the run)
+  echo "ros2-bag-logger-up: export: project=${COMPOSE_PROJECT_NAME} sessions=${COUNT} script=$SCRIPT" >&2
+  exec docker compose -f "$REPO/docker/compose.deploy.yaml" run --rm --no-deps -T \
+    -v "$RIG_EXPORT_SOURCE:$RIG_EXPORT_SOURCE:ro" -v "$RIG_EXPORT_DEST:$RIG_EXPORT_DEST" \
+    bag-logger /bin/bash "$SCRIPT"
+fi
 
 # config -> the exact `ros2 bag record` command, rendered to var/run/<name>/record.sh (captured by
 # `rig bake` like any launcher-rendered file). bag_cmd prints
