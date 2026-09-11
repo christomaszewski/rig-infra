@@ -239,6 +239,21 @@ render), the project name comes from rig or the config's `name`, and a note on s
 The player's `down` used to die in `play_cmd` before `docker compose down` ever ran, leaving a
 half-up replay with no way down short of hand-exporting the env.
 
+**Zenoh shared memory** (player ≥ v1.14.1). The player publishes the recorded pointclouds in place of the sensor,
+so it defaults to `zenoh: {shared_memory: true, shm_pool_mb: 256}` even in existing configs
+without a `zenoh:` block. Its container uses `ipc: host`. The knobs match Ouster and the bag
+logger: `shared_memory: false` explicitly disables SHM, `shm_pool_mb` sets this session's pool
+in MiB, and optional nested `zenoh.overrides` entries take precedence over those shorthand keys.
+`play.sh` appends the settings to `ZENOH_CONFIG_OVERRIDE` before starting the player, latch
+pre-pass, or release gate, only under `rmw_zenoh_cpp`, and logs the resulting overrides. Other
+session settings are preserved. Each ROS session using these defaults has its own pool.
+
+Local subscribers also need Zenoh SHM enabled and host IPC for those links to use shared memory;
+otherwise they fall back to TCP. Avoid an image-level `ZENOH_SHM_ALLOC_SIZE`, which overrides the
+pool-size setting. Recreate the player container to apply host IPC, then verify transport use
+and playback latency on the replay host; these settings alone do not establish the cause of a
+latency problem.
+
 **Standalone invocation** (no rig — this is also the SIL path before rig v0.2.33 lands):
 
 ```bash

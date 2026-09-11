@@ -21,6 +21,7 @@ services:
   bag-player:
     image: ${BAG_PLAYER_IMAGE:-${RIG_MSGS_IMAGE:-${RIG_BASE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}}}
     network_mode: host            # join the graph / reach the zenoh router at localhost:7447
+    ipc: host                    # share the host SHM namespace with local pointcloud subscribers
     restart: "no"                 # bag ends -> container exits 0 -> replay is FINISHED (never loop it back up)
     volumes:
       - ${RIG_REPLAY_SOURCE:?exported by rig replay, or by ros2-bag-player-up from source.run}:/replay:ro
@@ -33,6 +34,7 @@ services:
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+      ZENOH_CONFIG_OVERRIDE: ${ZENOH_CONFIG_OVERRIDE:-}   # play.sh appends the config's zenoh settings
       VEHICLE_ID: ${VEHICLE_ID:-}
       BAG_PLAYER_NAME: ${BAG_PLAYER_NAME:-bag_player}   # the latch pre-pass + release gate nodes' namespace (/<name>/latch_restore, /<name>/release_gate)
     command: ["/bin/bash", "/play.sh"]   # bash, not sh: play.sh sources ROS `setup.bash` (bash-only)

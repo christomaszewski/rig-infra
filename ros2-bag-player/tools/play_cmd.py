@@ -99,6 +99,7 @@ and needs no epoch arithmetic. Pre-Jazzy rosbag2 lacked the offset+duration comp
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import pathlib
@@ -478,8 +479,55 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
         "from_s": from_s, "to_s": to_s, "latch": latch, "start_at": start_at}
 
 
+def zenoh_env_lines(cfg: dict, warns: list[str]) -> str:
+    """Use the Ouster/logger `zenoh:` knobs, defaulting this publisher to SHM + 256 MiB.
+
+    Append session overrides at runtime, after any container override. Explicit nested
+    overrides win over the shorthand keys. Host IPC is set in the player's base compose.
+    """
+    zn = _strict(cfg.get("zenoh"), "zenoh", {"shared_memory", "shm_pool_mb", "overrides"})
+    enabled = zn.get("shared_memory", True)
+    if not isinstance(enabled, bool):
+        raise SystemExit("play_cmd: zenoh.shared_memory must be a bool")
+    pool_mb = zn.get("shm_pool_mb", 256)
+    if isinstance(pool_mb, bool) or not isinstance(pool_mb, int) or pool_mb <= 0:
+        raise SystemExit("play_cmd: zenoh.shm_pool_mb must be a positive integer (MiB)")
+    if not enabled and "shm_pool_mb" in zn:
+        warns.append("zenoh.shm_pool_mb is ignored without zenoh.shared_memory: true")
+
+    # Emit false too: an explicit opt-out must override a session/image-level SHM default.
+    pairs = [("transport/shared_memory/enabled", json.dumps(enabled))]
+    if enabled:
+        pairs.append(("transport/shared_memory/transport_optimization/pool_size",
+                      str(pool_mb * 1024 * 1024)))
+    overrides = zn.get("overrides")
+    if overrides is not None and not isinstance(overrides, dict):
+        raise SystemExit("play_cmd: zenoh.overrides must be a mapping (nested zenoh session config)")
+    if overrides:
+        def leaves(prefix: str, val) -> None:
+            if isinstance(val, dict) and val:
+                for key in sorted(val):
+                    leaves(f"{prefix}/{key}" if prefix else str(key), val[key])
+            else:
+                pairs.append((prefix, json.dumps(val, sort_keys=True, separators=(",", ":"))))
+        leaves("", overrides)
+    for path, value in pairs:
+        if ";" in path or ";" in value:
+            raise SystemExit(f"play_cmd: zenoh override at '{path}' contains ';' — rmw_zenoh's "
+                             "ZENOH_CONFIG_OVERRIDE parser splits on ';'")
+    override = shlex.quote(";".join(f"{path}={value}" for path, value in pairs))
+    return (
+        "# Apply Zenoh session tuning before starting any ROS nodes, including replay helpers.\n"
+        'if [ "${RMW_IMPLEMENTATION:-}" = "rmw_zenoh_cpp" ]; then\n'
+        '  export ZENOH_CONFIG_OVERRIDE="${ZENOH_CONFIG_OVERRIDE:+$ZENOH_CONFIG_OVERRIDE;}"'
+        + override + "\n"
+        '  echo "ros2-bag-player: ZENOH_CONFIG_OVERRIDE=$ZENOH_CONFIG_OVERRIDE" >&2\n'
+        "fi\n"
+    )
+
+
 def play_script(path: str, args: list[str], latch: list[str],
-                start_at: float | None = None) -> str:
+                start_at: float | None = None, zenoh: str = "") -> str:
     """play.sh text: source ROS, (windowed) start the latch pre-pass and wait — bounded — for it
     to have published, (gated) start the release-gate companion, then exec `ros2 bag play`.
     Everything is static: no runtime stamps, playback writes nothing — the release instant is a
@@ -494,6 +542,7 @@ def play_script(path: str, args: list[str], latch: list[str],
         "# Source ROS if the image's entrypoint didn't (we run as `command:`, so usually it did).",
         '[ -n "${ROS_DISTRO:-}" ] && [ -f "/opt/ros/$ROS_DISTRO/setup.bash" ] && '
         '. "/opt/ros/$ROS_DISTRO/setup.bash"',
+        *zenoh.splitlines(),
         f'echo "ros2-bag-player: playing {shlex.quote(path)} (exit 0 = the bag ended — a finished'
         ' replay, not a failure)" >&2',
     ]
@@ -537,12 +586,13 @@ def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, ...]:
     static (no runtime stamps: playback writes nothing), captured by `rig bake` like any
     launcher-rendered file."""
     name, source, path, args, warns, extras = build_args(cfg, env)
+    zenoh = zenoh_env_lines(cfg, warns)
     for w in warns:
         sys.stderr.write("ros2-bag-player: " + w + "\n")
     run_dir = pathlib.Path(repo) / "var" / "run" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     script = run_dir / "play.sh"
-    script.write_text(play_script(path, args, extras["latch"], extras["start_at"]))
+    script.write_text(play_script(path, args, extras["latch"], extras["start_at"], zenoh))
     script.chmod(0o755)
     return (name, str(script), source, path, extras["services_source"], extras["calls"],
             "" if extras["bag_start_ns"] is None else str(extras["bag_start_ns"]),

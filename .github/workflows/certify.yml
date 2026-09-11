@@ -121,6 +121,7 @@ jobs:
       - name: ros2-bag-player unit tests
         run: |
           python3 ros2-bag-player/tests/test_play_cmd.py
+          python3 ros2-bag-player/tests/test_play_cmd_zenoh.py
           python3 ros2-bag-player/tests/test_play_cmd_services.py
           python3 ros2-bag-player/tests/test_call_injector.py
           python3 ros2-bag-player/tests/test_export_calls.py

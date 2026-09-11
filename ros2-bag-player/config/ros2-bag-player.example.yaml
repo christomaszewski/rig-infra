@@ -9,6 +9,19 @@
 service: ros2-bag-player
 name: bag_player
 
+# This session publishes the recorded PointCloud2 messages in place of the sensor, so it needs
+# a publisher-sized SHM pool. These defaults also apply to configs that omit the zenoh block.
+# Applied through ZENOH_CONFIG_OVERRIDE in play.sh, only under rmw_zenoh_cpp; untouched session
+# settings are preserved. The player container uses ipc: host. Local subscribers must also
+# enable Zenoh SHM and share host IPC to use it; otherwise those links fall back to TCP.
+zenoh:
+  shared_memory: true    # set false to disable SHM explicitly
+  shm_pool_mb: 256       # MiB per publishing session; ignored when shared_memory is false
+  # overrides:          # optional nested Zenoh session config; applied last, wins on conflict
+  #   transport:
+  #     link: { rx: { buffer_size: 1048576 } }
+# Do not also set ZENOH_SHM_ALLOC_SIZE in the image: it takes precedence over shm_pool_mb.
+
 source:
   run: ""                # abs host path to a run dir — STANDALONE use only; RIG_REPLAY_SOURCE wins.
   #                        Mounted READ-ONLY at /replay; the player cannot write the source run.
