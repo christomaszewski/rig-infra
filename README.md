@@ -521,7 +521,23 @@ export_profiles:
       # topics: [/gnss/fix, /imu/data]      # an ALLOW list instead (composes with exclude)
       # from_s: 30                          # a window, from EACH session's bag start
       # to_s: 900                           #   (its metadata.yaml starting_time — replay's zero)
+      # split_duration_s: 600               # roll the OUTPUT (default: one file per session —
+      # max_size_mb: 2048                   #   a multi-file recording converts to ONE file)
 ```
+
+**In place** (v1.15.0, rig ≥ v0.2.59 `rig run export <run> --in-place`). The same verb rewrites
+the sessions INSIDE the run to reclaim disk instead of making a copy: each session converts into
+`bags/<name>/.rig-rewrite/<session>` (same basename, so rosbag2 names the files after the
+session; same filesystem, so the swap is a rename), `verify.py` compares the converted session's
+per-topic message counts with the original's `metadata.yaml` inside the image, and only then is
+the original replaced. Free space for one session is checked first; a session that fails to
+convert or verify is left untouched; a crash between the two renames is repaired at the next
+run. Options that DROP data (`exclude`, `topics`, `from_s`/`to_s`) are permanent in place and
+refuse without `RIG_EXPORT_LOSSY=1` (rig's `--lossy`) — the verification then checks the topics
+that remain (`kept`), or only non-emptiness for a window. `RIG_EXPORT_NAME` names the data dir
+when it is not this config's `name`, so a run from another deployment or a renamed instance is
+rewritten under its own naming. Nothing about the run has to be special: any closed rosbag2
+session qualifies, runs recorded long before this release included.
 
 **Mechanics.** `tools/bag_export.py` (pure, tested) finds the sessions the recorder wrote
 (`<run>/bags/<name>/<name>_<stamp>/` with a `metadata.yaml`), renders one rosbag2 output spec

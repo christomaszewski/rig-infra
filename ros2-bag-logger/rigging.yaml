@@ -42,7 +42,9 @@ replay: { sim_time: true }
 # into the export dir rig names. `data` is where the recorder writes (output.subdir default —
 # a config with another subdir exports nothing and its bags travel as recorded). The profile
 # options rig hands over (vehicle.yaml export_profiles.<p>.ros2-bag-logger): preset, exclude,
-# topics, from_s, to_s — see tools/bag_export.py. Older rigs ignore this key.
+# topics, from_s, to_s, split_duration_s, max_size_mb — see tools/bag_export.py. v1.15.0 (rig >=
+# v0.2.59 `--in-place`): the same verb REWRITES the sessions inside the run, each verified
+# against the original's per-topic counts before it replaces it. Older rigs ignore this key.
 export: { data: "bags/{name}" }
 launch_surface:
   - ros2-bag-logger-up

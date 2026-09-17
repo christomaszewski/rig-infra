@@ -62,12 +62,13 @@ def _plan(run, dest, opts, *, force=False, name="bag_logger"):
 
 def test_options_defaults_and_refusals():
     d = bag_export.parse_options(None)
-    assert d == {"preset": "zstd_small", "exclude": [], "topics": [], "from_s": None, "to_s": None}
+    assert d == {"preset": "zstd_small", "exclude": [], "topics": [], "from_s": None, "to_s": None,
+                 "split_duration_s": 0, "max_size_mb": 0}
     assert bag_export.parse_options({})["preset"] == "zstd_small"
     o = bag_export.parse_options({"preset": "ZSTD_FAST", "exclude": ".*/points$", "topics": ["/a"],
                                   "from_s": 3, "to_s": "10.5"})
     assert o == {"preset": "zstd_fast", "exclude": [".*/points$"], "topics": ["/a"],
-                 "from_s": 3.0, "to_s": 10.5}
+                 "from_s": 3.0, "to_s": 10.5, "split_duration_s": 0, "max_size_mb": 0}
     for bad, needle in (({"presets": "zstd_small"}, "unknown export option"),
                         ({"preset": "lzma"}, "unknown preset"),
                         ({"exclude": [".*/points(" ]}, "not a regex"),
@@ -145,6 +146,130 @@ def test_idempotent_unless_force_and_nothing_to_export():
         assert len(jobs) == 2 and f"rm -rf {done}" in script      # convert refuses an existing dir
         jobs, _, warns = _plan(run, dest, {}, name="other_logger")
         assert jobs == [] and any("no sessions" in w for w in warns)
+
+
+# --- in place (v1.15.0) ---------------------------------------------------------------------------------
+
+def test_in_place_plan_converts_beside_verifies_then_swaps():
+    with tempfile.TemporaryDirectory() as tmp:
+        run, _ = _run_tree(pathlib.Path(tmp), sessions=("bag_logger_20260101T000000Z",))
+        tree = run / "bags" / "bag_logger"
+        (tree / ".rig-rewrite").mkdir()                          # a leftover work dir is no session
+        jobs, script, warns = bag_export.plan(str(run), str(run), "bags", "bag_logger",
+                                              bag_export.parse_options({}), force=False,
+                                              spec_dir=run / ".rig" / "export" / "bag_logger",
+                                              in_place=True)
+        assert warns == [] and len(jobs) == 1
+        sess, spec, _ = jobs[0]
+        out = tree / ".rig-rewrite" / sess.name                  # SAME basename: rosbag2 names the
+        assert spec["output_bags"][0]["uri"] == str(out)         # files after it; same filesystem
+        verify = run / ".rig" / "export" / "bag_logger" / "verify.py"
+        assert f"ros2 bag convert -i {sess} -o " in script
+        assert f"python3 {verify} {sess}/metadata.yaml {out}/metadata.yaml all" in script
+        orig = tree / ".rig-rewrite" / f"{sess.name}.orig"
+        assert f"mv {sess} {orig} && mv {out} {sess}" in script   # swap only after the verify
+        assert script.index("python3 ") < script.index(f"mv {sess} ")
+        assert f"[ -e {sess} ] || mv {orig} {sess}" in script      # a failed swap restores
+        assert "*.orig" in script and "df -Pk" in script           # crash recovery + free-space guard
+        assert "original untouched" in script and script.rstrip().endswith("exit $rc")
+        # an in-place session is never "already exported": rig's manifest record is the gate
+        jobs2, _, warns2 = bag_export.plan(str(run), str(run), "bags", "bag_logger",
+                                           bag_export.parse_options({}), force=False,
+                                           spec_dir=run / ".rig" / "export" / "bag_logger", in_place=True)
+        assert len(jobs2) == 1 and warns2 == []
+
+
+def test_lossy_gate_verify_modes_and_split_keys():
+    lossless = bag_export.parse_options({"preset": "zstd_small", "split_duration_s": 600, "max_size_mb": 2048})
+    assert bag_export.lossy_reasons(lossless) == [] and bag_export.verify_mode(lossless) == "all"
+    spec = bag_export.session_spec("/s", "/o", lossless, None)["output_bags"][0]
+    assert spec["max_bagfile_duration"] == 600 and spec["max_bagfile_size"] == 2048 * 1024 * 1024
+    dropped = bag_export.parse_options({"exclude": [".*/points$"]})
+    assert bag_export.verify_mode(dropped) == "kept" and "exclude" in bag_export.lossy_reasons(dropped)[0]
+    assert bag_export.verify_mode(bag_export.parse_options({"topics": ["/a"]})) == "kept"
+    window = bag_export.parse_options({"from_s": 5})
+    assert bag_export.verify_mode(window) == "any" and "window" in bag_export.lossy_reasons(window)[0]
+    for bad in ({"split_duration_s": "soon"}, {"max_size_mb": -1}):
+        try:
+            bag_export.parse_options(bad)
+            assert False
+        except SystemExit:
+            pass
+
+
+def test_main_in_place_refuses_lossy_without_the_flag_and_honors_the_data_name():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        run, _ = _run_tree(tmp, sessions=("legacy_20260101T000000Z",), name="legacy")
+        cfg = tmp / "bag_logger.yaml"
+        cfg.write_text("service: ros2-bag-logger\nname: bag_logger\n")   # NOT the run's name
+        opts = tmp / "opts.yaml"
+        opts.write_text("exclude: ['.*/points$']\n")
+        base = {"RIG_EXPORT_SOURCE": str(run), "RIG_EXPORT_DEST": str(run), "RIG_EXPORT_INPLACE": "1",
+                "RIG_EXPORT_OPTIONS": str(opts), "RIG_EXPORT_NAME": "legacy"}
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                bag_export.main([str(cfg), str(REPO)], base)
+            assert False, "lossy in place must refuse without RIG_EXPORT_LOSSY"
+        except SystemExit as exc:
+            assert "DROP data" in str(exc) and "--lossy" in str(exc)
+        assert not (run / ".rig").exists()                          # refused before writing anything
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = bag_export.main([str(cfg), str(REPO)], {**base, "RIG_EXPORT_LOSSY": "1"})
+        script, count, name = out.getvalue().strip().split("\t")
+        assert rc == 0 and count == "1" and name == "legacy"
+        assert script == str(run / ".rig" / "export" / "legacy" / "convert.sh")
+        assert (run / ".rig" / "export" / "legacy" / "verify.py").is_file()
+        assert " kept" in pathlib.Path(script).read_text() and "rewrite IN PLACE" in err.getvalue()
+        for env, needle in (({**base, "RIG_EXPORT_DEST": str(tmp)}, "is the run itself"),
+                            ({**base, "RIG_EXPORT_NAME": "../x"}, "plain directory name")):
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    bag_export.main([str(cfg), str(REPO)], env)
+                assert False
+            except SystemExit as exc:
+                assert needle in str(exc)
+
+
+def _meta(counts: dict) -> str:
+    return yaml.safe_dump({"rosbag2_bagfile_information": {"topics_with_message_count": [
+        {"topic_metadata": {"name": k}, "message_count": v} for k, v in counts.items()]}})
+
+
+def test_verify_script_modes_for_real():
+    """verify.py is what stands between a convert and the removal of the original: run it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        (tmp / "verify.py").write_text(bag_export.VERIFY_PY)
+        (tmp / "orig.yaml").write_text(_meta({"/imu": 6000, "/chatter": 6000, "/silent": 0}))
+
+        def run(new: dict, mode: str):
+            (tmp / "new.yaml").write_text(_meta(new))
+            return subprocess.run([sys.executable, str(tmp / "verify.py"), str(tmp / "orig.yaml"),
+                                   str(tmp / "new.yaml"), mode], capture_output=True, text=True)
+
+        assert run({"/imu": 6000, "/chatter": 6000}, "all").returncode == 0   # zero-count topics moot
+        bad = run({"/imu": 6000, "/chatter": 5999}, "all")
+        assert bad.returncode == 1 and "/chatter: 6000 -> 5999" in bad.stderr
+        assert run({"/imu": 6000}, "all").returncode == 1                       # a topic went missing
+        assert run({"/imu": 6000}, "kept").returncode == 0                      # …on purpose
+        assert run({"/imu": 5000}, "kept").returncode == 1                      # a kept topic lost data
+        assert run({}, "kept").returncode == 1 and run({}, "any").returncode == 1
+        assert run({"/imu": 10}, "any").returncode == 0                         # a window: non-empty
+
+
+def test_launcher_in_place_mounts_the_run_once_writable():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        run, _ = _run_tree(tmp)
+        proc, log = _launch(tmp, "export", {"RIG_EXPORT_SOURCE": str(run), "RIG_EXPORT_DEST": str(run),
+                                            "RIG_EXPORT_INPLACE": "1"})
+        assert proc.returncode == 0, proc.stderr
+        argv = [line for line in log.splitlines() if line.startswith("ARGV:")][0]
+        assert f"-v {run}:{run} " in argv and ":ro" not in argv
+        assert argv.count(" -v ") == 1
+        assert argv.endswith(f"bag-logger /bin/bash {run / '.rig' / 'export' / 'bag_logger' / 'convert.sh'}")
 
 
 # --- main + the launcher -------------------------------------------------------------------------------

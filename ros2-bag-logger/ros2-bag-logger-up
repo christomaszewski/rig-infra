@@ -34,6 +34,13 @@ if [ "${1:-}" = "export" ]; then
   export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros2-bag-logger_${NAME}}"
   export BAG_RECORD_SCRIPT="$SCRIPT"   # satisfies the compose's required mount (unused by the run)
   echo "ros2-bag-logger-up: export: project=${COMPOSE_PROJECT_NAME} sessions=${COUNT} script=$SCRIPT" >&2
+  # In place (v1.15.0, rig run export --in-place): the run is source AND destination — ONE
+  # writable mount; the script verifies every converted session before it replaces the original.
+  if [ "${RIG_EXPORT_INPLACE:-}" = "1" ]; then
+    exec docker compose -f "$REPO/docker/compose.deploy.yaml" run --rm --no-deps -T \
+      -v "$RIG_EXPORT_SOURCE:$RIG_EXPORT_SOURCE" \
+      bag-logger /bin/bash "$SCRIPT"
+  fi
   exec docker compose -f "$REPO/docker/compose.deploy.yaml" run --rm --no-deps -T \
     -v "$RIG_EXPORT_SOURCE:$RIG_EXPORT_SOURCE:ro" -v "$RIG_EXPORT_DEST:$RIG_EXPORT_DEST" \
     bag-logger /bin/bash "$SCRIPT"

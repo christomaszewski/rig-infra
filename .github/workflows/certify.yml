@@ -50,6 +50,8 @@ jobs:
           # v1.14.0: the `export` verb — bag_export's pure core (specs per session, the options
           # schema, windows off the session's metadata, idempotency) + the launcher against a
           # docker stub (the one-off `compose run` with both dirs mounted at their host paths)
+          # v1.15.0: + the in-place rewrite (convert beside, verify.py run for real, swap,
+          # crash recovery, the lossy gate, RIG_EXPORT_NAME, the single writable mount)
           python3 ros2-bag-logger/tests/test_bag_export.py
       # The player renders against a source run (session resolution is host-side, §1.3 of the
       # replay handoff) and the example config's source.run is empty ON PURPOSE — the source is
