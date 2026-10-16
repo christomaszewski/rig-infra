@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import time
 
@@ -141,8 +142,8 @@ class EpochTracker:
 def walk(node) -> dict:
     """One graph observation via the four per-node NodeGraph calls. A node that vanishes between
     enumeration and its by-node calls is dropped whole (the next tick sees the settled graph) —
-    but a SHUTDOWN mid-walk (rclpy's signal handler invalidates the context, every call starts
-    raising) must propagate, or a shutdown would masquerade as an everything-vanished epoch."""
+    but an externally invalidated context must propagate, or a shutdown would masquerade as an
+    everything-vanished epoch. Our signal handler keeps the context alive through the walk/write."""
     obs: dict = {}
     for name, ns in node.get_node_names_and_namespaces():
         try:
@@ -181,8 +182,21 @@ def _utc() -> tuple[str, str]:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", t), time.strftime("%Y%m%dT%H%M%SZ", t)
 
 
+def wait_for_stop(seconds: float, stopping) -> bool:
+    """Interruptible warm-up/tick delay. The signal handler only sets a flag: no exceptions,
+    ROS calls, I/O, or locks (even an Event.set can deadlock if a signal interrupts its lock)."""
+    deadline = time.monotonic() + seconds
+    while not stopping():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(remaining, 0.1))
+    return True
+
+
 def main() -> int:
     import rclpy  # lazy: the pure core above stays importable (testable) without ROS
+    from rclpy.signals import SignalHandlerOptions
 
     name = os.environ.get("GRAPH_SNAPSHOT_NAME") or "bag_logger"
     interval = float(os.environ.get("GRAPH_SNAPSHOT_INTERVAL_S") or 60)
@@ -193,22 +207,35 @@ def main() -> int:
     out_dir = resolve_out_dir(os.environ.get("RIG_BAG_ROOT") or "/data", name)
     os.makedirs(out_dir, exist_ok=True)
 
-    rclpy.init()
-    node = rclpy.create_node("graph_snapshotter_" + re.sub(r"[^A-Za-z0-9_]", "_", name))
-    self_fqn = node.get_fully_qualified_name()
-    sys.stderr.write(f"graph-snapshotter: {self_fqn} -> {out_dir} "
-                     f"(interval={interval:g}s settle={settle:g}s rmw={rmw} domain={domain})\n")
-    time.sleep(settle)  # zenoh graph cache warm-up: liveliness tokens replay after the node joins
+    stopping = False
 
-    tracker = EpochTracker(rmw, domain)
+    def request_stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    # Own both signals so a stop never invalidates ROS mid-observation or interrupts a write.
+    # The compose command execs Python, so Docker's normal SIGTERM reaches this handler.
+    previous_handlers = {sig: signal.signal(sig, request_stop)
+                         for sig in (signal.SIGTERM, signal.SIGINT)}
+    node = None
     try:
-        while True:
+        rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+        node = rclpy.create_node("graph_snapshotter_" + re.sub(r"[^A-Za-z0-9_]", "_", name))
+        self_fqn = node.get_fully_qualified_name()
+        sys.stderr.write(f"graph-snapshotter: {self_fqn} -> {out_dir} "
+                         f"(interval={interval:g}s settle={settle:g}s rmw={rmw} domain={domain})\n")
+        # zenoh graph cache warm-up: liveliness tokens replay after the node joins
+        if wait_for_stop(settle, lambda: stopping):
+            return 0
+
+        tracker = EpochTracker(rmw, domain)
+        while not stopping and rclpy.ok():
             t0 = time.monotonic()
             try:
                 nodes = canonicalize(walk(node), self_fqn)
             except Exception:  # noqa: BLE001
                 if not rclpy.ok():
-                    break  # SIGTERM/SIGINT: rclpy's handler shut the context down — exit clean
+                    break  # external context shutdown: never persist a partial observation
                 raise
             walk_ms = (time.monotonic() - t0) * 1000
             now, stamp = _utc()
@@ -221,12 +248,18 @@ def main() -> int:
                                      f"({len(nodes)} nodes, walk {walk_ms:.0f} ms)\n")
             except OSError as exc:  # disk trouble: keep observing, retry next tick
                 sys.stderr.write(f"graph-snapshotter: write failed ({exc}); retrying next tick\n")
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        pass
+            if wait_for_stop(interval, lambda: stopping):
+                break
     finally:
-        node.destroy_node()
-        rclpy.try_shutdown()
+        try:
+            try:
+                if node is not None:
+                    node.destroy_node()
+            finally:
+                rclpy.try_shutdown(uninstall_handlers=False)
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
     return 0
 
 

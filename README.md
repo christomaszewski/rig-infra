@@ -498,6 +498,11 @@ and env (`ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`, the data-root mount) — custom-
 works wherever the recorder's does, and there are no new rig-owned env vars. Cost is negligible:
 a ~28-node graph walks in single-digit milliseconds per tick and writes ~35 KB per epoch.
 
+**Shutdown.** Docker's normal SIGTERM wakes the warm-up or interval wait within 100 ms. If a
+graph observation or atomic epoch write is already underway, it finishes before the ROS node
+and context are torn down. Shutdown does not start another observation or bump `last:` without
+one; the last saved timestamp remains the time the graph was actually observed.
+
 ## Slim exports — the bag logger's `export` verb (v1.14.0, rig ≥ v0.2.54)
 
 A run dir is mostly video and bags, both already compressed, so what shrinks it for the trip

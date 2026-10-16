@@ -46,6 +46,7 @@ jobs:
       - name: ros2-bag-logger unit tests
         run: |
           python3 ros2-bag-logger/tests/test_graph_snapshot.py
+          python3 ros2-bag-logger/tests/test_graph_snapshot_shutdown.py
           python3 ros2-bag-logger/tests/test_bag_cmd_sim_time.py
           # v1.14.0: the `export` verb — bag_export's pure core (specs per session, the options
           # schema, windows off the session's metadata, idempotency) + the launcher against a
