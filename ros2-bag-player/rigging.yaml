@@ -20,7 +20,7 @@ examples: [config/ros2-bag-player.example.yaml]   # default config for `rig cert
 # compose) the bag logger records under, so every recorded type deserializes by construction. No
 # new image and no `provides: base` here: the player rides whatever base the fleet's
 # logger/router riggings already provide; declaring the build ref only names the fallback build.
-build: { command: ../base/build.sh, images: [fleet-ros] }
+build: { architectures: [arm64, amd64], capabilities: {no_cache: true, platforms: true}, command: ../base/build.sh, images: [fleet-ros] }
 launch_surface:
   - ros2-bag-player-up
   - tools/play_cmd.py

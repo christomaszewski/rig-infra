@@ -23,22 +23,23 @@ jobs:
           repository: christomaszewski/rig
           path: .rig
       - run: python3 -m pip install --user pyyaml
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap libseccomp2
       # Each service's declared `examples:` is certify's default --config.
       - name: certify zenoh-router
-        run: ./.rig/rig certify --repo zenoh-router
+        run: ./.rig/rig certify --require-build-check --repo zenoh-router
       # The router's second config path: an inline `router_config:` renders + mounts a zenohd.json5.
       - name: certify zenoh-router (router_config path)
         run: |
           printf 'service: zenoh-router\nname: zr\nrouter_config:\n  scouting: {multicast: {enabled: false}}\n' > /tmp/zr.yaml
-          ./.rig/rig certify --repo zenoh-router --config /tmp/zr.yaml
+          ./.rig/rig certify --require-build-check --repo zenoh-router --config /tmp/zr.yaml
       - name: certify ros2-bag-logger
-        run: ./.rig/rig certify --repo ros2-bag-logger
+        run: ./.rig/rig certify --require-build-check --repo ros2-bag-logger
       # The logger's second config path: a `graph:` block gates the graph-snapshotter sidecar
       # (profile-gated compose service + GRAPH_SNAPSHOT_* env exports).
       - name: certify ros2-bag-logger (graph path)
         run: |
           printf 'service: ros2-bag-logger\nname: bl\ngraph:\n  enabled: true\n  interval_s: 30\n' > /tmp/bl.yaml
-          ./.rig/rig certify --repo ros2-bag-logger --config /tmp/bl.yaml
+          ./.rig/rig certify --require-build-check --repo ros2-bag-logger --config /tmp/bl.yaml
       # The graph-snapshotter's pure core (epoch dedup/hash/schema — the rig v0.2.32 reader is
       # built against fixtures of exactly this schema) and the `graph:` config gate — plus the
       # v1.9.0 sim-time adoption (RIG_SIM_TIME fills use_sim_time's default, explicit config
@@ -65,7 +66,7 @@ jobs:
           # bag start is the injector's one zero; the duration bounds the window) — fabricate it.
           printf 'rosbag2_bagfile_information:\n  version: 9\n  storage_identifier: mcap\n  duration: {nanoseconds: 120000000000}\n  starting_time: {nanoseconds_since_epoch: 1767225600000000000}\n  topics_with_message_count: []\n' \
             > /tmp/replay-src/bags/bag_logger/bag_logger_20260101T000000Z/metadata.yaml
-          RIG_REPLAY_SOURCE=/tmp/replay-src ./.rig/rig certify --repo ros2-bag-player
+          RIG_REPLAY_SOURCE=/tmp/replay-src ./.rig/rig certify --require-build-check --repo ros2-bag-player
       # The player's service-call paths (rig-replay-calls-handoff §1, rig >= v0.2.37): verbatim
       # service playback rides the topic session's env; a call script activates the injector's
       # `calls` compose profile (gated on `up` only — `config` renders the player alone, like
@@ -74,16 +75,16 @@ jobs:
         run: |
           printf 'schema: 1\ncalls: []\n' > /tmp/calls.yaml
           RIG_REPLAY_SOURCE=/tmp/replay-src RIG_REPLAY_TOPICS="/a /b" \
-            RIG_REPLAY_SERVICES="/planner/set_mode" ./.rig/rig certify --repo ros2-bag-player
+            RIG_REPLAY_SERVICES="/planner/set_mode" ./.rig/rig certify --require-build-check --repo ros2-bag-player
           RIG_REPLAY_SOURCE=/tmp/replay-src RIG_REPLAY_CALLS=/tmp/calls.yaml \
-            ./.rig/rig certify --repo ros2-bag-player
+            ./.rig/rig certify --require-build-check --repo ros2-bag-player
       # The window path (rig-replay-window-handoff §1, rig >= v0.2.46): RIG_REPLAY_FROM_S/TO_S ->
       # --start-offset + --playback-duration, validated against the fabricated metadata.yaml, and
       # play.sh grows the latch pre-pass block (tools/latch_restore.py mounted into the player).
       - name: certify ros2-bag-player (window path)
         run: |
           RIG_REPLAY_SOURCE=/tmp/replay-src RIG_REPLAY_FROM_S=30 RIG_REPLAY_TO_S=45 \
-            RIG_REPLAY_TOPICS="/a /b" ./.rig/rig certify --repo ros2-bag-player
+            RIG_REPLAY_TOPICS="/a /b" ./.rig/rig certify --require-build-check --repo ros2-bag-player
       # The release-gate path (rig-sensor-replay-plan §5, rig >= v0.2.52 -> v1.13.0):
       # RIG_REPLAY_START_AT_UNIX_S forces --start-paused and play.sh backgrounds the companion
       # (tools/release_gate.py, mounted into the player) with the instant spelled as rig spelled
@@ -95,7 +96,7 @@ jobs:
           set -eu
           play=ros2-bag-player/var/run/certifyname0/play.sh
           RIG_REPLAY_SOURCE=/tmp/replay-src RIG_REPLAY_START_AT_UNIX_S=1767225620.500 \
-            RIG_REPLAY_EXCLUDE='^$' ./.rig/rig certify --repo ros2-bag-player
+            RIG_REPLAY_EXCLUDE='^$' ./.rig/rig certify --require-build-check --repo ros2-bag-player
           grep -qxF 'python3 /release_gate.py --at 1767225620.500 &' "$play" || {
             echo "::error::play.sh lacks the release-gate companion line"; cat "$play"; exit 1; }
           grep -qxF "exec ros2 bag play /replay/bags/bag_logger/bag_logger_20260101T000000Z --start-paused --exclude-regex '(?:^\$)'" "$play" || {
@@ -107,7 +108,7 @@ jobs:
             | grep -q 'RIG_REPLAY_START_AT_UNIX_S: "1767225620.500"' || {
             echo "::error::the call-injector's compose env lacks RIG_REPLAY_START_AT_UNIX_S"; exit 1; }
           # absent var: today's behaviour — no companion, no --start-paused
-          RIG_REPLAY_SOURCE=/tmp/replay-src ./.rig/rig certify --repo ros2-bag-player
+          RIG_REPLAY_SOURCE=/tmp/replay-src ./.rig/rig certify --require-build-check --repo ros2-bag-player
           ! grep -qE 'release_gate|--start-paused' "$play" || {
             echo "::error::play.sh carries the gate without RIG_REPLAY_START_AT_UNIX_S"; cat "$play"; exit 1; }
           echo "  ok  release gate: companion + forced --start-paused + injector env; absent var inert"
@@ -136,9 +137,9 @@ jobs:
           # to render (rig strips RIG_REPLAY_* on every verb but `replay`; a docker stub records
           # what the launcher ran), and a bare certify -- no source exported -- must pass.
           python3 ros2-bag-player/tests/test_launcher_verbs.py
-          ./.rig/rig certify --repo ros2-bag-player
+          ./.rig/rig certify --require-build-check --repo ros2-bag-player
       - name: certify ros1-bag-logger
-        run: ./.rig/rig certify --repo ros1-bag-logger
+        run: ./.rig/rig certify --require-build-check --repo ros1-bag-logger
       # RIG_BASE_IMAGE, consumer side: with a base exported the stacks RUN it; with none — certify's
       # view, and a standalone `docker compose` — they fall back to the composed fleet-ros pull ref.
       # A per-instance ${<SVC>_IMAGE} override still beats both.

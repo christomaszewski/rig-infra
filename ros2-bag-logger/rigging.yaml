@@ -29,7 +29,7 @@ examples: [config/ros2-bag-logger.example.yaml]   # default config for `rig cert
 # message packages installed and bags stop silently missing those topics. zenoh-router declares
 # the same overlay from the same script; rig dedupes them into one build. An external
 # `images.base` skips the base build but NOT the overlay (built FROM the external ref).
-build: { command: ../base/build.sh, images: [fleet-ros], provides: base,
+build: { architectures: [arm64, amd64], capabilities: {no_cache: true, platforms: true}, command: ../base/build.sh, images: [fleet-ros], provides: base,
          msgs_overlay: { command: ../msgs/build-msgs.sh, image: fleet-ros-msgs } }
 # Replay sim-time adoption (rig >= v0.2.34): bag_cmd fills `control.use_sim_time`'s DEFAULT from
 # rig's RIG_SIM_TIME token (explicit config wins both ways) — under `rig replay` the recorder then

@@ -568,3 +568,12 @@ services:
 
 or scaffold directly: `rig init my-vehicle --infra zenoh-router --infra ros2-bag-logger` (bare names
 resolve by scanning the workspace) — wired + enabled, router pinned to order 0.
+
+## Portable image builds
+
+Portable builds declare Linux arm64 and amd64 for `fleet-ros` and `fleet-ros-msgs`. Rig builds the
+shared base once, publishes its multiarch index, then passes that exact digest to the messages
+overlay and service consumers. `--no-cache` disables instruction caching in both builds; the overlay
+keeps its deliberate no-pull policy. `rig certify --repo zenoh-router --require-build-check` tests
+both build entrypoints in isolation without building images (requires Bubblewrap on Linux or
+sandbox-exec on macOS). The router, logger and player CI gates require completed build checks.

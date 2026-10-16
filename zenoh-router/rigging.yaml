@@ -30,7 +30,7 @@ examples: [config/zenoh-router.example.yaml]   # default config for `rig certify
 # anywhere = no overlay build, and the logger falls back to the base — correct. ros2-bag-logger
 # declares the SAME overlay from the SAME script (either service alone still supplies it); rig
 # dedupes by script identity exactly like the base build.
-build: { command: ../base/build.sh, images: [fleet-ros], provides: base,
+build: { architectures: [arm64, amd64], capabilities: {no_cache: true, platforms: true}, command: ../base/build.sh, images: [fleet-ros], provides: base,
          msgs_overlay: { command: ../msgs/build-msgs.sh, image: fleet-ros-msgs } }
 # Standalone alternative: point ZENOH_ROUTER_IMAGE at a PINNED eclipse/zenoh (e.g. eclipse/zenoh:1.2.1
 # — never :latest, mirrored tags can silently drift on re-mirror), swap this `build:` for

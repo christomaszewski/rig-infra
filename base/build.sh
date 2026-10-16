@@ -53,8 +53,9 @@ rmw="${RIG_ROS_RMW:-${FLEET_ROS_RMW:-rmw_zenoh_cpp}}"
 
 echo "fleet-ros: building ${ref} (ROS_DISTRO=${distro} rmw=${rmw})${RIG_BUILD_NO_CACHE:+ --no-cache --pull}" >&2
 # Unquoted on purpose: each ${VAR:+word} expands to exactly one word or none (safe under `set -u`).
-docker build ${RIG_BUILD_NO_CACHE:+--no-cache} ${RIG_BUILD_NO_CACHE:+--pull} \
+# shellcheck source=base/rig-build.sh
+. "$base_dir/rig-build.sh"
+rig_build "$ref" \
     --build-arg "ROS_DISTRO=${distro}" \
     --build-arg "RMW_IMPLEMENTATION=${rmw}" \
-    -t "$ref" "$base_dir"
-docker push "$ref"
+    "$base_dir"

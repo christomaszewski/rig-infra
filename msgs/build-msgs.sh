@@ -45,7 +45,7 @@ ref="${registry}/fleet-ros-msgs:${tag}"
 # Stage a throwaway context: the manifest lives wherever the caller keeps it (rig will render a temp
 # file; hand use points at a deployment-owned yaml) — never copied into msgs/ itself, which must stay
 # a clean, self-contained build unit.
-ctx="$(mktemp -d)"
+ctx="$(mktemp -d "${TMPDIR:-/tmp}/rig-msgs.XXXXXX")"
 trap 'rm -rf "$ctx"' EXIT
 cp "$msgs_dir/Dockerfile" "$msgs_dir/build_msgs.py" "$ctx/"
 cp "$manifest" "$ctx/msgs-manifest.yaml"
@@ -71,8 +71,11 @@ fi
 
 echo "fleet-ros-msgs: building ${ref} FROM ${base} (manifest=${manifest})${RIG_BUILD_NO_CACHE:+ --no-cache}${ssh_flag:+ ${ssh_flag}}" >&2
 # Unquoted on purpose: ${VAR:+word} expands to exactly one word or none (safe under `set -u`).
-docker build ${RIG_BUILD_NO_CACHE:+--no-cache} ${ssh_flag} \
+# shellcheck source=msgs/rig-build.sh
+. "$msgs_dir/rig-build.sh"
+export RIG_BUILD_PULL=0
+# shellcheck disable=SC2086  # optional two-word --ssh default
+rig_build "$ref" ${ssh_flag} \
     --build-arg "BASE_IMAGE=${base}" \
     --build-arg "ROS_DISTRO=${distro}" \
-    -t "$ref" "$ctx"
-docker push "$ref"
+    "$ctx"
