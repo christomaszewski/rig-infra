@@ -202,8 +202,15 @@ jobs:
           # parent. RIG_BASE_IMAGE must NOT reach the base build even when it leaks in.
           : > /tmp/stub/argv
           RIG_BUILD_NO_CACHE=1 ./base/build.sh devbox:5000 v1.3.0
-          grep -q -- 'docker build --no-cache --pull .*--build-arg ROS_DISTRO=lyrical' /tmp/stub/argv || {
-            echo "::error::RIG_BUILD_NO_CACHE=1 did not reach docker build as --no-cache --pull"; cat /tmp/stub/argv; exit 1; }
+          python3 - <<'PY'
+          import pathlib, shlex
+          commands = [shlex.split(line) for line in pathlib.Path('/tmp/stub/argv').read_text().splitlines()]
+          builds = [command for command in commands if command[:2] == ['docker', 'build']]
+          assert len(builds) == 1, commands
+          args = builds[0]
+          assert '--no-cache' in args and '--pull' in args, args
+          assert any(args[i:i+2] == ['--build-arg', 'ROS_DISTRO=lyrical'] for i in range(len(args))), args
+          PY
           : > /tmp/stub/argv
           RIG_BASE_IMAGE=nvcr.io/vendor/l4t-ros:36.4 ./base/build.sh devbox:5000 v1.3.0
           ! grep -qE -- '--no-cache|--pull|nvcr\.io' /tmp/stub/argv || {
