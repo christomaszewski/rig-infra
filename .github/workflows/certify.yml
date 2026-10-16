@@ -23,7 +23,7 @@ jobs:
           repository: christomaszewski/rig
           path: .rig
       - run: python3 -m pip install --user pyyaml
-      - run: sudo apt-get update && sudo apt-get install -y bubblewrap libseccomp2
+      - uses: ./.rig/.github/actions/setup-build-probe
       # Each service's declared `examples:` is certify's default --config.
       - name: certify zenoh-router
         run: ./.rig/rig certify --require-build-check --repo zenoh-router
