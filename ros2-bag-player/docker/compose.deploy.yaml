@@ -31,6 +31,7 @@ services:
                                                        # backgrounds it before a WINDOWED play (from > 0), never otherwise
       - ../tools/release_gate.py:/release_gate.py:ro   # the release gate (rig-sensor-replay-plan §5): play.sh backgrounds it
                                                        # under RIG_REPLAY_START_AT_UNIX_S (baked into play.sh), never otherwise
+      - ../tools/clock_only.py:/clock_only.py:ro
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}

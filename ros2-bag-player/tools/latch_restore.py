@@ -148,7 +148,9 @@ def main() -> int:
                     help="window start, seconds from bag start (must be > 0)")
     ap.add_argument("--topics", nargs="+", help="the main play's allow-list")
     ap.add_argument("--exclude-regex", help="the main play's exclude alternation")
+    ap.add_argument("--remap", action="append", default=[], help="same exact topic remap as the player")
     a = ap.parse_args()
+    remap = dict(value.split(":=", 1) for value in a.remap)
     if a.topics and a.exclude_regex:
         raise SystemExit("latch_restore: --topics and --exclude-regex together — play_cmd never "
                          "emits both")
@@ -194,7 +196,9 @@ def main() -> int:
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message
 
-    rclpy.init()
+    # Our --remap arguments are data for this helper, not global ROS remap rules.
+    # Letting rclpy parse them would apply a second remap to chained destinations.
+    rclpy.init(args=[])
     node = rclpy.create_node("latch_restore", namespace="/" + name)
     pubs = []
     for t in have:
@@ -210,7 +214,7 @@ def main() -> int:
                          durability=DurabilityPolicy.TRANSIENT_LOCAL,
                          reliability=ReliabilityPolicy.BEST_EFFORT
                          if t["reliability"] == "best_effort" else ReliabilityPolicy.RELIABLE)
-        pub = node.create_publisher(cls, t["name"], qos)
+        pub = node.create_publisher(cls, remap.get(t["name"], t["name"]), qos)
         stamp_ns, data = last[t["name"]]
         pub.publish(deserialize_message(data, cls))
         pubs.append(pub)
@@ -224,7 +228,7 @@ def main() -> int:
     try:
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=1.0)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
         node.destroy_node()

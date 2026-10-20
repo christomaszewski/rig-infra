@@ -13,6 +13,13 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="${BAG_PLAYER_PYTHON:-python3}"
 
 CONFIG="${1:?usage: ros2-bag-player-up <config.yaml> [up [-d]|down|status|logs|config|export-calls|...]}"; shift || true
+case "${1:-}" in
+  replay-capabilities)
+    printf '%s\n' '{"plan":1,"remap":true,"clock_only":true,"reindex":true}'
+    exit 0 ;;
+  replay-reindex)
+    exec "$PYTHON" "$REPO/tools/reindex.py" "${2:?derived bag directory required}" ;;
+esac
 [ -f "$CONFIG" ] || { echo "ros2-bag-player-up: config not found: $CONFIG" >&2; exit 1; }
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 

@@ -13,6 +13,8 @@ verbs:
   status: "ps"
   logs: "logs"
   config: "config"
+  replay-capabilities: "replay-capabilities"
+  replay-reindex: "replay-reindex"
 ros_distro: lyrical
 tier: autonomy
 examples: [config/ros2-bag-player.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
@@ -28,4 +30,6 @@ launch_surface:
   - tools/export_calls.py    # the export-calls one-shot's tool (mounted into the player)
   - tools/latch_restore.py   # the latch pre-pass of a windowed replay (mounted into the player)
   - tools/release_gate.py    # the release gate of a gated replay (mounted into the player; RIG_REPLAY_START_AT_UNIX_S)
+  - tools/clock_only.py
+  - tools/reindex.py
   - docker/compose.deploy.yaml

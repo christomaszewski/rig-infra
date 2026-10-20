@@ -292,6 +292,70 @@ def validate_window(from_s: float, to_s: float | None, duration_ns: int,
     return from_s, to_s, clamped
 
 
+def apply_plan(cfg, env, read):
+    """Explicit v1 handoff overrides standalone selection, never merges hidden calls."""
+    import copy
+    import json
+    path = env.get("RIG_REPLAY_PLAN")
+    if not path:
+        return cfg, env, None
+    try:
+        plan = json.loads(read(path))
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"play_cmd: invalid replay plan: {exc}")
+    if not isinstance(plan, dict) or type(plan.get("version")) is not int or plan["version"] != 1:
+        raise SystemExit("play_cmd: replay plan version must be 1")
+    _strict(plan, "replay plan", {"version", "source", "bag", "topics", "remap", "services", "calls", "clock_only"})
+    bag = _strict(plan.get("bag"), "replay plan bag", {"logger", "session", "start_ns", "duration_ns"})
+    for key in ("logger", "session"):
+        value = bag.get(key)
+        if not isinstance(value, str) or not value or "/" in value or value in (".", ".."):
+            raise SystemExit(f"play_cmd: plan bag.{key} must name one exact session")
+    if bag["session"] == "latest":
+        raise SystemExit("play_cmd: plan must pin an exact session")
+    topics, services, remap = plan.get("topics"), plan.get("services", []), plan.get("remap", {})
+    if not isinstance(topics, list) or not isinstance(services, list) or not isinstance(remap, dict):
+        raise SystemExit("play_cmd: invalid plan topic/service selection")
+    all_names = [*topics, *services, *remap.keys(), *remap.values()]
+    if any(not isinstance(n, str) or not re.fullmatch(r"/[A-Za-z0-9_/]+", n)
+           or "//" in n or n.endswith("/") for n in all_names):
+        raise SystemExit("play_cmd: plan uses invalid absolute ROS names")
+    if any(n in ("/clock", "/rosout", "/parameter_events") or n.endswith("/_service_event")
+           for n in [*topics, *remap.keys(), *remap.values()]):
+        raise SystemExit("play_cmd: plan data selection includes clock/plumbing/service events")
+    if len({remap.get(t, t) for t in topics}) != len(topics):
+        raise SystemExit("play_cmd: plan topic remapping collision")
+    if plan.get("calls") and services:
+        raise SystemExit("play_cmd: plan calls and services are mutually exclusive")
+    if any(env.get(k) for k in ("RIG_REPLAY_TOPICS", "RIG_REPLAY_EXCLUDE",
+                                "RIG_REPLAY_SERVICES", "RIG_REPLAY_CALLS")):
+        raise SystemExit("play_cmd: plan conflicts with legacy replay selector environment")
+    if env.get("RIG_REPLAY_SOURCE") and env["RIG_REPLAY_SOURCE"] != plan.get("source"):
+        raise SystemExit("play_cmd: plan/source mismatch")
+    cfg, env = copy.deepcopy(cfg), dict(env)
+    cfg["source"] = {"run": plan.get("source"), "logger": bag["logger"], "session": bag["session"]}
+    cfg["play"] = {**cfg.get("play", {}), "topics": [], "exclude": [], "services": []}
+    cfg.pop("calls", None)
+    env["RIG_REPLAY_SOURCE"] = str(plan.get("source") or "")
+    if topics:
+        env["RIG_REPLAY_TOPICS"] = " ".join(topics)
+    else:
+        # Exact match-nothing allow-list: unlike exclude-regex it does not suppress service calls.
+        meta = yaml.safe_load(read(os.path.join(env["RIG_REPLAY_SOURCE"], "bags",
+                                              bag["logger"], bag["session"], "metadata.yaml")) or "") or {}
+        existing = {t.get("topic_metadata", {}).get("name") for t in
+                    meta.get("rosbag2_bagfile_information", {}).get("topics_with_message_count", [])}
+        sentinel = "/__rig_replay_no_data__"
+        while sentinel in existing:
+            sentinel += "_"
+        env["RIG_REPLAY_TOPICS"] = sentinel
+    if services:
+        env["RIG_REPLAY_SERVICES"] = " ".join(services)
+    if plan.get("calls"):
+        env["RIG_REPLAY_CALLS"] = plan["calls"]
+    return cfg, env, plan
+
+
 def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str, list[str],
                                                                    list[str], dict]:
     """(name, host-source-dir, container-session-path, play argv AFTER the path, warnings,
@@ -303,6 +367,7 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
     `latch` (the pre-pass argv after the session path, empty when `from_s == 0`) and `start_at`
     (the release instant from RIG_REPLAY_START_AT_UNIX_S, None without a gate — play.sh then
     starts no companion). Pure modulo the injected `ls` / `read`."""
+    cfg, env, plan = apply_plan(cfg, env, read)
     name = str(cfg.get("name") or "bag_player")
     src = _strict(cfg.get("source"), "source", {"run", "logger", "session"})
     play = _strict(cfg.get("play"), "play",
@@ -405,7 +470,7 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
     # --- the window (rig-replay-window-handoff §1.1) + the bag start for the injector ----------
     from_s, to_s = resolve_window(play, env, warns)
     bag_start_ns, clamped = None, False
-    if from_s > 0 or to_s is not None or calls:
+    if from_s > 0 or to_s is not None or calls or plan:
         meta_path = os.path.join(host_session, "metadata.yaml")
         text = read(meta_path)
         if text is None:
@@ -414,6 +479,9 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
                              f"duration — the ONE zero every `t` counts from) but none is "
                              f"readable at {meta_path}")
         bag_start_ns, duration_ns = read_bag_bounds(text, meta_path)
+        if plan and any(plan["bag"].get(k) is not None and plan["bag"][k] != value
+                        for k, value in (("start_ns", bag_start_ns), ("duration_ns", duration_ns))):
+            raise SystemExit("play_cmd: bag metadata changed after planning")
         from_s, to_s, clamped = validate_window(from_s, to_s, duration_ns, warns)
 
     args: list[str] = []
@@ -421,7 +489,7 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
         rate = 1.0 if play.get("rate") is None else float(play.get("rate"))
     except (TypeError, ValueError):
         raise SystemExit("play_cmd: play.rate must be a number")
-    if rate <= 0:
+    if not math.isfinite(rate) or rate <= 0:
         raise SystemExit("play_cmd: play.rate must be > 0")
     if rate != 1.0:
         args += ["-r", f"{rate:g}"]
@@ -444,6 +512,9 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
         args.append("--start-paused")
     if str(env.get("RIG_SIM_TIME") or "") == "1":
         args.append("--clock")
+    remaps = [f"{a}:={b}" for a, b in (plan or {}).get("remap", {}).items()]
+    if remaps:
+        args += ["--remap"] + remaps
 
     # Verbatim service playback, just BEFORE the topic selector: --services is greedy like
     # --topics, so the next flag terminates it and the selector stays last. Requests come from
@@ -473,10 +544,14 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
             selector = ["--exclude-regex", "|".join(f"(?:{p})" for p in pats)]
     args += selector
 
-    latch = (["--from", _num(from_s)] + selector) if from_s > 0 else []
+    latch_remaps = [arg for mapping in remaps for arg in ("--remap", mapping)]
+    latch = (["--from", _num(from_s)] + latch_remaps + selector) if from_s > 0 else []
     return name, source, container_path, args, warns, {
         "calls": calls, "services_source": src_mode, "bag_start_ns": bag_start_ns,
-        "from_s": from_s, "to_s": to_s, "latch": latch, "start_at": start_at}
+        "from_s": from_s, "to_s": to_s, "latch": latch, "start_at": start_at,
+        "clock_only": bool(plan and not plan["topics"] and not plan.get("services")),
+        "duration_ns": duration_ns if plan else None, "rate": rate,
+        "loop": bool(play.get("loop")), "sim_time": env.get("RIG_SIM_TIME") == "1"}
 
 
 def zenoh_env_lines(cfg: dict, warns: list[str]) -> str:
@@ -592,7 +667,25 @@ def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, ...]:
     run_dir = pathlib.Path(repo) / "var" / "run" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     script = run_dir / "play.sh"
-    script.write_text(play_script(path, args, extras["latch"], extras["start_at"], zenoh))
+    if extras["clock_only"]:
+        if cfg.get("play", {}).get("start_paused") and extras["start_at"] is None:
+            raise SystemExit("play_cmd: clock-only playback needs a release gate for start_paused")
+        clock_args = ["--start-ns", str(extras["bag_start_ns"]),
+                      "--from", str(extras["from_s"]),
+                      "--to", str(extras["to_s"] if extras["to_s"] is not None
+                                  else extras["duration_ns"] / 1e9),
+                      "--rate", str(extras["rate"])]
+        if extras["start_at"]:
+            clock_args += ["--at", str(extras["start_at"])]
+        if extras["loop"]:
+            clock_args += ["--loop"]
+        if not extras["sim_time"]:
+            clock_args += ["--wall-clock"]
+        text = play_script(path, [], [], None, zenoh).splitlines()[:-1]
+        text.append("exec python3 /clock_only.py " + " ".join(shlex.quote(a) for a in clock_args))
+        script.write_text("\n".join(text) + "\n")
+    else:
+        script.write_text(play_script(path, args, extras["latch"], extras["start_at"], zenoh))
     script.chmod(0o755)
     return (name, str(script), source, path, extras["services_source"], extras["calls"],
             "" if extras["bag_start_ns"] is None else str(extras["bag_start_ns"]),
