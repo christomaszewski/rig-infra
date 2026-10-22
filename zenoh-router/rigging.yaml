@@ -7,6 +7,8 @@ verbs:
   status: "ps"
   logs: "logs"
   config: "config"
+  images: "images"
+  runtime-images: "runtime-images"
 ros_distro: lyrical
 tier: infra
 examples: [config/zenoh-router.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
@@ -36,6 +38,7 @@ build: { architectures: [arm64, amd64], capabilities: {no_cache: true, platforms
 # — never :latest, mirrored tags can silently drift on re-mirror), swap this `build:` for
 # `mirror: [eclipse/zenoh:1.2.1]`, and see the command note in docker/compose.deploy.yaml.
 launch_surface:
+  - tools/runtime_images.py
   - zenoh-router-up
   - docker/compose.deploy.yaml
   - docker/compose.config.yaml   # applied only when the instance config has an inline `router_config:`

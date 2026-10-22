@@ -43,5 +43,10 @@ RUN rmw_pkg="ros-${ROS_DISTRO}-$(echo "${RMW_IMPLEMENTATION}" | tr '_' '-')" \
         ros-${ROS_DISTRO}-rosbag2 \
         ros-${ROS_DISTRO}-rosbag2-storage-mcap \
     && rm -rf /var/lib/apt/lists/*
+COPY check_replay_runtime.py /usr/local/lib/rig/check_replay_runtime.py
+RUN . /opt/ros/${ROS_DISTRO}/setup.sh \
+    && python3 /usr/local/lib/rig/check_replay_runtime.py
+# Advertise only after the installed runtime passes the player API/storage contract.
+LABEL io.rig.rosbag2.replay="1"
 # The ros base image's entrypoint sources /opt/ros/<distro>/setup.bash — commands like
 # `ros2 run rmw_zenoh_cpp rmw_zenohd` and the loggers' record.sh work as-is.

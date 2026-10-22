@@ -9,6 +9,8 @@ PYTHON="${ZENOH_ROUTER_PYTHON:-python3}"
 CONFIG="${1:?usage: zenoh-router-up <config.yaml> [up [-d]|down|status|logs|config|...]}"; shift || true
 [ -f "$CONFIG" ] || { echo "zenoh-router-up: config not found: $CONFIG" >&2; exit 1; }
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+READ_ONLY=0
+case "${1:-}" in runtime-images|images) READ_ONLY=1 ;; esac
 
 # Parse the instance config once: the name, plus (optionally) an inline `router_config:` mapping — the
 # zenohd config authored INSIDE the instance YAML. It renders TWO forms (both from the same mapping, so
@@ -20,7 +22,7 @@ CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 #    at a partial file instead would REPLACE that config wholesale — mode/listen fall back to zenoh
 #    library defaults and the router silently stops listening on 7447 (verified empirically).
 # A non-mapping `router_config` is a config error (paths don't bake; inline only).
-NAME_AND_CFG="$("$PYTHON" - "$CONFIG_ABS" "$REPO" <<'PY'
+NAME_AND_CFG="$("$PYTHON" - "$CONFIG_ABS" "$REPO" "$READ_ONLY" <<'PY'
 import json, pathlib, sys
 import yaml
 cfg = yaml.safe_load(open(sys.argv[1])) or {}
@@ -30,9 +32,10 @@ rendered = ""
 override = ""
 if isinstance(rc, dict) and rc:
     d = pathlib.Path(sys.argv[2]) / "var" / "run" / name
-    d.mkdir(parents=True, exist_ok=True)
     p = d / "zenohd.json5"
-    p.write_text(json.dumps(rc, indent=2, sort_keys=True) + "\n")
+    if sys.argv[3] != "1":
+        d.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(rc, indent=2, sort_keys=True) + "\n")
     rendered = str(p)
     # Leaf-path pairs: recurse into mappings so untouched shipped defaults survive at the finest
     # granularity (lists and scalars are leaves — a list you set replaces that list wholesale).
@@ -74,5 +77,13 @@ if [ -n "$CFG_FILE" ]; then
 fi
 ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
 [ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+case "${ARGS[0]}" in
+  runtime-images|images)
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" "${ARGS[0]}" "${FILES[@]}" ;;
+  up)
+    if [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+      exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" -- "${ARGS[@]:1}"
+    fi ;;
+esac
 echo "zenoh-router-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?}${CFG_FILE:+ router_config=$CFG_FILE}" >&2
 exec docker compose "${FILES[@]}" "${ARGS[@]}"

@@ -174,7 +174,25 @@ normal rig service (a launcher + rigging, certified like the rest) that joins th
 a **selected topic subset** from a source run's bags. Division of labor, on purpose: rig owns run
 selection, topic-set computation, and the safety guards; this service owns only the playback
 mechanics. The player never decides what to play. Replay is *current code against old data* —
-tag pins, not digests; never bit-exact reproduction.
+the current selected image references are resolved and pinned to immutable local image IDs for
+each invocation; this does not promise bit-exact reproduction.
+
+Current replay requires the selected player's image to advertise `io.rig.rosbag2.replay=1`.
+The player launcher declares this requirement through `replay-capabilities`; its read-only
+`runtime-images` query identifies the actual `bag-player` image after all overrides. Updating
+the launcher alone is insufficient: rebuild/publish the `fleet-ros` base and its
+`fleet-ros-msgs` descendants together, or use an equivalent compatible image. The overlay
+inherits the base's label; fleet-specific message and service types still belong in that overlay.
+
+`base/check_replay_runtime.py` must pass before the base image receives the label. Version 1
+covers the current topic/remap/window/clock/pause and recorded-service CLI options, both
+service-introspection source modes, integer-nanosecond end bounds, Python request/event serialization and inspection filters,
+clock and pause/resume interfaces, the latch reader's storage cutoff/filter APIs and extended timestamps, and
+MCAP/SQLite read/reindex support. The latch helper itself enforces the timestamp cutoff;
+the storage plugin's `end_time_ns` hint is not relied on for correctness.
+It checks installed APIs and local synthetic bags without creating a ROS node or using the
+network. It does not certify a particular recording, custom interface package, or cross-service
+startup synchronization.
 
 **The selector env contract** (`rig replay`, rig ≥ v0.2.33, exports these; all absent under every
 other verb):
@@ -395,13 +413,29 @@ adoption recipe).
 **Verbatim playback** (`RIG_REPLAY_SERVICES`, or standalone `play.services`): recorded requests
 re-issued at the live servers, mapped to rosbag2's service playback
 (`--publish-service-requests` + the `--services` allow-list — greedy like `--topics`, and the
-two filters compose). rig computes the set as the with-set's observed `provides` minus its
-observed `requires` (the self-echo twin: replaying a with-set client's own calls would
-double-call). Only ever set **alongside a topic selector mode** — services replay within a topic
+two filters compose). Rig owns the explicit service allow-list and validates its recorded
+request contents before handing it to the player. Only ever set **alongside a topic selector mode** — services replay within a topic
 session; SERVICES alone is refused. Services absent from the bag are tolerated. The
 `play.services_source` knob (`service` | `client`, default `service`) picks which side's
 recorded events requests are reconstructed from — servers under test adopted introspection;
 their callers may not have. The env var shadows `play.services` with a WARN, the topics pattern.
+
+The structured v1 plan freezes `services_source` (`service` by default), so a standalone player
+config cannot change the inspected origin at launch. `replay-capabilities` advertises
+`inspect_calls: 1`; `replay-inspect-calls REQUEST_JSON` inspects the exact bag and selected
+service names using the verified player image. It requires `RIG_RUNTIME_IMAGE_PINS` and
+`RIG_TARGET_ARCH`, runs with no network and read-only bag/helper/request mounts, and is bounded
+to 90 seconds plus cleanup. The JSON report distinguishes usable request contents from
+metadata-only events, responses, the other introspection origin, empty windows, missing events,
+and unavailable types. Read/decode/timeout failures fail the command. Windows use bag receive
+timestamps in `[from_s, to_s)` relative to the frozen bag start. `request_count` counts every
+selected-origin request; `duplicate_count` reports repeated client-GID/sequence identities
+without removing them. Rosbag2 replays such repeated selected-origin events repeatedly.
+The structured plan's player uses an absolute integer-nanosecond cutoff one nanosecond before
+`to_s`; this compensates for rosbag2's inclusive last timestamp. Inspection explicitly orders
+by received timestamp, seeks to the lower bound, and stops at the upper bound, so a short
+window does not require scanning unrelated history and tail events. Standalone playback keeps
+its existing inclusive `--playback-duration` behavior.
 
 **The call injector** (`RIG_REPLAY_CALLS`, or standalone `calls:` — env wins, WARN): a
 schema-v1 YAML timeline of calls, executed on the replay clock by a second compose service

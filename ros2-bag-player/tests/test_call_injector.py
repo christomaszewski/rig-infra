@@ -10,9 +10,9 @@ v1.12.0 adds the window half (rig-replay-window-handoff §1.3): the ONE zero (`t
 bag start under sim time, from + elapsed under wall time — never the first sample), the window
 as a FILTER (t < from skipped, t >= to never reached, t == from IN), and the ONE leading
 `# window:` comment line results.yaml carries before its first entry.
-v1.13.0 adds the release gate's two touches: `gate_delay` (a future instant's distance, 0
-otherwise) moves the WALL-clock zero to the instant and extends the sim-time /clock wait; the
-sim-time zero stays the bag start.
+v1.13.0 adds the release gate's two touches: the absolute instant anchors the WALL-clock
+zero and `gate_delay` extends the sim-time /clock wait; the sim-time zero stays the bag start.
+Mocked runtime checks cover initialization delay, late gates, and sim-clock rates/windowing.
 Run: `python3 tests/test_call_injector.py` (no ROS — the rclpy shell imports lazily)."""
 import pathlib
 import sys
@@ -211,6 +211,115 @@ def test_wall_zero_is_the_release_instant_under_a_gate():
     assert call_injector.wall_now(27.5 - zero, from_s=30.0) == 37.5
     # sim time is anchored to the bag whatever the gate does — the one zero never moves
     assert call_injector.sim_now(1788361689.6, 1788361659.6) == 30.0
+
+
+def _run_clocked_injector(*, initialization_s, instant=100.0, sim_rate=None):
+    """Drive main() with real script/window handling and deterministic ROS/clock adapters."""
+    import contextlib
+    import io
+    import os
+    import tempfile
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    clock = SimpleNamespace(elapsed=0.0, subscriber=None, spins=0)
+    fired = []
+
+    def wall():
+        return 80.0 + clock.elapsed
+
+    class Future:
+        def done(self):
+            return True
+
+        def result(self):
+            return {}
+
+    class Client:
+        def call_async(self, request):
+            fired.append((request["t"], wall()))
+            return Future()
+
+    class Node:
+        def create_client(self, *args):
+            return Client()
+
+        def create_subscription(self, _type, _topic, callback, _qos):
+            clock.subscriber = callback
+
+        def destroy_node(self):
+            pass
+
+    def init():
+        clock.elapsed += initialization_s
+
+    def spin_once(_node, timeout_sec):
+        clock.spins += 1
+        assert clock.spins < 2000, "injector never reached its scripted calls"
+        clock.elapsed += timeout_sec
+        if clock.subscriber:
+            # A paused player publishes the window start, then advances at its chosen rate.
+            position = 30.0 + max(0, wall() - instant) * sim_rate
+            ns = round((1000.0 + position) * 1e9)
+            sec, nanosec = divmod(ns, 10**9)
+            clock.subscriber(SimpleNamespace(clock=SimpleNamespace(sec=sec, nanosec=nanosec)))
+
+    def resolve_types(calls):
+        for call in calls:
+            call["_req"] = call
+        return {call["type"]: object for call in calls}
+
+    modules = {
+        "rclpy": SimpleNamespace(init=init, create_node=lambda *a, **kw: Node(),
+                                 spin_once=spin_once, try_shutdown=lambda: None),
+        "rclpy.executors": SimpleNamespace(ExternalShutdownException=type("Shutdown", (Exception,), {})),
+        "rclpy.qos": SimpleNamespace(QoSProfile=lambda **kw: kw,
+                                     ReliabilityPolicy=SimpleNamespace(BEST_EFFORT=1)),
+        "rosidl_runtime_py.convert": SimpleNamespace(message_to_ordereddict=lambda value: value),
+        "rosgraph_msgs.msg": SimpleNamespace(Clock=object),
+    }
+    with tempfile.TemporaryDirectory() as temp:
+        path = pathlib.Path(temp) / "calls.yaml"
+        path.write_text(yaml.safe_dump(_script([{**CALL, "t": t} for t in (29, 30, 34, 40)])))
+        env = {"RIG_BAG_ROOT": temp, "RIG_SIM_TIME": "1" if sim_rate else "",
+               "RIG_REPLAY_FROM_S": "30", "RIG_REPLAY_TO_S": "40",
+               "RIG_REPLAY_START_AT_UNIX_S": "" if instant is None else str(instant),
+               "CALL_INJECTOR_BAG_START_NS": "1000000000000"}
+        with patch.dict(sys.modules, modules), patch.dict(os.environ, env, clear=True), \
+                patch.object(sys, "argv", ["injector", str(path)]), \
+                patch.object(call_injector, "resolve_types", resolve_types), \
+                patch.object(call_injector, "time", SimpleNamespace(time=wall, monotonic=lambda: clock.elapsed)), \
+                contextlib.redirect_stderr(io.StringIO()):
+            assert call_injector.main() == 0
+        results = yaml.safe_load((pathlib.Path(temp) / "calls/bag_player/results.yaml").read_text())
+        assert [entry["t"] for entry in results] == [30, 34]  # from is inclusive; to is exclusive
+    return fired
+
+
+def test_wall_gate_does_not_drift_during_initialization():
+    fired = _run_clocked_injector(initialization_s=5)
+    assert [t for t, _ in fired] == [30, 34]
+    assert abs(fired[0][1] - 100) < 0.01
+    assert abs(fired[1][1] - 104) < 0.01
+
+
+def test_wall_gate_preserves_elapsed_time_when_startup_finishes_late():
+    fired = _run_clocked_injector(initialization_s=22)
+    assert fired[0] == (30, 102)  # catch up the call already due; do not invent a new zero
+    assert abs(fired[1][1] - 104) < 0.01
+
+
+def test_wall_without_a_gate_keeps_initialization_as_its_zero():
+    fired = _run_clocked_injector(initialization_s=5, instant=None)
+    assert fired[0] == (30, 85)
+    assert abs(fired[1][1] - 89) < 0.01
+
+
+def test_sim_clock_rate_and_window_remain_anchored_to_bag_start():
+    fired = _run_clocked_injector(initialization_s=5, sim_rate=2)
+    # Existing sim behavior: t==from may set state during the hold, then /clock owns pacing.
+    assert abs(fired[0][1] - 85) < 0.06
+    assert abs(fired[1][1] - 102) < 0.06
 
 
 if __name__ == "__main__":

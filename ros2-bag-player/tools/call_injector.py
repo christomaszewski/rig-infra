@@ -35,7 +35,9 @@ release and the zero is untouched (a call at ``t == from`` therefore fires durin
 state-setting before data flows, like the latch pre-pass). The ``/clock`` wait deadline grows
 by the distance to the instant so a long ``--start-delay`` cannot time it out. Under wall clock
 the zero is the INSTANT, not injector start: ``now() = from + (wall − instant)`` — without that
-every call would fire early by the whole gate.
+every call would fire early by the whole gate. Convert that absolute instant to a monotonic
+origin AFTER initialization, retaining elapsed time if the gate has already passed; script/type
+loading and ROS discovery must not move every call later.
 
 The window is a FILTER over the script (``RIG_REPLAY_FROM_S`` / ``RIG_REPLAY_TO_S``, passed
 through by the launcher — the resolved, clamped values; standalone config windows arrive the
@@ -249,7 +251,7 @@ def wall_now(elapsed_s: float, from_s: float) -> float:
 
 def gate_delay(instant: float | None, now: float) -> float:
     """Seconds from `now` to the release instant — 0 without a gate or once it is past. The
-    wall-clock zero moves by this much; the sim-time /clock wait is extended by it."""
+    initial log and sim-time /clock wait use this remaining delay, not the wall-clock zero."""
     if instant is None:
         return 0.0
     return max(0.0, float(instant) - float(now))
@@ -402,7 +404,12 @@ def main() -> int:
             def now() -> float:
                 return sim_now(latest["clock"], bag_start_s)
         else:
-            start = time.monotonic() + gate_s   # the zero: the release instant, when gated
+            start = time.monotonic()
+            if instant is not None:
+                # gate_s was sampled before script/type/ROS initialization. Reusing it here
+                # would delay every call by that startup time. Preserve a past origin too:
+                # late startup must catch up to the shared timeline instead of shifting it.
+                start += instant - time.time()
 
             def now() -> float:
                 return wall_now(time.monotonic() - start, from_s)

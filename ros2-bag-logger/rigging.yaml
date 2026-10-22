@@ -8,6 +8,8 @@ verbs:
   status: "ps"
   logs: "logs"
   config: "config"
+  images: "images"
+  runtime-images: "runtime-images"
 ros_distro: lyrical
 tier: infra
 examples: [config/ros2-bag-logger.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
@@ -47,6 +49,7 @@ replay: { sim_time: true }
 # against the original's per-topic counts before it replaces it. Older rigs ignore this key.
 export: { data: "bags/{name}" }
 launch_surface:
+  - tools/runtime_images.py
   - ros2-bag-logger-up
   - tools/bag_cmd.py
   - tools/bag_export.py       # the `export` verb's renderer (specs + convert script per run)

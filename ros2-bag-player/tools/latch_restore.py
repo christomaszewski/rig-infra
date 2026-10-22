@@ -105,7 +105,8 @@ def select(latched: list[dict], allow: list[str] | None, exclude: str | None) ->
 def window_start_ns(bag_start_ns: int, from_s: float) -> int:
     """The window's first stamp: messages with recv stamp < this are pre-window (ours to restore),
     >= this are the main play's (`--start-offset` seeks there)."""
-    return int(bag_start_ns) + int(round(float(from_s) * 1e9))
+    # rosbag2's floating start_offset converts to integer ns by truncation.
+    return int(bag_start_ns) + int(float(from_s) * 1e9)
 
 
 def last_before(messages, cutoff_ns: int) -> dict:

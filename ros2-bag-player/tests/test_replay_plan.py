@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import play_cmd
 import clock_only
 import reindex
+import latch_restore
 
 
 class ReplayPlan(unittest.TestCase):
@@ -74,6 +75,49 @@ class ReplayPlan(unittest.TestCase):
         self.plan["calls"] = "/calls.yaml"
         with self.assertRaisesRegex(SystemExit, "mutually exclusive"):
             self.build()
+
+    def test_plan_freezes_service_origin_including_default(self):
+        self.cfg["play"]["services_source"] = "client"
+        self.plan["services"] = ["/control"]
+        self.assertNotIn("client_introspection", self.build()[3])
+        self.plan["services_source"] = "client"
+        self.assertIn("client_introspection", self.build()[3])
+        self.plan["services_source"] = "service"
+        self.assertNotIn("client_introspection", self.build()[3])
+        self.plan["services_source"] = "auto"
+        with self.assertRaisesRegex(SystemExit, "services_source"):
+            self.build()
+
+    def test_plan_window_clears_standalone_offsets_and_open_end(self):
+        self.cfg["play"].update(start_offset_s=1, end_offset_s=2)
+        _, _, _, args, _, extras = self.build()
+        self.assertNotIn("--start-offset", args)
+        self.assertNotIn("--playback-duration", args)
+        self.assertNotIn("--playback-until-nsec", args)
+        self.assertEqual((extras["from_s"], extras["to_s"]), (0, None))
+        _, _, _, args, _, extras = self.build(RIG_REPLAY_FROM_S="1", RIG_REPLAY_TO_S="3")
+        self.assertEqual(args[args.index("--start-offset") + 1], "1")
+        self.assertEqual(args[args.index("--playback-until-nsec") + 1], "102999999999")
+        self.assertEqual((extras["from_s"], extras["to_s"]), (1, 3))
+
+    def test_fractional_long_window_preserves_offset_and_exclusive_integer_end(self):
+        start, stop = 3600.000001, 3601.000001
+        (self.bag / "metadata.yaml").write_text(yaml.safe_dump({
+            "rosbag2_bagfile_information": {"starting_time": {"nanoseconds_since_epoch": 100_000_000_000},
+                                           "duration": {"nanoseconds": 4_000_000_000_000}}}))
+        _, _, _, args, _, extras = self.build(RIG_REPLAY_FROM_S=str(start), RIG_REPLAY_TO_S=str(stop))
+        self.assertEqual(float(args[args.index("--start-offset") + 1]), start)
+        self.assertEqual(float(extras["latch"][1]), start)
+        self.assertEqual(int(args[args.index("--playback-until-nsec") + 1]),
+                         100_000_000_000 + int(stop * 1e9) - 1)
+        self.assertNotIn("--playback-duration", args)
+        self.assertEqual(latch_restore.window_start_ns(100, 1.9e-9), 101)
+        self.assertEqual(play_cmd._num(3600.000001), "3600.000001")
+        (self.bag / "metadata.yaml").write_text(yaml.safe_dump({
+            "rosbag2_bagfile_information": {"starting_time": {"nanoseconds_since_epoch": 0},
+                                           "duration": {"nanoseconds": 10_000_000_000}}}))
+        with self.assertRaisesRegex(SystemExit, "exclusive end at epoch zero"):
+            self.build(RIG_REPLAY_TO_S="0.000000001")
 
     def test_conflicts_and_protected_remaps_refuse(self):
         with self.assertRaisesRegex(SystemExit, "conflicts"):

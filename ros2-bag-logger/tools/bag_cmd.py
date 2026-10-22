@@ -262,7 +262,7 @@ def graph_params(cfg: dict) -> tuple[bool, str, str]:
 
 
 def render(cfg: dict, repo: pathlib.Path,
-           sim_time_env: str | None = None) -> tuple[str, str, bool]:
+           sim_time_env: str | None = None, *, write=True) -> tuple[str, str, bool]:
     """Write var/run/<name>/record.sh and return (name, script-path, shm-enabled)."""
     name, subdir, node, args, warns = build_args(cfg, sim_time_env)
     shm, shm_on = zenoh_env_lines(cfg, warns)
@@ -270,9 +270,10 @@ def render(cfg: dict, repo: pathlib.Path,
         sys.stderr.write("ros2-bag-logger: " + w + "\n")
     argv = " ".join(shlex.quote(a) for a in args)
     run_dir = pathlib.Path(repo) / "var" / "run" / name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if write:
+        run_dir.mkdir(parents=True, exist_ok=True)
     script = run_dir / "record.sh"
-    script.write_text(
+    content = (
         "#!/usr/bin/env bash\n"   # bash: ROS `setup.bash` is bash-only (sourcing it under sh/dash errors)
         "set -e\n"
         "# Source ROS if the image's entrypoint didn't (we run as `command:`, so usually it did).\n"
@@ -290,18 +291,20 @@ def render(cfg: dict, repo: pathlib.Path,
         f' (control services: /{node}/pause|resume|split_bagfile|stop)" >&2\n'
         f'exec ros2 bag record {argv} -o "$out"\n'
     )
-    script.chmod(0o755)
+    if write:
+        script.write_text(content)
+        script.chmod(0o755)
     return name, str(script), shm_on
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 3 and not (len(sys.argv) == 4 and sys.argv[3] == "--inspect"):
         sys.stderr.write("usage: bag_cmd.py <config.yaml> <repo-dir>\n")
         return 2
     import os
     cfg = yaml.safe_load(open(sys.argv[1])) or {}
     name, script, shm_on = render(cfg, pathlib.Path(sys.argv[2]),
-                                  sim_time_env=os.environ.get("RIG_SIM_TIME"))
+                                  sim_time_env=os.environ.get("RIG_SIM_TIME"), write=len(sys.argv) == 3)
     graph_on, interval_s, settle_s = graph_params(cfg)
     print("\t".join([name, script, "shm" if shm_on else "",
                      "graph" if graph_on else "", interval_s, settle_s]))

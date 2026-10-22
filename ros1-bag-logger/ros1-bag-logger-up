@@ -10,8 +10,10 @@ PYTHON="${BAG_LOGGER_PYTHON:-python3}"
 CONFIG="${1:?usage: ros1-bag-logger-up <config.yaml> [up [-d]|down|status|logs|config|...]}"; shift || true
 [ -f "$CONFIG" ] || { echo "ros1-bag-logger-up: config not found: $CONFIG" >&2; exit 1; }
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+INSPECT=()
+case "${1:-}" in runtime-images|images) INSPECT=(--inspect) ;; esac
 
-NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/bag_cmd.py" "$CONFIG_ABS" "$REPO")"
+NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/bag_cmd.py" "$CONFIG_ABS" "$REPO" ${INSPECT[@]+"${INSPECT[@]}"})"
 NAME="${NAME_AND_SCRIPT%%$'\t'*}"
 SCRIPT="${NAME_AND_SCRIPT#*$'\t'}"
 export BAG_LOGGER_NAME="$NAME"
@@ -20,5 +22,13 @@ export BAG_RECORD_SCRIPT="$SCRIPT"
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros1-bag-logger_${NAME}}"
 ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
 [ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+case "${ARGS[0]}" in
+  runtime-images|images)
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" "${ARGS[0]}" -f "$REPO/docker/compose.deploy.yaml" ;;
+  up)
+    if [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+      exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up -f "$REPO/docker/compose.deploy.yaml" -- "${ARGS[@]:1}"
+    fi ;;
+esac
 echo "ros1-bag-logger-up: project=${COMPOSE_PROJECT_NAME} master=${ROS_MASTER_URI:-http://localhost:11311} script=$SCRIPT" >&2
 exec docker compose -f "$REPO/docker/compose.deploy.yaml" "${ARGS[@]}"

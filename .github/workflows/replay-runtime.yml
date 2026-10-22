@@ -1,0 +1,39 @@
+name: replay runtime
+on:
+  push: {branches: [main]}
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  replay:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build replay-capable base and messages overlay
+        run: |
+          PUSH=0 base/build.sh local replay-ci
+          printf 'apt: [nmea_msgs]\n' > /tmp/replay-messages.yaml
+          PUSH=0 FLEET_MSGS_MANIFEST=/tmp/replay-messages.yaml msgs/build-msgs.sh local replay-ci
+      - name: Verify replay capability declaration
+        run: python3 -m unittest discover -s base -p test_replay_contract.py -v
+      - name: Verify declared overlay typesupport
+        run: |
+          docker run --rm --pull=never --network none local/fleet-ros-msgs:replay-ci \
+            python3 -c 'from nmea_msgs.msg import Sentence; from rclpy.serialization import serialize_message, deserialize_message; message = Sentence(sentence="replay overlay"); assert deserialize_message(serialize_message(message), Sentence) == message'
+      - name: Native base and overlay replay acceptance (no skips)
+        run: |
+          for image in local/fleet-ros:replay-ci local/fleet-ros-msgs:replay-ci; do
+            test "$(docker image inspect "$image" --format '{{ index .Config.Labels "io.rig.rosbag2.replay" }}')" = 1
+            docker run --rm --pull=never --network none --cap-drop=ALL \
+              --security-opt no-new-privileges --pids-limit 256 \
+              -e RMW_IMPLEMENTATION=rmw_zenoh_cpp -e PYTHONDONTWRITEBYTECODE=1 \
+              --mount "type=bind,source=$PWD/ros2-bag-player,target=/replay-source,readonly" \
+              "$image" bash -c 'set -e; if [ -f /opt/fleet-msgs/setup.bash ]; then source /opt/fleet-msgs/setup.bash; fi; python3 /usr/local/lib/rig/check_replay_runtime.py; timeout 120s python3 /replay-source/tests/run_runtime_acceptance.py'
+          done
+      - name: Validated image survives a moved runtime tag
+        run: RIG_TEST_RUNTIME_IMAGE=local/fleet-ros:replay-ci python3 ros2-bag-player/tests/test_runtime_images_docker.py -v

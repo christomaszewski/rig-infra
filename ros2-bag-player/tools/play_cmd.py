@@ -22,8 +22,8 @@ EVERYTHING). Exclude mode merges ``RIG_REPLAY_EXCLUDE`` + ``play.exclude`` into 
 clock coherence is one rig-owned token and the incoherent state stays unrepresentable.
 
 Service playback + the call injector (rig-replay-calls-handoff §1, frozen; rig >= v0.2.37):
-``RIG_REPLAY_SERVICES`` (space-separated service names, same grammar as TOPICS — rig computes the
-with-set's observed ``provides`` minus its observed ``requires``) maps to rosbag2's service
+``RIG_REPLAY_SERVICES`` (space-separated service names, same grammar as TOPICS — rig owns the
+selection and its recorded-request inspection) maps to rosbag2's service
 playback; it is REFUSED without a topic selector mode (services replay only within a topic
 session) and REFUSED alongside ``RIG_REPLAY_CALLS`` (script mode subsumes verbatim — a scripted
 call plus its recorded twin would double-call). Standalone: ``play.services`` allow-list, shadowed
@@ -37,8 +37,10 @@ may name services no caller exercised).
 
 Replay WINDOWS (rig-replay-window-handoff §1, frozen; rig >= v0.2.46): ``RIG_REPLAY_FROM_S`` /
 ``RIG_REPLAY_TO_S`` — float seconds from BAG START (the session's ``metadata.yaml``
-``starting_time``), ``to`` exclusive — map to ``--start-offset <from>`` + ``--playback-duration
-<to − from>``. Standalone: ``play.start_offset_s`` / ``play.end_offset_s`` (0/absent = bag end);
+``starting_time``). Structured plans use an exclusive ``to``: ``--start-offset <from>`` plus
+``--playback-until-nsec <bag_start_ns + int(to * 1e9) - 1>``. Standalone playback retains its
+inclusive ``--playback-duration <to − from>`` end convention. Standalone:
+``play.start_offset_s`` / ``play.end_offset_s`` (0/absent = bag end);
 each env key shadows a NON-ZERO config value with a WARN, the topics pattern. Validation is
 HOST-side against the session's ``metadata.yaml``: ``from >= duration`` REFUSES (the window starts
 after the bag ends), ``from >= to`` REFUSES (empty window), ``to > duration`` WARNs and CLAMPS
@@ -89,13 +91,13 @@ GREEDY like ``--topics`` — emitted just BEFORE the topic selector so the selec
 each greedy list is terminated by the next flag), ``--service-requests-source
 {service_introspection,client_introspection}`` (rosbag2's own default is service_introspection —
 we emit the flag only for ``client``, the defaults-emit-nothing pattern).
-The window's end bound (pinned live on lyrical, v1.12.0): ``--playback-duration SECONDS`` counts
-RECORDED time from the (offset) start — independent of ``-r`` and of ``--clock``, composing with
-``--start-offset`` as ``[from, from + duration)``; the player exits 0 when it is reached. Its
-sibling ``--playback-until-sec`` (an absolute epoch stamp; ``--playback-until-nsec`` for exact
-ns) is the same bound spelled absolutely — rosbag2 takes the LATER of the two when both are
-given — and stays unused here: the duration form self-documents the window length in play.sh
-and needs no epoch arithmetic. Pre-Jazzy rosbag2 lacked the offset+duration composition.
+The window's end bound: ``--playback-duration SECONDS`` counts RECORDED time from the offset
+start, independently of rate and clock, but includes the exact final timestamp (verified live
+on lyrical). Structured plans therefore use only ``--playback-until-nsec`` with an absolute
+integer cutoff one ns before the exclusive upper bound; this avoids floating subtraction and
+agrees with request inspection. Rosbag2 takes the LATER bound when duration and until are both
+given, so the two must never be combined. Standalone playback retains duration for compatibility.
+Offsets and rates round-trip as floats; ROS converts offset seconds to ns by truncation.
 """
 from __future__ import annotations
 
@@ -191,9 +193,9 @@ def resolve_start_at(env: dict) -> float | None:
 
 
 def _num(x: float) -> str:
-    """Seconds as argv text: shortest form without trailing zeros, 9 significant digits (ns-ish
-    precision below 1000 s; `:g` alone would clip a 20-minute offset to 10 ms)."""
-    return f"{x:.9g}"
+    """Round-trip seconds without losing fractional window offsets on long recordings."""
+    value = float(x)
+    return str(int(value)) if value.is_integer() else repr(value)
 
 
 def resolve_session(source: str, logger: str, session: str, ls, warns: list[str]) -> str:
@@ -292,7 +294,7 @@ def validate_window(from_s: float, to_s: float | None, duration_ns: int,
     return from_s, to_s, clamped
 
 
-def apply_plan(cfg, env, read):
+def apply_plan(cfg, env, read, *, inspect=False):
     """Explicit v1 handoff overrides standalone selection, never merges hidden calls."""
     import copy
     import json
@@ -305,7 +307,8 @@ def apply_plan(cfg, env, read):
         raise SystemExit(f"play_cmd: invalid replay plan: {exc}")
     if not isinstance(plan, dict) or type(plan.get("version")) is not int or plan["version"] != 1:
         raise SystemExit("play_cmd: replay plan version must be 1")
-    _strict(plan, "replay plan", {"version", "source", "bag", "topics", "remap", "services", "calls", "clock_only"})
+    _strict(plan, "replay plan", {"version", "source", "bag", "topics", "remap", "services",
+                                 "services_source", "calls", "clock_only"})
     bag = _strict(plan.get("bag"), "replay plan bag", {"logger", "session", "start_ns", "duration_ns"})
     for key in ("logger", "session"):
         value = bag.get(key)
@@ -327,6 +330,9 @@ def apply_plan(cfg, env, read):
         raise SystemExit("play_cmd: plan topic remapping collision")
     if plan.get("calls") and services:
         raise SystemExit("play_cmd: plan calls and services are mutually exclusive")
+    source_mode = plan.get("services_source", "service")
+    if source_mode not in ("service", "client"):
+        raise SystemExit("play_cmd: plan services_source must be service or client")
     if any(env.get(k) for k in ("RIG_REPLAY_TOPICS", "RIG_REPLAY_EXCLUDE",
                                 "RIG_REPLAY_SERVICES", "RIG_REPLAY_CALLS")):
         raise SystemExit("play_cmd: plan conflicts with legacy replay selector environment")
@@ -334,15 +340,16 @@ def apply_plan(cfg, env, read):
         raise SystemExit("play_cmd: plan/source mismatch")
     cfg, env = copy.deepcopy(cfg), dict(env)
     cfg["source"] = {"run": plan.get("source"), "logger": bag["logger"], "session": bag["session"]}
-    cfg["play"] = {**cfg.get("play", {}), "topics": [], "exclude": [], "services": []}
+    cfg["play"] = {**cfg.get("play", {}), "topics": [], "exclude": [], "services": [],
+                   "services_source": source_mode, "start_offset_s": 0, "end_offset_s": 0}
     cfg.pop("calls", None)
     env["RIG_REPLAY_SOURCE"] = str(plan.get("source") or "")
     if topics:
         env["RIG_REPLAY_TOPICS"] = " ".join(topics)
     else:
         # Exact match-nothing allow-list: unlike exclude-regex it does not suppress service calls.
-        meta = yaml.safe_load(read(os.path.join(env["RIG_REPLAY_SOURCE"], "bags",
-                                              bag["logger"], bag["session"], "metadata.yaml")) or "") or {}
+        meta = {} if inspect else (yaml.safe_load(read(os.path.join(
+            env["RIG_REPLAY_SOURCE"], "bags", bag["logger"], bag["session"], "metadata.yaml")) or "") or {})
         existing = {t.get("topic_metadata", {}).get("name") for t in
                     meta.get("rosbag2_bagfile_information", {}).get("topics_with_message_count", [])}
         sentinel = "/__rig_replay_no_data__"
@@ -354,6 +361,68 @@ def apply_plan(cfg, env, read):
     if plan.get("calls"):
         env["RIG_REPLAY_CALLS"] = plan["calls"]
     return cfg, env, plan
+
+
+def service_selection(cfg, env, warns):
+    """Resolve scripted/verbatim calls once for playback and read-only image selection."""
+    play = cfg.get("play") or {}
+    t_env = str(env.get("RIG_REPLAY_TOPICS") or "").split()
+    x_env = str(env.get("RIG_REPLAY_EXCLUDE") or "").strip()
+    # --- service playback XOR the call injector (rig-replay-calls-handoff §1.1–§1.2) ----------
+    svc_env = str(env.get("RIG_REPLAY_SERVICES") or "").split()
+    calls_env = str(env.get("RIG_REPLAY_CALLS") or "").strip()
+    cfg_services = play.get("services") or []
+    if not isinstance(cfg_services, list):
+        raise SystemExit("play_cmd: play.services must be a list of service names")
+    cfg_services = [str(s) for s in cfg_services]
+    src_mode = str(play.get("services_source") or "service")
+    if src_mode not in ("service", "client"):
+        raise SystemExit(f"play_cmd: play.services_source must be `service` or `client` (got "
+                         f"{src_mode!r}) — which side's recorded events requests are "
+                         "reconstructed from")
+    calls_cfg = cfg.get("calls")
+    if calls_cfg is not None and not isinstance(calls_cfg, str):
+        raise SystemExit("play_cmd: `calls` must be a string — the call-script YAML's absolute "
+                         "host path")
+    calls_cfg = str(calls_cfg or "").strip()
+
+    if svc_env and calls_env:
+        raise SystemExit("play_cmd: RIG_REPLAY_SERVICES and RIG_REPLAY_CALLS are both set — "
+                         "script mode subsumes verbatim playback (a scripted call plus its "
+                         "recorded twin would double-call); rig never sets both, refusing "
+                         "rather than guessing")
+
+    calls, services = "", []
+    if calls_env:
+        calls = calls_env
+        if calls_cfg:
+            warns.append("`calls` config path is shadowed by RIG_REPLAY_CALLS (rig's script "
+                         "governs)")
+        if cfg_services:
+            warns.append("play.services is suppressed under RIG_REPLAY_CALLS (script mode "
+                         "subsumes verbatim playback — no service flags are emitted)")
+    elif svc_env:
+        services = svc_env
+        if not t_env and not x_env:
+            raise SystemExit("play_cmd: RIG_REPLAY_SERVICES without a topic selector mode — "
+                             "services replay only within a topic session; rig always pairs it "
+                             "with RIG_REPLAY_TOPICS or RIG_REPLAY_EXCLUDE")
+        if cfg_services:
+            warns.append("play.services is shadowed by RIG_REPLAY_SERVICES (rig's selection "
+                         "governs)")
+        if calls_cfg:
+            warns.append("`calls` config path is ignored under RIG_REPLAY_SERVICES (rig chose "
+                         "verbatim mode — the injector is not activated)")
+    else:
+        if calls_cfg and cfg_services:
+            raise SystemExit("play_cmd: `calls` and play.services are both set — script mode "
+                             "subsumes verbatim playback (double-call discipline); drop one")
+        calls, services = calls_cfg, cfg_services
+    if calls and not os.path.isabs(calls):
+        raise SystemExit(f"play_cmd: the call script must be an absolute host path (got "
+                         f"{calls!r}) — it is bind-mounted read-only into the injector")
+
+    return calls, services, src_mode
 
 
 def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str, list[str],
@@ -413,59 +482,7 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
         warns.append("play.topics is ignored under RIG_REPLAY_EXCLUDE (rig chose exclude mode)")
     allow = t_env or ([] if x_env else cfg_topics)
 
-    # --- service playback XOR the call injector (rig-replay-calls-handoff §1.1–§1.2) ----------
-    svc_env = str(env.get("RIG_REPLAY_SERVICES") or "").split()
-    calls_env = str(env.get("RIG_REPLAY_CALLS") or "").strip()
-    cfg_services = play.get("services") or []
-    if not isinstance(cfg_services, list):
-        raise SystemExit("play_cmd: play.services must be a list of service names")
-    cfg_services = [str(s) for s in cfg_services]
-    src_mode = str(play.get("services_source") or "service")
-    if src_mode not in ("service", "client"):
-        raise SystemExit(f"play_cmd: play.services_source must be `service` or `client` (got "
-                         f"{src_mode!r}) — which side's recorded events requests are "
-                         "reconstructed from")
-    calls_cfg = cfg.get("calls")
-    if calls_cfg is not None and not isinstance(calls_cfg, str):
-        raise SystemExit("play_cmd: `calls` must be a string — the call-script YAML's absolute "
-                         "host path")
-    calls_cfg = str(calls_cfg or "").strip()
-
-    if svc_env and calls_env:
-        raise SystemExit("play_cmd: RIG_REPLAY_SERVICES and RIG_REPLAY_CALLS are both set — "
-                         "script mode subsumes verbatim playback (a scripted call plus its "
-                         "recorded twin would double-call); rig never sets both, refusing "
-                         "rather than guessing")
-
-    calls, services = "", []
-    if calls_env:
-        calls = calls_env
-        if calls_cfg:
-            warns.append("`calls` config path is shadowed by RIG_REPLAY_CALLS (rig's script "
-                         "governs)")
-        if cfg_services:
-            warns.append("play.services is suppressed under RIG_REPLAY_CALLS (script mode "
-                         "subsumes verbatim playback — no service flags are emitted)")
-    elif svc_env:
-        services = svc_env
-        if not t_env and not x_env:
-            raise SystemExit("play_cmd: RIG_REPLAY_SERVICES without a topic selector mode — "
-                             "services replay only within a topic session; rig always pairs it "
-                             "with RIG_REPLAY_TOPICS or RIG_REPLAY_EXCLUDE")
-        if cfg_services:
-            warns.append("play.services is shadowed by RIG_REPLAY_SERVICES (rig's selection "
-                         "governs)")
-        if calls_cfg:
-            warns.append("`calls` config path is ignored under RIG_REPLAY_SERVICES (rig chose "
-                         "verbatim mode — the injector is not activated)")
-    else:
-        if calls_cfg and cfg_services:
-            raise SystemExit("play_cmd: `calls` and play.services are both set — script mode "
-                             "subsumes verbatim playback (double-call discipline); drop one")
-        calls, services = calls_cfg, cfg_services
-    if calls and not os.path.isabs(calls):
-        raise SystemExit(f"play_cmd: the call script must be an absolute host path (got "
-                         f"{calls!r}) — it is bind-mounted read-only into the injector")
+    calls, services, src_mode = service_selection(cfg, env, warns)
 
     # --- the window (rig-replay-window-handoff §1.1) + the bag start for the injector ----------
     from_s, to_s = resolve_window(play, env, warns)
@@ -492,7 +509,7 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
     if not math.isfinite(rate) or rate <= 0:
         raise SystemExit("play_cmd: play.rate must be > 0")
     if rate != 1.0:
-        args += ["-r", f"{rate:g}"]
+        args += ["-r", _num(rate)]
     if play.get("loop"):
         args.append("--loop")
         warns.append('play.loop: true — with restart: "no" the bag wraps forever and `down` is '
@@ -502,9 +519,20 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
     if from_s > 0:
         args += ["--start-offset", _num(from_s)]
     if to_s is not None and not clamped:
-        # RECORDED seconds from the (offset) start — pinned live on lyrical, see the docstring.
-        # A clamped `to` IS the bag end: no flag, the bag ends by itself.
-        args += ["--playback-duration", _num(to_s - from_s)]
+        if plan:
+            # rosbag2's final stamp is inclusive. The inspected plan window is [from, to),
+            # so stop one ns before its absolute upper bound. Integer ns avoids cancellation
+            # in (to - from), and must NOT combine with duration (rosbag2 takes the maximum).
+            if int(to_s * 1e9) <= int(from_s * 1e9):
+                raise SystemExit("play_cmd: plan window is empty at nanosecond precision")
+            final_ns = bag_start_ns + int(to_s * 1e9) - 1
+            # ros2bag treats an until value of zero as disabled; fail instead of playing on.
+            if final_ns <= 0:
+                raise SystemExit("play_cmd: rosbag2 cannot represent this plan's exclusive end at epoch zero")
+            args += ["--playback-until-nsec", str(final_ns)]
+        else:
+            # Preserve the standalone launcher's established inclusive-duration convention.
+            args += ["--playback-duration", _num(to_s - from_s)]
     # The release gate holds a PAUSED player: with RIG_REPLAY_START_AT_UNIX_S the flag is
     # rendered whatever the config says (the gate's companion resumes it at the instant).
     start_at = resolve_start_at(env)
@@ -693,7 +721,22 @@ def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, ...]:
             "" if extras["to_s"] is None else _num(extras["to_s"]))
 
 
+def runtime_config(cfg, env, repo):
+    """The launcher's Compose inputs without reading bags or writing rendered scripts."""
+    cfg, env, _ = apply_plan(cfg, env, _read, inspect=True)
+    name = str(cfg.get("name") or "bag_player")
+    calls, _, source_mode = service_selection(cfg, env, [])
+    source = str(env.get("RIG_REPLAY_SOURCE") or (cfg.get("source") or {}).get("run")
+                 or "/replay-source-unset")
+    return (name, str(pathlib.Path(repo) / "var/run" / name / "play.sh"), source,
+            "", source_mode, calls, "", "", "")
+
+
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[3] == "--runtime-config":
+        cfg = yaml.safe_load(open(sys.argv[1])) or {}
+        print("\t".join(runtime_config(cfg, dict(os.environ), pathlib.Path(sys.argv[2]))))
+        return 0
     if len(sys.argv) == 4 and sys.argv[3] == "--name":
         # The instance name alone -- a pure config read, no env, no filesystem. The launcher's
         # fallback for the verbs that need only the compose MODEL (down / ps / logs / config)

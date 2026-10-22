@@ -11,6 +11,8 @@ PYTHON="${BAG_LOGGER_PYTHON:-python3}"
 CONFIG="${1:?usage: ros2-bag-logger-up <config.yaml> [up [-d]|down|status|logs|config|export|...]}"; shift || true
 [ -f "$CONFIG" ] || { echo "ros2-bag-logger-up: config not found: $CONFIG" >&2; exit 1; }
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+INSPECT=()
+case "${1:-}" in runtime-images|images) INSPECT=(--inspect) ;; esac
 
 # `export` (v1.14.0, rig ≥ v0.2.54 `rig run export`): re-write THIS instance's sessions of a sealed
 # run smaller — `ros2 bag convert` per session (recompress at the profile's preset, drop topics,
@@ -52,7 +54,7 @@ fi
 # when zenoh shared memory is EFFECTIVELY on) gates the ipc:host compose overlay — the container
 # only gives up IPC-namespace isolation when SHM can actually use it — and the graph fields carry
 # the `graph:` block (the graph-snapshotter sidecar gate; empty interval/settle = tool defaults).
-NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/bag_cmd.py" "$CONFIG_ABS" "$REPO")"
+NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/bag_cmd.py" "$CONFIG_ABS" "$REPO" ${INSPECT[@]+"${INSPECT[@]}"})"
 # split on tabs by hand — `read` with a whitespace IFS collapses runs of tabs, losing empty fields
 REST="$NAME_AND_SCRIPT"
 NAME="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
@@ -80,8 +82,16 @@ ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
 [ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
 PROFILE=()
 case "${ARGS[0]}" in
-  up) [ "$GRAPH_FLAG" = "graph" ] && PROFILE=(--profile graph) ;;
+  up|runtime-images|images) [ "$GRAPH_FLAG" = "graph" ] && PROFILE=(--profile graph) ;;
   down|ps|logs) PROFILE=(--profile graph) ;;
+esac
+case "${ARGS[0]}" in
+  runtime-images|images)
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" "${ARGS[0]}" "${FILES[@]}" ${PROFILE[@]+"${PROFILE[@]}"} ;;
+  up)
+    if [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+      exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" ${PROFILE[@]+"${PROFILE[@]}"} -- "${ARGS[@]:1}"
+    fi ;;
 esac
 echo "ros2-bag-logger-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} script=$SCRIPT${SHM_FLAG:+ shm=on}${GRAPH_FLAG:+ graph=on}" >&2
 # ${PROFILE[@]+...}: an EMPTY array under `set -u` is an error on bash < 4.4 (macOS dev boxes)

@@ -4,6 +4,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from runtime_images import native_platform, pinned_image
+
 
 def command(path, env):
     path = Path(path).resolve()
@@ -16,8 +18,14 @@ def command(path, env):
     image = env.get("BAG_PLAYER_IMAGE") or env.get("RIG_MSGS_IMAGE") or env.get("RIG_BASE_IMAGE")
     if not image:
         prefix = env.get("RIG_IMAGE_REGISTRY", "")
-        image = (prefix + "/" if prefix else "") + "fleet-ros:" + env.get("RIG_IMAGE_TAG", "latest")
+        image = (prefix + "/" if prefix else "") + "fleet-ros:" + (env.get("RIG_IMAGE_TAG") or "latest")
+    try:
+        image = pinned_image(image, env)
+        platform = native_platform(env)
+    except ValueError as exc:
+        raise SystemExit(f"reindex: {exc}") from exc
     return ["docker", "run", "--rm", "--pull=never", "--network=none", "--cap-drop=ALL",
+            *([f"--platform={platform}"] if platform else []),
             "--user", f"{os.getuid()}:{os.getgid()}", "--mount", f"type=bind,src={path},dst=/bag",
             "--entrypoint", "/bin/bash", image, "-c",
             'set -e; . "/opt/ros/$ROS_DISTRO/setup.bash"; exec ros2 bag reindex --storage "$1" /bag',

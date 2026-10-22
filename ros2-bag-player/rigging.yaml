@@ -13,8 +13,11 @@ verbs:
   status: "ps"
   logs: "logs"
   config: "config"
+  images: "images"
+  runtime-images: "runtime-images"
   replay-capabilities: "replay-capabilities"
   replay-reindex: "replay-reindex"
+  replay-inspect-calls: "replay-inspect-calls"
 ros_distro: lyrical
 tier: autonomy
 examples: [config/ros2-bag-player.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
@@ -24,6 +27,7 @@ examples: [config/ros2-bag-player.example.yaml]   # default config for `rig cert
 # logger/router riggings already provide; declaring the build ref only names the fallback build.
 build: { architectures: [arm64, amd64], capabilities: {no_cache: true, platforms: true}, command: ../base/build.sh, images: [fleet-ros] }
 launch_surface:
+  - tools/runtime_images.py
   - ros2-bag-player-up
   - tools/play_cmd.py
   - tools/call_injector.py   # the call injector's tool (mounted, not rendered — the graph-snapshotter pattern)
@@ -32,4 +36,6 @@ launch_surface:
   - tools/release_gate.py    # the release gate of a gated replay (mounted into the player; RIG_REPLAY_START_AT_UNIX_S)
   - tools/clock_only.py
   - tools/reindex.py
+  - tools/inspect_calls.py
+  - tools/inspect_calls_host.py
   - docker/compose.deploy.yaml

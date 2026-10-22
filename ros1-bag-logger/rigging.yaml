@@ -9,6 +9,8 @@ verbs:
   status: "ps"
   logs: "logs"
   config: "config"
+  images: "images"
+  runtime-images: "runtime-images"
 ros_distro: noetic
 tier: infra
 examples: [config/ros1-bag-logger.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
@@ -17,6 +19,7 @@ examples: [config/ros1-bag-logger.example.yaml]   # default config for `rig cert
 # mirror:
 #   - ros:noetic-ros-base
 launch_surface:
+  - tools/runtime_images.py
   - ros1-bag-logger-up
   - tools/bag_cmd.py
   - docker/compose.deploy.yaml

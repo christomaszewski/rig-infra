@@ -15,10 +15,12 @@ PYTHON="${BAG_PLAYER_PYTHON:-python3}"
 CONFIG="${1:?usage: ros2-bag-player-up <config.yaml> [up [-d]|down|status|logs|config|export-calls|...]}"; shift || true
 case "${1:-}" in
   replay-capabilities)
-    printf '%s\n' '{"plan":1,"remap":true,"clock_only":true,"reindex":true}'
+    printf '%s\n' '{"plan":1,"remap":true,"clock_only":true,"reindex":true,"inspect_calls":1,"image_labels":{"bag-player":{"io.rig.rosbag2.replay":"1"}}}'
     exit 0 ;;
   replay-reindex)
     exec "$PYTHON" "$REPO/tools/reindex.py" "${2:?derived bag directory required}" ;;
+  replay-inspect-calls)
+    exec "$PYTHON" "$REPO/tools/inspect_calls_host.py" "${2:?inspection request JSON required}" ;;
 esac
 [ -f "$CONFIG" ] || { echo "ros2-bag-player-up: config not found: $CONFIG" >&2; exit 1; }
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
@@ -47,6 +49,9 @@ VERB="${ARGS[0]}"
 # `rig down` that follows a finished or half-failed replay must still tear the player down. On a
 # failed render those verbs continue with placeholders for the compose's required interpolations
 # (never touched by down/ps/logs; visible in a `config` render), the name read from the config.
+if [ "$VERB" = "runtime-images" ] || [ "$VERB" = "images" ]; then
+  NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/play_cmd.py" "$CONFIG_ABS" "$REPO" --runtime-config)"
+else
 PLAY_ERR="$(mktemp)"; trap 'rm -f "$PLAY_ERR"' EXIT
 if NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/play_cmd.py" "$CONFIG_ABS" "$REPO" 2>"$PLAY_ERR")"; then
   cat "$PLAY_ERR" >&2   # play_cmd's WARNs (shadowed config keys, ...) still reach the operator
@@ -57,6 +62,7 @@ else
   NAME_ONLY="$("$PYTHON" "$REPO/tools/play_cmd.py" "$CONFIG_ABS" - --name)"
   echo "ros2-bag-player-up: no replay to render ($(tr '\n' ' ' <"$PLAY_ERR" | sed 's/ *$//')) -- \`$VERB\` needs only the compose model, continuing" >&2
   NAME_AND_SCRIPT="$(printf '%s\t%s\t%s\t\t\t\t\t\t' "$NAME_ONLY" /play.sh-unset /replay-source-unset)"
+fi
 fi
 REST="$NAME_AND_SCRIPT"
 NAME="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
@@ -94,7 +100,13 @@ if [ "${ARGS[0]}" = "export-calls" ]; then
   # typesupport until /opt/fleet-msgs/setup.bash is sourced (the overlay bakes AMENT_PREFIX_PATH
   # for C++ but deliberately NOT PYTHONPATH; apt-side types never notice). Distro first, overlay
   # second, both defensive — the record.sh pattern extended.
-  exec docker compose "${FILES[@]}" run --rm --no-deps -T \
+  EXPORT=(run --rm --no-deps -T)
+  if [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+    EXPORT=("$PYTHON" "$REPO/tools/runtime_images.py" pinned-run "${FILES[@]}" -- --rm --no-deps -T)
+  else
+    EXPORT=(docker compose "${FILES[@]}" "${EXPORT[@]}")
+  fi
+  exec "${EXPORT[@]}" \
     -e CALL_EXPORT_SOURCE="$SVC_SOURCE" bag-player /bin/bash -c \
     '[ -n "${ROS_DISTRO:-}" ] && [ -f "/opt/ros/$ROS_DISTRO/setup.bash" ] && . "/opt/ros/$ROS_DISTRO/setup.bash"; [ -f /opt/fleet-msgs/setup.bash ] && . /opt/fleet-msgs/setup.bash; exec python3 /export_calls.py "$1"' -- "$SESSION"
 fi
@@ -105,8 +117,16 @@ fi
 # container is harmless (the graph-snapshotter pattern).
 PROFILE=()
 case "${ARGS[0]}" in
-  up) [ -n "$CALLS" ] && PROFILE=(--profile calls) ;;
+  up|runtime-images|images) [ -n "$CALLS" ] && PROFILE=(--profile calls) ;;
   down|ps|logs) PROFILE=(--profile calls) ;;
+esac
+case "$VERB" in
+  runtime-images|images)
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" "$VERB" "${FILES[@]}" ${PROFILE[@]+"${PROFILE[@]}"} ;;
+  up)
+    if [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+      exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" ${PROFILE[@]+"${PROFILE[@]}"} -- "${ARGS[@]:1}"
+    fi ;;
 esac
 # The release instant rides rig's env straight into play.sh (baked by play_cmd) and the injector's
 # compose env — nothing to re-export; named in the banner so `logs` readers see the gate was armed.

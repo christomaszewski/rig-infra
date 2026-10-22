@@ -84,16 +84,17 @@ def build_args(cfg: dict) -> tuple[str, str, list[str], list[str]]:
     return name, str(out.get("subdir") or "bags"), args, warns
 
 
-def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str]:
+def render(cfg: dict, repo: pathlib.Path, *, write=True) -> tuple[str, str]:
     """Write var/run/<name>/record.sh and return (name, script-path)."""
     name, subdir, args, warns = build_args(cfg)
     for w in warns:
         sys.stderr.write("ros1-bag-logger: " + w + "\n")
     argv = " ".join(shlex.quote(a) for a in args)
     run_dir = pathlib.Path(repo) / "var" / "run" / name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if write:
+        run_dir.mkdir(parents=True, exist_ok=True)
     script = run_dir / "record.sh"
-    script.write_text(
+    content = (
         "#!/usr/bin/env bash\n"   # bash: ROS `setup.bash` is bash-only (sourcing it under sh/dash errors)
         "set -e\n"
         '[ -n "${ROS_DISTRO:-}" ] && [ -f "/opt/ros/$ROS_DISTRO/setup.bash" ] && '
@@ -107,16 +108,18 @@ def render(cfg: dict, repo: pathlib.Path) -> tuple[str, str]:
         f'echo "ros1-bag-logger: recording ({shlex.quote(subdir)}) -> $base/{shlex.quote(name)}_*.bag" >&2\n'
         f'exec rosbag record {argv} -o "$base/{shlex.quote(name)}"\n'
     )
-    script.chmod(0o755)
+    if write:
+        script.write_text(content)
+        script.chmod(0o755)
     return name, str(script)
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 3 and not (len(sys.argv) == 4 and sys.argv[3] == "--inspect"):
         sys.stderr.write("usage: bag_cmd.py <config.yaml> <repo-dir>\n")
         return 2
     cfg = yaml.safe_load(open(sys.argv[1])) or {}
-    name, script = render(cfg, pathlib.Path(sys.argv[2]))
+    name, script = render(cfg, pathlib.Path(sys.argv[2]), write=len(sys.argv) == 3)
     print(name + "\t" + script)
     return 0
 
