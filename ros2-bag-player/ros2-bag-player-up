@@ -15,7 +15,7 @@ PYTHON="${BAG_PLAYER_PYTHON:-python3}"
 CONFIG="${1:?usage: ros2-bag-player-up <config.yaml> [up [-d]|down|status|logs|config|export-calls|...]}"; shift || true
 case "${1:-}" in
   replay-capabilities)
-    printf '%s\n' '{"plan":1,"remap":true,"clock_only":true,"reindex":true,"inspect_calls":1,"image_labels":{"bag-player":{"io.rig.rosbag2.replay":"1"}}}'
+    printf '%s\n' '{"plan":1,"remap":true,"clock_only":true,"reindex":true,"inspect_calls":1,"image_labels":{"bag-player":{"io.rig.rosbag2.replay":"1"}},"coordination":{"version":1,"components":["player","calls","readiness"],"image_labels":{"bag-player":{"io.rig.replay.coordination":"1"}}}}'
     exit 0 ;;
   replay-reindex)
     exec "$PYTHON" "$REPO/tools/reindex.py" "${2:?derived bag directory required}" ;;
@@ -29,7 +29,7 @@ CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 # (captured by `rig bake` like any launcher-rendered file; session resolution is HOST-side at
 # render — the source run is static). play_cmd prints
 # "<name>\t<script>\t<host-source>\t<container-session-path>\t<services-source>\t<calls>\t
-#  <bag-start-ns>\t<from-s>\t<to-s>":
+#  <bag-start-ns>\t<from-s>\t<to-s>\t<rate>":
 # the host source (RIG_REPLAY_SOURCE, or the config's source.run standalone) is exported for the
 # compose's ro mount; the session path + services source feed the export-calls one-shot; `calls`
 # (RIG_REPLAY_CALLS, or the config's `calls:` path — env wins, play_cmd WARNs) may be EMPTY and
@@ -61,7 +61,7 @@ else
   esac
   NAME_ONLY="$("$PYTHON" "$REPO/tools/play_cmd.py" "$CONFIG_ABS" - --name)"
   echo "ros2-bag-player-up: no replay to render ($(tr '\n' ' ' <"$PLAY_ERR" | sed 's/ *$//')) -- \`$VERB\` needs only the compose model, continuing" >&2
-  NAME_AND_SCRIPT="$(printf '%s\t%s\t%s\t\t\t\t\t\t' "$NAME_ONLY" /play.sh-unset /replay-source-unset)"
+  NAME_AND_SCRIPT="$(printf '%s\t%s\t%s\t\t\t\t\t\t\t1' "$NAME_ONLY" /play.sh-unset /replay-source-unset)"
 fi
 fi
 REST="$NAME_AND_SCRIPT"
@@ -73,12 +73,16 @@ SVC_SOURCE="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
 CALLS="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
 BAG_START_NS="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
 FROM_S="${REST%%$'\t'*}"
-TO_S="${REST#*$'\t'}"
+REST="${REST#*$'\t'}"
+TO_S="${REST%%$'\t'*}"
+RATE="${REST#*$'\t'}"
 export BAG_PLAYER_NAME="$NAME"
 export BAG_PLAY_SCRIPT="$SCRIPT"
+export CALL_INJECTOR_SCRIPT="${SCRIPT%/*}/calls.sh"
 export RIG_REPLAY_SOURCE="$SOURCE"
 # The injector writes <run>/calls/<NAME>/ — the player config's name, run-dir doctrine.
 export CALL_INJECTOR_NAME="$NAME"
+export CALL_INJECTOR_RATE="${RATE:-1}"
 [ -n "$CALLS" ] && export RIG_REPLAY_CALLS="$CALLS"
 # The ONE zero (bag start) + the resolved window, for the injector: re-exported like
 # RIG_REPLAY_SOURCE so a standalone config window reaches it exactly the way rig's does.
@@ -89,6 +93,12 @@ export CALL_INJECTOR_NAME="$NAME"
 # rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros2-bag-player_${NAME}}"
 FILES=(-f "$REPO/docker/compose.deploy.yaml")
+if [ "${RIG_REPLAY_CONTROL_DIR+x}" ]; then
+  if [ "$VERB" = "up" ]; then
+    [ "${RIG_RUNTIME_IMAGE_PINS+x}" ] || { echo "coordinated replay requires runtime image pins" >&2; exit 1; }
+  fi
+  FILES+=(-f "$REPO/docker/compose.coordinated.yaml")
+fi
 
 # export-calls (rig-replay-calls-handoff §1.3): one-shot container over the SAME resolved
 # session the play verb would use — server-side `_service_event` topics (or client-side, per

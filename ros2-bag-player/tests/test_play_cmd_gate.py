@@ -159,7 +159,7 @@ def test_render_fields_unchanged_and_the_script_carries_the_gate():
         (sess / "metadata.yaml").write_text(META)
         cfg = {"name": "gated", "source": {"run": str(src)}}
         out = play_cmd.render(cfg, {"RIG_REPLAY_START_AT_UNIX_S": AT}, pathlib.Path(d))
-        assert len(out) == 9 and out[0] == "gated" and out[6:] == ("", "", "")
+        assert len(out) == 10 and out[0] == "gated" and out[6:] == ("", "", "", "1")
         text = pathlib.Path(out[1]).read_text()
         assert GATE_LINE in text.splitlines()
         assert text.endswith(f"exec ros2 bag play /replay/bags/bag_logger/{S1} --start-paused\n")

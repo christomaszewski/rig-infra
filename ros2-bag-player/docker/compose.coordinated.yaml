@@ -1,0 +1,18 @@
+# Only selected for an explicitly coordinated, invocation-pinned replay.
+services:
+  bag-player:
+    environment: &coordination
+      RIG_REPLAY_CONTROL_DIR: /replay-control
+      RIG_REPLAY_SESSION_ID: ${RIG_REPLAY_SESSION_ID:?coordinated session required}
+      RIG_REPLAY_PLAN_ID: ${RIG_REPLAY_PLAN_ID:?coordinated plan required}
+      RIG_REPLAY_PARTICIPANT: ${RIG_REPLAY_PARTICIPANT:?coordinated instance required}
+    volumes:
+      - ${RIG_REPLAY_CONTROL_DIR:?coordinated directory required}:/replay-control
+      - ../tools/replay_coordination.py:/replay_coordination.py:ro
+      - ../tools/coordinated_player.py:/coordinated_player.py:ro
+      - ../tools/replay_readiness.py:/replay_readiness.py:ro
+  call-injector:
+    environment: *coordination
+    volumes:
+      - ${RIG_REPLAY_CONTROL_DIR:?coordinated directory required}:/replay-control
+      - ../tools/replay_coordination.py:/replay_coordination.py:ro

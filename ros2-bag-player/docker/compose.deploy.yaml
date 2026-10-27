@@ -70,10 +70,12 @@ services:
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+      ZENOH_CONFIG_OVERRIDE: ${ZENOH_CONFIG_OVERRIDE:-}  # calls.sh appends the same resolved config as play.sh
       VEHICLE_ID: ${VEHICLE_ID:-}
       RIG_BAG_ROOT: /data
       RIG_SIM_TIME: ${RIG_SIM_TIME:-}                      # one rig-owned clock token, third consumer
       CALL_INJECTOR_NAME: ${CALL_INJECTOR_NAME:-bag_player}
+      CALL_INJECTOR_RATE: ${CALL_INJECTOR_RATE:-1}  # resolved by launcher; scales wall-clock scripts
       CALL_INJECTOR_BAG_START_NS: ${CALL_INJECTOR_BAG_START_NS:-}   # the session's starting_time (ns) — the one zero; launcher-private, from metadata.yaml
       RIG_REPLAY_FROM_S: ${RIG_REPLAY_FROM_S:-}            # the window, as resolved by the launcher (absent/empty = 0 / the bag end)
       RIG_REPLAY_TO_S: ${RIG_REPLAY_TO_S:-}
@@ -82,8 +84,7 @@ services:
     volumes:
       - ${RIG_DATA_DIR:-/data}:/data                       # rw: results.yaml lands in the run dir
       - ${RIG_REPLAY_CALLS:-/dev/null}:/calls.yaml:ro      # default keeps un-profiled interpolation quiet
+      - ${CALL_INJECTOR_SCRIPT:-/dev/null}:/calls.sh:ro
       - ../tools/call_injector.py:/call_injector.py:ro     # static tool — no render, mounted from the repo
-    # Source ROS defensively before exec'ing python3 (the record.sh pattern). $$ = literal $ for
-    # the container shell: these expand IN the container, never at compose-interpolation time.
-    command: ["/bin/bash", "-c",
-              "[ -n \"$${ROS_DISTRO:-}\" ] && [ -f \"/opt/ros/$$ROS_DISTRO/setup.bash\" ] && . \"/opt/ros/$$ROS_DISTRO/setup.bash\"; [ -f /opt/fleet-msgs/setup.bash ] && . /opt/fleet-msgs/setup.bash; exec python3 /call_injector.py"]
+    # The rendered bootstrap sources ROS/overlay and applies exactly the player's Zenoh config.
+    command: ["/bin/bash", "/calls.sh"]

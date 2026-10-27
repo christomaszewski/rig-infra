@@ -160,9 +160,9 @@ def main() -> int:
                          "at 0)")
     name = re.sub(r"[^A-Za-z0-9_]", "_", os.environ.get("BAG_PLAYER_NAME") or "bag_player")
 
-    def ready():
+    def ready(restored=0):
         with open(READY_PATH, "w") as f:
-            f.write("ok\n")
+            f.write("empty\n" if restored == 0 else f"restored:{restored}\n")
 
     meta_path = os.path.join(a.session, "metadata.yaml")
     try:
@@ -210,6 +210,8 @@ def main() -> int:
                              f"in this image ({exc}) — skipped (the main play would fail on it "
                              "too; declare the package in the owning service's rigging `msgs:` "
                              "block)\n")
+            if os.environ.get("RIG_LATCH_STRICT") == "1":
+                raise RuntimeError(f"cannot restore latched type {t['type']}") from exc
             continue
         qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
                          durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -222,7 +224,7 @@ def main() -> int:
         sys.stderr.write(f"latch-restore: {t['name']} <- last pre-window sample at "
                          f"t={(stamp_ns - bag_start_ns) / 1e9:.3f}s ({t['type']}, "
                          f"{t['reliability']})\n")
-    ready()
+    ready(len(pubs))
     sys.stderr.write(f"latch-restore: {len(pubs)} latched topic(s) restored before from="
                      f"{a.from_s:g}s (bag read {read_ms:.0f} ms) — staying alive for the "
                      "session\n")

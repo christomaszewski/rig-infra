@@ -54,13 +54,17 @@ def check_runtime():
     from service_msgs.msg import ServiceEventInfo
     import yaml
 
+    from ros2bag.verb.play import PlayVerb
+    require(callable(PlayVerb.add_arguments), "rosbag2 playback selector parser")
     help_text = cli_help("play", PLAY_FLAGS)
     if "client_introspection" not in help_text or "service_introspection" not in help_text:
         raise RuntimeError("rosbag2 replay runtime lacks both service request source modes")
     cli_help("reindex", {"--storage"})
     for name in ("init", "create_node", "spin_once", "try_shutdown"):
         require(callable(getattr(rclpy, name)), "rclpy." + name)
-    for name in ("create_publisher", "create_subscription", "create_client", "destroy_node"):
+    for name in ("create_publisher", "create_subscription", "create_client", "destroy_node",
+                 "get_node_names_and_namespaces", "get_subscriptions_info_by_topic",
+                 "get_service_names_and_types_by_node"):
         require(callable(getattr(Node, name)), "rclpy.node.Node." + name)
     require(issubclass(ExternalShutdownException, Exception), "ExternalShutdownException")
     QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST, reliability=ReliabilityPolicy.RELIABLE,
@@ -69,6 +73,13 @@ def check_runtime():
     IsPaused.Request()
     require(isinstance(IsPaused.Response().paused, bool), "IsPaused.Response.paused")
     Resume.Request()
+    require(isinstance(Resume.Response().return_code, int) and
+            isinstance(Resume.Response().error_string, str), "Resume response contract")
+    from rclpy.client import Client
+    require(callable(Client.service_is_ready), "client discovery without requests")
+    from rclpy.node import TopicEndpointInfo
+    for field in ("node_name", "node_namespace", "topic_type"):
+        require(hasattr(TopicEndpointInfo, field), "subscription endpoint " + field)
 
     # Generated request/event types and Python typesupport are needed by both call paths.
     service = get_service("std_srvs/srv/SetBool")
@@ -131,7 +142,7 @@ def check_runtime():
                            check=True, capture_output=True, text=True, timeout=30)
             require(rosbag2_py.Info().read_metadata(str(path), "").message_count == 2,
                     storage + " reindexed message count")
-    return {"io.rig.rosbag2.replay": "1", "storage": ["mcap", "sqlite3"]}
+    return {"io.rig.rosbag2.replay": "1", "io.rig.replay.coordination": "1", "storage": ["mcap", "sqlite3"]}
 
 
 if __name__ == "__main__":

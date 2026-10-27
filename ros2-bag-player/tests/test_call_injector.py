@@ -213,7 +213,7 @@ def test_wall_zero_is_the_release_instant_under_a_gate():
     assert call_injector.sim_now(1788361689.6, 1788361659.6) == 30.0
 
 
-def _run_clocked_injector(*, initialization_s, instant=100.0, sim_rate=None):
+def _run_clocked_injector(*, initialization_s, instant=100.0, sim_rate=None, wall_rate=1):
     """Drive main() with real script/window handling and deterministic ROS/clock adapters."""
     import contextlib
     import io
@@ -284,7 +284,7 @@ def _run_clocked_injector(*, initialization_s, instant=100.0, sim_rate=None):
         env = {"RIG_BAG_ROOT": temp, "RIG_SIM_TIME": "1" if sim_rate else "",
                "RIG_REPLAY_FROM_S": "30", "RIG_REPLAY_TO_S": "40",
                "RIG_REPLAY_START_AT_UNIX_S": "" if instant is None else str(instant),
-               "CALL_INJECTOR_BAG_START_NS": "1000000000000"}
+               "CALL_INJECTOR_BAG_START_NS": "1000000000000", "CALL_INJECTOR_RATE": str(wall_rate)}
         with patch.dict(sys.modules, modules), patch.dict(os.environ, env, clear=True), \
                 patch.object(sys, "argv", ["injector", str(path)]), \
                 patch.object(call_injector, "resolve_types", resolve_types), \
@@ -313,6 +313,12 @@ def test_wall_without_a_gate_keeps_initialization_as_its_zero():
     fired = _run_clocked_injector(initialization_s=5, instant=None)
     assert fired[0] == (30, 85)
     assert abs(fired[1][1] - 89) < 0.01
+
+
+def test_wall_rate_scales_window_timing_from_immutable_release():
+    fired = _run_clocked_injector(initialization_s=5, wall_rate=2)
+    assert abs(fired[0][1] - 100) < .01
+    assert abs(fired[1][1] - 102) < .06
 
 
 def test_sim_clock_rate_and_window_remain_anchored_to_bag_start():

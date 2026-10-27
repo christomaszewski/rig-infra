@@ -137,6 +137,8 @@ jobs:
           python3 ros2-bag-player/tests/test_inspect_calls.py
           python3 ros2-bag-player/tests/test_runtime_images.py
           python3 ros2-bag-player/tests/test_runtime_acceptance_runner.py
+          python3 ros2-bag-player/tests/test_replay_coordination.py
+          python3 ros2-bag-player/tests/test_replay_readiness.py
           python3 -m unittest discover -s base -p test_replay_contract.py -v
           # v1.13.1: down / ps / logs / config on the compose model alone when there is no replay
           # to render (rig strips RIG_REPLAY_* on every verb but `replay`; a docker stub records

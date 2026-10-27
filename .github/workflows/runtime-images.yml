@@ -1,0 +1,45 @@
+name: runtime images
+on:
+  push: {branches: [main]}
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build shared runtime
+        run: PUSH=0 base/build.sh local ci
+      - name: Record, export and replay on both transports
+        run: |
+          for rmw in rmw_fastrtps_cpp rmw_zenoh_cpp; do
+            docker run --rm --network none -e RMW_IMPLEMENTATION="$rmw" \
+              -v "$PWD/base/test_runtime.py:/test_runtime.py:ro" local/fleet-ros:ci \
+              python3 /test_runtime.py
+          done
+      - name: Build and test apt-only messages overlay
+        run: |
+          printf 'apt: [nmea_msgs]\n' > /tmp/messages.yaml
+          PUSH=0 FLEET_MSGS_MANIFEST=/tmp/messages.yaml msgs/build-msgs.sh local ci
+          docker run --rm --network none -e FLEET_TEST_MESSAGE=nmea_msgs/msg/Sentence \
+            -v "$PWD/base/test_runtime.py:/test_runtime.py:ro" local/fleet-ros-msgs:ci \
+            python3 /test_runtime.py
+      - name: Build and test generated message typesupport
+        run: |
+          cat > /tmp/messages.yaml <<'YAML'
+          apt: [nmea_msgs]
+          source:
+            - repo: https://github.com/christomaszewski/sbg_driver.git
+              ref: v0.8.2
+              packages: [sbg_msgs]
+          YAML
+          PUSH=0 FLEET_MSGS_MANIFEST=/tmp/messages.yaml msgs/build-msgs.sh local ci
+          docker run --rm --network none -e FLEET_TEST_MESSAGE=sbg_msgs/msg/Status \
+            -v "$PWD/base/test_runtime.py:/test_runtime.py:ro" local/fleet-ros-msgs:ci \
+            bash -c 'source /opt/fleet-msgs/setup.bash; python3 /test_runtime.py'

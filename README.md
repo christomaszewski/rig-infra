@@ -30,7 +30,7 @@ one in CI).
   `export-calls` verb). Beside per-sensor replay sources it starts paused and resumes itself at
   rig's one release instant. See [SIL replay](#sil-replay--the-ros2-bag-player-service).
 - **`ros1-bag-logger/`** — the ROS 1 sibling (`rosbag record`), for ROS 1 fleets with a roscore.
-- **`base/`** — the `fleet-ros` image: `ros:<distro>-ros-base` + the fleet's rmw + `rosbag2` (+ mcap).
+- **`base/`** — the `fleet-ros` image: `ros:<distro>-ros-core` + the ROS base packages + the fleet's rmw + `rosbag2` (+ mcap).
   `base/build.sh <registry> [tag]` follows the rig build contract; the router and ros2 bag logger
   riggings declare it (`build: { command: ../base/build.sh, images: [fleet-ros], provides: base }`),
   so `rig build` builds + pushes it and certify enforces the compose pulls the same tag. Both the
@@ -72,7 +72,7 @@ that contract.
   with an external ref, used verbatim. rig then skips the fleet-ros build — nothing would pull it —
   and the stacks run that ref, so it has to carry the fleet's `ros.distro`, its declared rmw, and
   rosbag2. fleet-ros is never re-parented onto it: it is the ROOT of the chain, always built `FROM
-  ros:<distro>-ros-base`, and rig pops `RIG_BASE_IMAGE` for that stage-0 build.
+  ros:<distro>-ros-core`, and rig pops `RIG_BASE_IMAGE` for that stage-0 build.
 - **Built for the fleet's rmw.** vehicle.yaml `ros.rmw` reaches `base/build.sh` as `RIG_ROS_RMW`
   (rig-owned and set-or-popped — deliberately not the conventional `RMW_IMPLEMENTATION`, which most
   ROS shells export), and the image installs `ros-<distro>-<rmw, '_' → '-'>`. That is the same
@@ -437,6 +437,15 @@ by received timestamp, seeks to the lower bound, and stops at the upper bound, s
 window does not require scanning unrelated history and tail events. Standalone playback keeps
 its existing inclusive `--playback-duration` behavior.
 
+Coordinated startup v1 holds every producer through preparation and endpoint discovery,
+then acknowledges and commits one common release. It requires the actual player image's
+`io.rig.replay.coordination=1` label. Selected message/service types are checked before
+holding; unsupported selected types fail rather than being silently skipped by rosbag2.
+Only the paused clock and window latch restoration may run after arm; ordinary data and
+scripted requests (including timestamp zero) wait for commit. Both player and injector use
+the same configured Zenoh transport, and wall-clock scripts follow the resolved playback
+rate from the immutable release origin. See [the coordination contract](ros2-bag-player/REPLAY_PLAN.md#coordinated-startup).
+
 **The call injector** (`RIG_REPLAY_CALLS`, or standalone `calls:` — env wins, WARN): a
 schema-v1 YAML timeline of calls, executed on the replay clock by a second compose service
 (profile `calls`, activated by the launcher when a script is in play; `restart: "no"`). Script
@@ -611,3 +620,18 @@ overlay and service consumers. `--no-cache` disables instruction caching in both
 keeps its deliberate no-pull policy. `rig certify --repo zenoh-router --require-build-check` tests
 both build entrypoints in isolation without building images (requires Bubblewrap on Linux or
 sandbox-exec on macOS). The router, logger and player CI gates require completed build checks.
+
+### Runtime and SDK images
+
+The published `fleet-ros` retains ROS CLI commands, common interfaces, the selected
+RMW, rosbag2 and MCAP. It starts from `ros-core` and installs the ROS base packages
+without inheriting the upstream image's compiler/colcon/rosdep layer. An optional
+local development image is available with
+`docker build --target sdk -t fleet-ros-sdk base/`; normal Rig builds still publish
+only the runtime, for the full requested CPU matrix.
+
+The messages overlay installs declared apt interfaces before source generation,
+so those interfaces are available to both the generator and the final runtime.
+Apt-only overlays skip compiler installation entirely. Source overlays keep their
+compiler and Git tools in a disposable stage; the final image carries only the
+interface install prefix and its manifest/provenance records.

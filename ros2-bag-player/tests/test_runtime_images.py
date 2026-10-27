@@ -169,6 +169,28 @@ class RuntimeImages(unittest.TestCase):
             self.assertNotIn("profiles", service)
             self.assertEqual(service["command"], inspection["model"]["services"][name]["command"])
 
+    def test_coordinated_launch_has_session_labels_and_bound_control_directory(self):
+        extra = dict(self.pins("fleet-ros:latest"), RIG_REPLAY_CONTROL_DIR=str(self.root / "control"),
+            RIG_REPLAY_SESSION_ID="a"*32, RIG_REPLAY_PLAN_ID="b"*64, RIG_REPLAY_PARTICIPANT="fixture")
+        proc, repo = self.launch("ros2-bag-player", "up", calls="/calls.yaml", play={"topics": ["/points"], "rate": 2},
+            extra=dict(extra, CALL_INJECTOR_RATE="999", ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/localhost:17747"]'))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        services = self.logs()[-1]["model"]["services"]
+        for service in services.values():
+            self.assertEqual(service["labels"]["io.rig.replay.session"], "a"*32)
+            self.assertEqual(service["labels"]["io.rig.replay.plan"], "b"*64)
+            self.assertEqual(service["environment"]["RIG_REPLAY_CONTROL_DIR"], "/replay-control")
+            self.assertTrue(any(m["target"] == "/replay-control" for m in service["volumes"]))
+        self.assertEqual(str(services["call-injector"]["environment"]["CALL_INJECTOR_RATE"]), "2")
+        self.assertEqual(services["call-injector"]["environment"]["ZENOH_CONFIG_OVERRIDE"],
+                         'connect/endpoints=["tcp/localhost:17747"]')
+        self.assertEqual(services["call-injector"]["command"], ["/bin/bash", "/calls.sh"])
+        self.assertTrue((repo / "var/run/fixture/calls.sh").is_file())
+        script = (repo / "var/run/fixture/play.sh").read_text()
+        self.assertIn("exec python3 /coordinated_player.py", script)
+        self.assertIn("--start-paused", script)
+        self.assertNotIn("python3 /release_gate.py", script)
+
     def test_other_bundles_enforce_image_pins(self):
         for name in SERVICES[1:]:
             image = "ros1-bridge:latest" if name == "ros1-bag-logger" else "fleet-ros:latest"

@@ -29,6 +29,7 @@ jobs:
         run: |
           for image in local/fleet-ros:replay-ci local/fleet-ros-msgs:replay-ci; do
             test "$(docker image inspect "$image" --format '{{ index .Config.Labels "io.rig.rosbag2.replay" }}')" = 1
+            test "$(docker image inspect "$image" --format '{{ index .Config.Labels "io.rig.replay.coordination" }}')" = 1
             docker run --rm --pull=never --network none --cap-drop=ALL \
               --security-opt no-new-privileges --pids-limit 256 \
               -e RMW_IMPLEMENTATION=rmw_zenoh_cpp -e PYTHONDONTWRITEBYTECODE=1 \

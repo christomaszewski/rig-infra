@@ -136,6 +136,24 @@ def test_transport_settings_precede_both_replay_helpers():
         assert proc.returncode == 0, proc.stderr
 
 
+def test_injector_bootstrap_uses_exact_player_transport_overrides():
+    with tempfile.TemporaryDirectory() as temporary:
+        tmp = pathlib.Path(temporary)
+        cfg = {"zenoh": {"shared_memory": False, "overrides": {
+            "connect": {"endpoints": ["tcp/localhost:17747"]}}}}
+        inherited = 'connect/endpoints=["tcp/localhost:7447"];scouting/multicast/enabled=false'
+        player, _ = _run(tmp, cfg, inherited=inherited)
+        python = tmp / "bin/python3"
+        python.write_text(f"#!{sys.executable}\nimport os; print(os.environ.get('ZENOH_CONFIG_OVERRIDE', ''))\n")
+        python.chmod(0o755)
+        proc = subprocess.run(["/bin/bash", str(tmp / "var/run/bag_player/calls.sh")],
+            env={"PATH": f"{tmp / 'bin'}:{os.defpath}", "RMW_IMPLEMENTATION": "rmw_zenoh_cpp",
+                 "ZENOH_CONFIG_OVERRIDE": inherited}, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == player["override"]
+        assert _effective(proc.stdout.strip())["connect/endpoints"] == ["tcp/localhost:17747"]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

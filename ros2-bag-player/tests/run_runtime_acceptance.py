@@ -6,7 +6,7 @@ import unittest
 
 
 def accepted(result, count):
-    return count >= 7 and result.wasSuccessful() and not result.skipped
+    return count >= 13 and result.wasSuccessful() and not result.skipped
 
 
 def main():
@@ -15,7 +15,7 @@ def main():
     count = suite.countTestCases()
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not accepted(result, count):
-        print(f"native replay acceptance requires at least 7 passing cases and no skips; "
+        print(f"native replay acceptance requires at least 13 passing cases and no skips; "
               f"discovered={count}, skipped={len(result.skipped)}", file=sys.stderr)
         return 1
     return 0

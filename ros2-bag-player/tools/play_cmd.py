@@ -425,6 +425,16 @@ def service_selection(cfg, env, warns):
     return calls, services, src_mode
 
 
+def playback_rate(play):
+    try:  # `or`-defaulting would turn an explicit rate: 0 into 1.0 instead of a refusal
+        rate = 1.0 if play.get("rate") is None else float(play.get("rate"))
+    except (TypeError, ValueError):
+        raise SystemExit("play_cmd: play.rate must be a number")
+    if not math.isfinite(rate) or rate <= 0:
+        raise SystemExit("play_cmd: play.rate must be > 0")
+    return rate
+
+
 def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str, list[str],
                                                                    list[str], dict]:
     """(name, host-source-dir, container-session-path, play argv AFTER the path, warnings,
@@ -502,12 +512,7 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
         from_s, to_s, clamped = validate_window(from_s, to_s, duration_ns, warns)
 
     args: list[str] = []
-    try:  # `or`-defaulting would turn an explicit rate: 0 into 1.0 instead of a refusal
-        rate = 1.0 if play.get("rate") is None else float(play.get("rate"))
-    except (TypeError, ValueError):
-        raise SystemExit("play_cmd: play.rate must be a number")
-    if not math.isfinite(rate) or rate <= 0:
-        raise SystemExit("play_cmd: play.rate must be > 0")
+    rate = playback_rate(play)
     if rate != 1.0:
         args += ["-r", _num(rate)]
     if play.get("loop"):
@@ -536,7 +541,7 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
     # The release gate holds a PAUSED player: with RIG_REPLAY_START_AT_UNIX_S the flag is
     # rendered whatever the config says (the gate's companion resumes it at the instant).
     start_at = resolve_start_at(env)
-    if play.get("start_paused") or start_at is not None:
+    if play.get("start_paused") or start_at is not None or env.get("RIG_REPLAY_CONTROL_DIR"):
         args.append("--start-paused")
     if str(env.get("RIG_SIM_TIME") or "") == "1":
         args.append("--clock")
@@ -630,7 +635,7 @@ def zenoh_env_lines(cfg: dict, warns: list[str]) -> str:
 
 
 def play_script(path: str, args: list[str], latch: list[str],
-                start_at: float | None = None, zenoh: str = "") -> str:
+                start_at: float | None = None, zenoh: str = "", coordinated: bool = False) -> str:
     """play.sh text: source ROS, (windowed) start the latch pre-pass and wait — bounded — for it
     to have published, (gated) start the release-gate companion, then exec `ros2 bag play`.
     Everything is static: no runtime stamps, playback writes nothing — the release instant is a
@@ -649,6 +654,12 @@ def play_script(path: str, args: list[str], latch: list[str],
         f'echo "ros2-bag-player: playing {shlex.quote(path)} (exit 0 = the bag ended — a finished'
         ' replay, not a failure)" >&2',
     ]
+    if coordinated:
+        lines += ["[ -f /opt/fleet-msgs/setup.bash ] && . /opt/fleet-msgs/setup.bash",
+                  "exec python3 /coordinated_player.py --latch " +
+                  shlex.quote(json.dumps([path, *latch] if latch else [])) +
+                  " -- ros2 bag play " + shlex.quote(path) + " " + argv]
+        return "\n".join(lines) + "\n"
     if latch:
         latch_argv = " ".join(shlex.quote(a) for a in latch)
         lines += [
@@ -685,7 +696,7 @@ def play_script(path: str, args: list[str], latch: list[str],
 def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, ...]:
     """Write var/run/<name>/play.sh and return (name, script-path, host-source-dir,
     container-session-path, services-source, calls-path-or-empty, bag-start-ns-or-empty,
-    from-s-or-empty, to-s-or-empty). Everything is resolved here at render time — the script is
+    from-s-or-empty, to-s-or-empty, resolved-rate). Everything is resolved here at render time — the script is
     static (no runtime stamps: playback writes nothing), captured by `rig bake` like any
     launcher-rendered file."""
     name, source, path, args, warns, extras = build_args(cfg, env)
@@ -695,8 +706,15 @@ def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, ...]:
     run_dir = pathlib.Path(repo) / "var" / "run" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     script = run_dir / "play.sh"
+    injector = run_dir / "calls.sh"
+    injector.write_text("\n".join([
+        "#!/usr/bin/env bash", "set -e",
+        '[ -n "${ROS_DISTRO:-}" ] && [ -f "/opt/ros/$ROS_DISTRO/setup.bash" ] && . "/opt/ros/$ROS_DISTRO/setup.bash"',
+        '[ -f /opt/fleet-msgs/setup.bash ] && . /opt/fleet-msgs/setup.bash',
+        *zenoh.splitlines(), "exec python3 /call_injector.py"]) + "\n")
+    injector.chmod(0o755)
     if extras["clock_only"]:
-        if cfg.get("play", {}).get("start_paused") and extras["start_at"] is None:
+        if cfg.get("play", {}).get("start_paused") and extras["start_at"] is None and not env.get("RIG_REPLAY_CONTROL_DIR"):
             raise SystemExit("play_cmd: clock-only playback needs a release gate for start_paused")
         clock_args = ["--start-ns", str(extras["bag_start_ns"]),
                       "--from", str(extras["from_s"]),
@@ -713,12 +731,13 @@ def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, ...]:
         text.append("exec python3 /clock_only.py " + " ".join(shlex.quote(a) for a in clock_args))
         script.write_text("\n".join(text) + "\n")
     else:
-        script.write_text(play_script(path, args, extras["latch"], extras["start_at"], zenoh))
+        script.write_text(play_script(path, args, extras["latch"], extras["start_at"], zenoh,
+                                      coordinated=bool(env.get("RIG_REPLAY_CONTROL_DIR"))))
     script.chmod(0o755)
     return (name, str(script), source, path, extras["services_source"], extras["calls"],
             "" if extras["bag_start_ns"] is None else str(extras["bag_start_ns"]),
             _num(extras["from_s"]) if extras["from_s"] > 0 else "",
-            "" if extras["to_s"] is None else _num(extras["to_s"]))
+            "" if extras["to_s"] is None else _num(extras["to_s"]), _num(extras["rate"]))
 
 
 def runtime_config(cfg, env, repo):
@@ -729,7 +748,7 @@ def runtime_config(cfg, env, repo):
     source = str(env.get("RIG_REPLAY_SOURCE") or (cfg.get("source") or {}).get("run")
                  or "/replay-source-unset")
     return (name, str(pathlib.Path(repo) / "var/run" / name / "play.sh"), source,
-            "", source_mode, calls, "", "", "")
+            "", source_mode, calls, "", "", "", _num(playback_rate(cfg.get("play") or {})))
 
 
 def main() -> int:

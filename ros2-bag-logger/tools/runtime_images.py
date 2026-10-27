@@ -97,7 +97,17 @@ def main(argv=None):
                    "--no-deps", "--wait", "--no-build", "--quiet-pull"}
         if any(arg not in allowed for arg in up_args):
             raise ValueError("pinned replay up only accepts launch flags; image policy and service selection are fixed")
+    session_labels = {}
+    if "RIG_REPLAY_CONTROL_DIR" in os.environ:
+        for variable, label, size in (("RIG_REPLAY_SESSION_ID", "io.rig.replay.session", 32),
+                                      ("RIG_REPLAY_PLAN_ID", "io.rig.replay.plan", 64)):
+            value = os.environ.get(variable, "")
+            if not re.fullmatch(r"[0-9a-f]{" + str(size) + "}", value):
+                raise ValueError("invalid coordinated replay identity: " + variable)
+            session_labels[label] = value
     for service in model["services"].values():
+        if session_labels:
+            service.setdefault("labels", {}).update(session_labels)
         service["image"] = pins[service["image"]]
         service["pull_policy"] = "never"
         platform = native_platform(os.environ, service.get("platform"))

@@ -39,3 +39,7 @@ launch_surface:
   - tools/inspect_calls.py
   - tools/inspect_calls_host.py
   - docker/compose.deploy.yaml
+  - tools/replay_coordination.py
+  - tools/coordinated_player.py
+  - tools/replay_readiness.py
+  - docker/compose.coordinated.yaml

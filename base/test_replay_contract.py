@@ -27,6 +27,7 @@ class ReplayContract(unittest.TestCase):
         self.assertLess(install, copied)
         self.assertLess(copied, checked)
         self.assertLess(checked, label)
+        self.assertLess(checked, dockerfile.index('LABEL io.rig.replay.coordination="1"'))
         # A runtime-only base and an optional SDK-stage build both support this contract.
         if "FROM runtime-deps AS sdk" in dockerfile:
             self.assertLess(label, dockerfile.index("FROM runtime-deps AS sdk"))
@@ -40,6 +41,9 @@ class ReplayContract(unittest.TestCase):
         for capability in ("plan", "remap", "clock_only", "reindex"):
             self.assertTrue(capabilities[capability])
         self.assertEqual(capabilities["inspect_calls"], 1)
+        self.assertEqual(capabilities["coordination"], {"version": 1,
+            "components": ["player", "calls", "readiness"],
+            "image_labels": {"bag-player": {"io.rig.replay.coordination": "1"}}})
 
 
 if __name__ == "__main__":

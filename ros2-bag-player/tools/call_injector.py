@@ -19,7 +19,8 @@ handed over by the launcher (``CALL_INJECTOR_BAG_START_NS``, from the host-side 
 so ``-r`` scales the timeline exactly like the bag and a window NEVER shifts the zero (the first
 ``/clock`` sample under ``--start-offset`` is ≈ ``bag_start + from``, and the injector logs the
 observed-vs-expected offset as a sanity line). Without ``/clock`` (``--wall-clock`` replays):
-``now() = from + wall-elapsed-since-injector-start`` — approximate by construction. The compose
+``now() = from + rate * wall-elapsed-since-release``. The launcher passes its resolved
+player rate to the injector; a shared release supplies the immutable origin. The compose
 gives the injector a head start (the player ``depends_on`` it, ``required: false``) and rosbag2
 needs seconds to open a bag, so the subscription stands before the first sample; a missing
 ``/clock`` refuses after ``CALL_INJECTOR_CLOCK_TIMEOUT_S`` (default 60) rather than hanging a
@@ -31,10 +32,10 @@ The RELEASE GATE (v1.13.0; rig-sensor-replay-plan §5): under ``RIG_REPLAY_START
 player comes up paused and resumes itself at that instant (``release_gate.py``). Sim time needs
 nothing here — ``t = /clock − bag_start`` is anchored to the bag, and rosbag2 publishes a
 CONSTANT ``/clock`` (= bag_start + from) while holding, so the first sample arrives before the
-release and the zero is untouched (a call at ``t == from`` therefore fires during the hold —
-state-setting before data flows, like the latch pre-pass). The ``/clock`` wait deadline grows
+release and the zero is untouched (a call at ``t == from`` fires during the legacy hold;
+coordinated startup explicitly holds every scripted call until commit). The ``/clock`` wait deadline grows
 by the distance to the instant so a long ``--start-delay`` cannot time it out. Under wall clock
-the zero is the INSTANT, not injector start: ``now() = from + (wall − instant)`` — without that
+the zero is the INSTANT, not injector start: ``now() = from + rate * (wall − instant)`` — without that
 every call would fire early by the whole gate. Convert that absolute instant to a monotonic
 origin AFTER initialization, retaining elapsed time if the gate has already passed; script/type
 loading and ROS discovery must not move every call later.
@@ -71,6 +72,7 @@ Doctrine pins:
 from __future__ import annotations
 
 import os
+import math
 import re
 import sys
 import time
@@ -242,11 +244,10 @@ def sim_now(clock_s: float, bag_start_s: float) -> float:
     return clock_s - bag_start_s
 
 
-def wall_now(elapsed_s: float, from_s: float) -> float:
+def wall_now(elapsed_s: float, from_s: float, rate: float = 1.0) -> float:
     """`t` without /clock: the window start plus wall time since the zero (injector start, or
-    the release instant under a gate — approximate either way: no rate, no pacing information
-    without a clock)."""
-    return from_s + elapsed_s
+    the release instant under a gate), scaled by the resolved player rate."""
+    return from_s + elapsed_s * rate
 
 
 def gate_delay(instant: float | None, now: float) -> float:
@@ -300,7 +301,7 @@ def resolve_types(calls: list[dict]):
     return types
 
 
-def main() -> int:
+def main(participant=None) -> int:
     script_path = sys.argv[1] if len(sys.argv) > 1 else "/calls.yaml"
     name = os.environ.get("CALL_INJECTOR_NAME") or "bag_player"
     sim = str(os.environ.get("RIG_SIM_TIME") or "") == "1"
@@ -315,6 +316,10 @@ def main() -> int:
             return float(raw)
         except ValueError:
             raise SystemExit(f"call_injector: {key} must be a number of seconds (got {raw!r})")
+    rate = _env_seconds("CALL_INJECTOR_RATE")
+    rate = 1.0 if rate is None else rate
+    if not math.isfinite(rate) or rate <= 0:
+        raise SystemExit("call_injector: CALL_INJECTOR_RATE must be finite and positive")
     from_s = _env_seconds("RIG_REPLAY_FROM_S") or 0.0
     to_s = _env_seconds("RIG_REPLAY_TO_S") or None      # 0/absent = the bag end
     instant = _env_seconds("RIG_REPLAY_START_AT_UNIX_S")   # the release gate, None = no gate
@@ -383,8 +388,17 @@ def main() -> int:
     fd = os.open(results, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
         os.write(fd, comment.encode("utf-8"))   # the ONE leading line, before any entry
+        if participant:
+            def ready():
+                return (all(client.service_is_ready() for client in clients.values())
+                        and (not sim or latest["clock"] is not None))
+            instant = participant.wait_release(ready_check=ready,
+                on_tick=lambda: rclpy.spin_once(node, timeout_sec=0.005))
+            participant.started()
         if not calls:
             sys.stderr.write("call-injector: no call inside the window — nothing to fire\n")
+            if participant:
+                participant.completed()
             return 0
         # --- the zero: BAG START. Sim: wait for the first /clock sample (expected at
         # ≈ bag_start + from) and count from bag_start; wall: from + elapsed. -------------------
@@ -412,16 +426,22 @@ def main() -> int:
                 start += instant - time.time()
 
             def now() -> float:
-                return wall_now(time.monotonic() - start, from_s)
+                return wall_now(time.monotonic() - start, from_s, rate)
 
         # --- the timeline --------------------------------------------------------------------
         for c in calls:
             while now() < c["t"]:
+                if participant:
+                    participant.poll()
                 rclpy.spin_once(node, timeout_sec=min(0.05, max(0.001, c["t"] - now())))
+            if participant:
+                participant.poll()
             client, sent = clients[(c["service"], c["type"])], time.monotonic()
             fired = now()
             future = client.call_async(c["_req"])
             while not future.done() and time.monotonic() - sent < c["timeout_s"]:
+                if participant:
+                    participant.poll()
                 rclpy.spin_once(node, timeout_sec=0.05)
             latency = time.monotonic() - sent
             if future.done():
@@ -448,6 +468,8 @@ def main() -> int:
         os.close(fd)
         node.destroy_node()
         rclpy.try_shutdown()
+    if participant and not interrupted:
+        participant.completed()
     if interrupted:
         sys.stderr.write("call-injector: interrupted before the timeline finished\n")
         return 1
@@ -457,4 +479,16 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    participant = None
+    try:
+        if "RIG_REPLAY_CONTROL_DIR" in os.environ:
+            from replay_coordination import Participant
+            participant = Participant.from_env("calls")
+        code = main(participant)
+        if participant and code:
+            participant.failed("call injector interrupted")
+        sys.exit(code)
+    except BaseException as exc:
+        if participant and not (isinstance(exc, SystemExit) and exc.code == 0):
+            participant.failed(exc)
+        raise

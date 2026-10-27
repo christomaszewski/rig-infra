@@ -213,7 +213,7 @@ def test_render_fields_for_the_launcher(tmp_path=None):
         assert out[6] == str(START_NS) and out[7] == "30"
         assert abs(float(out[8]) - DURATION_NS / 1e9) < 1e-6   # the CLAMPED end reaches the injector
         out = play_cmd.render(cfg, {}, pathlib.Path(d))         # bare: the trailing fields are empty
-        assert out[6:] == ("", "", "")
+        assert out[6:] == ("", "", "", "1")
         assert (play_cmd._read, play_cmd._ls) == (real_read, real_ls)
 
 

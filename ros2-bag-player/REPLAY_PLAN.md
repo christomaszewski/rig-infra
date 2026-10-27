@@ -46,3 +46,33 @@ Host tests use the existing `tests/test_*.py` scripts. `tests/test_plan_runtime.
 also runs real ROS acceptance when `rclpy` and rosbag2 are installed. Run it in a
 local ROS image with `RMW_IMPLEMENTATION=rmw_zenoh_cpp`; it creates its own isolated
 router and tiny temporary bags. Without ROS, those runtime tests skip explicitly.
+
+## Coordinated startup
+
+A coordinated invocation binds a fresh control directory and supplies
+`RIG_REPLAY_CONTROL_DIR`, `RIG_REPLAY_SESSION_ID`, `RIG_REPLAY_PLAN_ID`, and
+`RIG_REPLAY_PARTICIPANT`. The `coordination` capability advertises protocol version 1
+and the `player`, `calls`, and `readiness` components. The actual selected image must
+carry `io.rig.replay.coordination=1`, verified by the base image's runtime checker.
+Coordinated launch requires immutable runtime image pins and labels each created
+container with its session and plan IDs.
+
+The player opens the bag paused. Its clock stays on a private topic until the
+coordinator arms the session. Arm permits a constant public clock and the window
+latch restore; ordinary bag messages, recorded requests, scripted calls (including
+timestamp zero), and advancing clock-only playback remain held. The readiness
+participant checks the exact configured ROS consumer endpoints without calling
+services. All participants acknowledge one future release proposal, then release
+only after the matching commit. A missing/late commit, lost readiness, expired
+startup deadline, foreign session/plan, or abort fails closed.
+
+Participant status files include immutable `held_at_unix_s`, `ready_at_unix_s`,
+`release_at_unix_s`, and `actual_release_at_unix_s` as each phase is reached.
+Heartbeats continue through preparation, holding, and execution. Session control
+files are owned by Rig; companion processes never invent or move a release time.
+The old `RIG_REPLAY_START_AT_UNIX_S` path remains available for explicitly selected
+legacy startup and does not provide this readiness contract.
+
+The launcher also passes its resolved `play.rate` as `CALL_INJECTOR_RATE`; wall-clock
+scripts multiply elapsed time from the committed origin by that rate. Their window
+remains lower-inclusive and upper-exclusive, and startup time never shifts the origin.
