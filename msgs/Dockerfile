@@ -50,10 +50,11 @@ RUN pkgs="$(python3 -c "import os, yaml; m = yaml.safe_load(open('/opt/fleet-msg
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Local checkouts — the FLEET_MSGS_LOCAL dev loop (build-msgs.sh): build-msgs.sh passes host-side
-# snapshots of working trees as the `local-sources` named build context, which REPLACES this stage;
-# without one (the default, and any hand-run `docker build`) it stays empty and build_msgs.py clones
-# every source repo at its pin.
+# Host-side sources (build-msgs.sh): snapshots of working trees (the FLEET_MSGS_LOCAL dev loop) and
+# rig's exports of the declared pins from its local git mirrors (RIG_BUILD_SOURCES — what makes
+# `rig build --offline` work) arrive as the `local-sources` named build context, which REPLACES this
+# stage; without one (a standalone build, or any hand-run `docker build`) it stays empty and
+# build_msgs.py clones every source repo at its pin.
 FROM scratch AS local-sources
 
 FROM interfaces AS builder

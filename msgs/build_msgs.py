@@ -20,6 +20,13 @@ repo name, or the repo URL); keys that match nothing, match several repos, name 
 or collide on one repo are refused here, with the manifest in hand. An empty mount (the default)
 changes nothing.
 
+Pinned exports (rig >= v0.2.74 — `rig src sync` / `rig build --offline`): rig resolves every
+`source:` repo through its local git mirror on the host and passes the tree at the declared pin
+in the same mount, as `pinned` rows (key = the repo URL, rev = the commit rig resolved). Such a repo
+is built from the export instead of a clone, so the builder needs no network or ssh agent, and its
+provenance is exactly what a clone would record (declared ref, resolved SHA). A local checkout for
+the same repo still wins. Repos with neither are cloned here, as before (standalone builds).
+
 Provenance: alongside the install prefix this writes <prefix>/provenance.yaml — one entry per
 source repo recording the declared ref AND the commit SHA it resolved to at build time
 (`git rev-parse HEAD` on the very clone that was built, so the record cannot drift from the build).
@@ -47,10 +54,12 @@ import yaml
 class Local:
     """One sources.tsv row, written by build-msgs.sh on the host."""
     dir: str   # snapshot directory, relative to the local-sources root
-    key: str   # the FLEET_MSGS_LOCAL key, resolved against the manifest below
-    path: str  # the checkout on the host — recorded as provenance `local:`
-    ref: str   # exact tag at HEAD, else the SHA; `-dirty` when the snapshot differs from HEAD
-    rev: str   # HEAD, or `unknown` (dirty, or no git identity)
+    key: str   # the FLEET_MSGS_LOCAL key (local), or the declared repo URL (pinned)
+    path: str  # the checkout on the host — recorded as provenance `local:` (pinned: `-`)
+    ref: str   # local: exact tag at HEAD, else the SHA, `-dirty` when it differs from HEAD;
+    #            pinned: the declared ref
+    rev: str   # local: HEAD, or `unknown` (dirty, or no git identity); pinned: the commit
+    kind: str = "local"  # local | pinned (a rig export of the declared pin)
 
 
 def die(msg: str) -> None:
@@ -92,7 +101,9 @@ def build(manifest_path: str, prefix: str, local_root: str | None = None,
         packages.setdefault(repo, [])
         packages[repo] += [p for p in pkgs if p not in packages[repo]]
     # Resolved before anything is fetched or built: a typo'd key must not cost a clone first.
-    local = resolve_local(read_local(local_root), packages, apt)
+    rows = read_local(local_root)
+    local = resolve_local([r for r in rows if r.kind == "local"], packages, apt)
+    pinned = resolve_pinned([r for r in rows if r.kind == "pinned"], pins)
 
     os.makedirs(prefix, exist_ok=True)  # the final stage COPYs this even when source: is empty
     if not source:
@@ -112,12 +123,21 @@ def build(manifest_path: str, prefix: str, local_root: str | None = None,
             provenance.append({"repo": repo, "ref": loc.ref, "rev": loc.rev,
                                "packages": packages[repo], "local": loc.path})
             continue
-        if local and _is_ssh(repo) and not os.path.exists(os.environ.get("SSH_AUTH_SOCK", "")):
-            # build-msgs.sh skips agent forwarding when FLEET_MSGS_LOCAL is set and no agent is
-            # loaded, betting the local checkouts cover every ssh-form repo — this one they don't.
-            die(f"{repo} is an ssh-form repo FLEET_MSGS_LOCAL does not cover, and no ssh-agent was "
-                f"forwarded — load one on the build machine (ssh-add) or add the repo to "
-                f"FLEET_MSGS_LOCAL")
+        if repo in pinned:
+            pin = pinned[repo]
+            print(f"build_msgs: {repo}: building rig's export of '{ref}' ({pin.rev[:12]})",
+                  file=sys.stderr)
+            shutil.copytree(os.path.join(local_root, pin.dir), dest, symlinks=True)
+            provenance.append({"repo": repo, "ref": ref, "rev": pin.rev,
+                               "packages": packages[repo]})
+            continue
+        if (local or pinned) and _is_ssh(repo) and not os.path.exists(
+                os.environ.get("SSH_AUTH_SOCK", "")):
+            # build-msgs.sh skips agent forwarding when local checkouts or rig's exports are given
+            # and no agent is loaded, betting they cover every ssh-form repo — this one they don't.
+            die(f"{repo} is an ssh-form repo neither FLEET_MSGS_LOCAL nor rig's exports cover, and "
+                f"no ssh-agent was forwarded — load one on the build machine (ssh-add), add the "
+                f"repo to FLEET_MSGS_LOCAL, or build through `rig build`")
         # full clone (no --depth): `ref` may be a tag, branch, or bare SHA — all must resolve
         subprocess.run(["git", "clone", repo, dest], check=True)
         # Resolve BEFORE checkout: a NON-DEFAULT branch exists only as origin/<ref> in a fresh
@@ -172,11 +192,28 @@ def read_local(root: str | None) -> list[Local]:
     with open(index) as f:
         for n, line in enumerate(f, 1):
             fields = line.rstrip("\n").split("\t")
-            if len(fields) != 5 or not all(fields):
+            if (len(fields) not in (5, 6) or not all(fields)
+                    or (len(fields) == 6 and fields[5] not in ("local", "pinned"))):
                 die(f"{index}:{n}: malformed local-sources row {line!r} (want dir, key, path, ref, "
-                    f"rev — written by build-msgs.sh)")
+                    f"rev[, local|pinned] — written by build-msgs.sh)")
             rows.append(Local(*fields))
     return rows
+
+
+def resolve_pinned(rows: list[Local], pins: dict[str, str]) -> dict[str, Local]:
+    """repo -> rig's export of its declared pin. rig exports exactly the manifest's `source:`
+    entries, so an export for an undeclared repo, or of a different ref, is a rig/manifest
+    mismatch — refused rather than built."""
+    by_norm = {norm_repo(repo): repo for repo in pins}
+    resolved: dict[str, Local] = {}
+    for row in rows:
+        repo = by_norm.get(norm_repo(row.key))
+        if repo is None:
+            die(f"rig exported {row.key}, which the manifest does not declare under `source:`")
+        if row.ref != pins[repo]:
+            die(f"rig exported {repo} at '{row.ref}', but the manifest pins '{pins[repo]}'")
+        resolved[repo] = row
+    return resolved
 
 
 def resolve_local(rows: list[Local], packages: dict[str, list], apt: list) -> dict[str, Local]:

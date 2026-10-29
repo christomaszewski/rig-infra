@@ -169,6 +169,14 @@ The fix is one thin image, never a fat one: `fleet-ros-msgs` = the deployment's 
   With ssh-form repos and no loaded agent, the
   build skips agent forwarding and refuses, by name, any ssh repo the checkouts do not cover.
   Unset (the default), nothing changes.
+- **Offline builds (rig >= v0.2.74).** Under `rig build`, the builder no longer clones `source:`
+  repos: rig resolves each pin through its local git mirror and passes the tree in as
+  `RIG_BUILD_SOURCES`, which `build-msgs.sh` adds to the `local-sources` context as a `pinned` row.
+  Provenance is the same as a clone's (declared `ref`, resolved `rev`, no `local:`) and no ssh agent
+  is needed. `rig src sync` fills the mirrors; `rig build --offline` then builds the overlay with
+  no remote git, its apt steps coming from the build cache of an earlier online build. A
+  `FLEET_MSGS_LOCAL` checkout of the same repo still wins. Standalone `build-msgs.sh` (no rig)
+  clones in the builder as before.
 - **Consumed.** The ros2 bag logger's compose resolves
   `BAG_LOGGER_IMAGE → RIG_MSGS_IMAGE → RIG_BASE_IMAGE → composed fleet-ros ref`. The moment an
   overlay exists and `RIG_MSGS_IMAGE` names it, the logger records the fleet's custom types — no

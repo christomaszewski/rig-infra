@@ -35,6 +35,10 @@
 #                        rig-owned: `rig build` passes the caller's env through, so
 #                          FLEET_MSGS_LOCAL="sbg_msgs=$HOME/ws/sbg_driver" rig build
 #                        works on any rig. Unset = the pinned clones, unchanged.
+#   RIG_BUILD_SOURCES    rig >= v0.2.74: the `source:` repos' trees at their pins, exported from
+#                        rig's local git mirrors (see "rig's pinned exports" below) — the builder
+#                        builds them instead of cloning, which is what lets `rig build --offline`
+#                        build the overlay. Rig-owned; unset = the builder clones.
 set -eu
 registry="${1:?usage: build-msgs.sh <registry> [tag]}"
 tag="${2:-latest}"
@@ -78,16 +82,15 @@ cp "$manifest" "$ctx/msgs-manifest.yaml"
 # audit` warns about it and `rig bake` refuses it without --allow-local. PATH must be absolute:
 # rig runs this script from the service directory, so a relative path would silently mean
 # something else.
-lsrc=""
+lsrc="$work/local-sources"
+mkdir "$lsrc"
 lkeys=""
+n=0
 if [ -n "${FLEET_MSGS_LOCAL:-}" ]; then
     command -v git >/dev/null 2>&1 || {
         echo "build-msgs.sh: FLEET_MSGS_LOCAL needs git on this machine to snapshot the checkouts" >&2
         exit 1
     }
-    lsrc="$work/local-sources"
-    mkdir "$lsrc"
-    n=0
     set -f  # split the entries on whitespace, but never glob them
     for entry in $FLEET_MSGS_LOCAL; do
         key="${entry%%=*}"
@@ -154,8 +157,26 @@ if [ -n "${FLEET_MSGS_LOCAL:-}" ]; then
         n=$((n + 1))
     done
     set +f
-    if [ "$n" -eq 0 ]; then lsrc=""; fi
 fi
+
+# rig's pinned exports (RIG_BUILD_SOURCES, rig >= v0.2.74): each `source:` repo's tree at its
+# declared pin, resolved through rig's local git mirror (sources.tsv: name, repo, ref, commit).
+# They join the same local-sources context as `pinned` rows (a 6th column), so the builder builds
+# them instead of cloning — no network, no ssh agent — and provenance records the pin and commit a
+# clone would. A FLEET_MSGS_LOCAL checkout of the same repo still wins (build_msgs.py). Unset
+# (standalone builds, older rig): the builder clones as before.
+if [ -n "${RIG_BUILD_SOURCES:-}" ] && [ -f "$RIG_BUILD_SOURCES/sources.tsv" ]; then
+    tab="$(printf '\t')"
+    while IFS="$tab" read -r name repo pref sha; do
+        [ -n "$name" ] || continue
+        mkdir "$lsrc/$n"
+        cp -RP "$RIG_BUILD_SOURCES/$name/." "$lsrc/$n/"
+        printf '%s\t%s\t-\t%s\t%s\tpinned\n' "$n" "$repo" "$pref" "$sha" >> "$lsrc/sources.tsv"
+        echo "fleet-ros-msgs: ${repo} <- ${pref} ($(printf %.12s "$sha")) from rig's git mirror" >&2
+        n=$((n + 1))
+    done < "$RIG_BUILD_SOURCES/sources.tsv"
+fi
+if [ "$n" -eq 0 ]; then lsrc=""; fi
 
 # ssh-form source repos clone inside the builder via BuildKit agent forwarding — the invoking
 # machine's keys, never baked into a layer (msgs/Dockerfile's --mount=type=ssh RUN). The flag is
@@ -163,15 +184,15 @@ fi
 # An EMPTY agent forwards fine and then fails the clone confusingly (macOS git uses key files
 # directly, but BuildKit forwards the AGENT) — hence the ssh-add -l identity check, not just
 # a socket check.
-# With local checkouts and no agent, the build proceeds WITHOUT forwarding: the checkouts may cover
-# every ssh-form repo, and build_msgs.py refuses, by name, any one they leave to a clone.
+# With local checkouts or rig's exports and no agent, the build proceeds WITHOUT forwarding: they
+# may cover every ssh-form repo, and build_msgs.py refuses, by name, any one they leave to a clone.
 ssh_flag=""
 if grep -Eq '^[[:space:]]*-?[[:space:]]*repo:[[:space:]]*["'"'"']?(git@|ssh://)' "$ctx/msgs-manifest.yaml"; then
     if [ -n "${SSH_AUTH_SOCK:-}" ] && ssh-add -l >/dev/null 2>&1; then
         ssh_flag="--ssh default"
     elif [ -n "$lsrc" ]; then
         echo "build-msgs.sh: no loaded ssh-agent — building without agent forwarding; ssh-form" >&2
-        echo "  repos FLEET_MSGS_LOCAL does not cover will be refused by name" >&2
+        echo "  repos neither FLEET_MSGS_LOCAL nor rig's exports cover will be refused by name" >&2
     else
         echo "build-msgs.sh: the manifest declares ssh-form source repos, but no ssh-agent with" >&2
         echo "  loaded identities is available for BuildKit to forward. Fix on the build machine:" >&2
@@ -189,7 +210,7 @@ echo "fleet-ros-msgs: building ${ref} FROM ${base} (manifest=${manifest})${RIG_B
 export RIG_BUILD_PULL=0
 # shellcheck disable=SC2086  # optional two-word --ssh default
 rig_build "$ref" ${ssh_flag} ${lsrc:+--build-context} ${lsrc:+"local-sources=$lsrc"} \
-    ${lsrc:+--label} ${lsrc:+"io.rig.build.local=$lkeys"} \
+    ${lkeys:+--label} ${lkeys:+"io.rig.build.local=$lkeys"} \
     --build-arg "BASE_IMAGE=${base}" \
     --build-arg "ROS_DISTRO=${distro}" \
     "$ctx"

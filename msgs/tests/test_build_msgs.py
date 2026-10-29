@@ -74,14 +74,14 @@ class BuildMsgs(unittest.TestCase):
 
     def local_root(self, *rows):
         """A local-sources mount the way build-msgs.sh lays it out: <n>/ snapshots + sources.tsv.
-        rows: (key, host path, ref, rev); each snapshot holds one marker file."""
+        rows: (key, host path, ref, rev[, kind]); each snapshot holds one marker file."""
         root = self.tmp / "local"
         root.mkdir()
         lines = []
-        for n, (key, path, ref, rev) in enumerate(rows):
+        for n, (key, path, ref, rev, *kind) in enumerate(rows):
             (root / str(n)).mkdir()
-            (root / str(n) / "LOCAL_MARKER").write_text(path)
-            lines.append("\t".join([str(n), key, path, ref, rev]) + "\n")
+            (root / str(n) / "LOCAL_MARKER").write_text(f"{path} {key}")
+            lines.append("\t".join([str(n), key, path, ref, rev, *kind]) + "\n")
         if rows:
             (root / "sources.tsv").write_text("".join(lines))
         return str(root)
@@ -127,7 +127,7 @@ class BuildMsgs(unittest.TestCase):
         prov = self.run_build(local=self.local_root(("sbg_msgs", host, "v0.11.0-dirty", "unknown")))
         self.assertEqual(self.clones(), [PX4])  # px4_msgs still cloned at its pin
         built = self.ws / "src" / "repo1"
-        self.assertEqual((built / "LOCAL_MARKER").read_text(), host)
+        self.assertEqual((built / "LOCAL_MARKER").read_text(), f"{host} sbg_msgs")
         self.assertFalse((built / "CLONED_FROM").exists())
         self.assertEqual(prov["source"][1], {"repo": SBG, "ref": "v0.11.0-dirty", "rev": "unknown",
                                              "packages": ["sbg_msgs"], "local": host})
@@ -204,6 +204,50 @@ class BuildMsgs(unittest.TestCase):
         prov = self.run_build(ssh, self.local_root(("private_msgs", "/w/p", "a", "unknown")))
         self.assertEqual(self.clones(), [SBG])
         self.assertEqual(prov["source"][0]["local"], "/w/p")
+
+    def test_rig_exports_replace_the_clones_with_clone_provenance(self):
+        other = "b" * 40
+        prov = self.run_build(local=self.local_root((PX4, "-", "v1.16.0", other, "pinned"),
+                                                    (SBG, "-", "v0.11.0", SHA, "pinned")))
+        self.assertEqual(self.clones(), [])  # nothing fetched in the builder
+        self.assertEqual((self.ws / "src" / "repo0" / "LOCAL_MARKER").read_text(), f"- {PX4}")
+        self.assertEqual(prov, {"version": 1, "source": [
+            {"repo": PX4, "ref": "v1.16.0", "rev": other, "packages": ["px4_msgs"]},
+            {"repo": SBG, "ref": "v0.11.0", "rev": SHA, "packages": ["sbg_msgs"]}]})
+
+    def test_a_local_checkout_wins_over_rigs_export(self):
+        prov = self.run_build(local=self.local_root((SBG, "-", "v0.11.0", SHA, "pinned"),
+                                                    ("sbg_msgs", "/w/sbg", "x-dirty", "unknown")))
+        self.assertEqual(self.clones(), [PX4])
+        self.assertEqual(prov["source"][1]["local"], "/w/sbg")
+        self.assertEqual((self.ws / "src" / "repo1" / "LOCAL_MARKER").read_text(),
+                         "/w/sbg sbg_msgs")
+
+    def test_rig_export_mismatches_are_refused(self):
+        cases = {"does not declare under `source:`":
+                 [("https://example.invalid/x.git", "-", "v1", SHA, "pinned")],
+                 "but the manifest pins 'v0.11.0'": [(SBG, "-", "v0.12.0", SHA, "pinned")],
+                 "malformed local-sources row": [(SBG, "-", "v0.11.0", SHA, "copied")]}
+        for needle, rows in cases.items():
+            with self.subTest(needle=needle):
+                self.tearDown()
+                self.setUp()
+                self.assertIn(needle, self.capture_refusal(local=self.local_root(*rows)))
+                self.assertEqual(self.calls(), [])
+
+    def test_ssh_repo_covered_by_rigs_export_needs_no_agent(self):
+        ssh = {"source": [{"repo": "git@github.com:acme/private_msgs.git", "ref": "v1",
+                           "packages": ["private_msgs"]},
+                          {"repo": SBG, "ref": "v0.11.0", "packages": ["sbg_msgs"]}]}
+        prov = self.run_build(ssh, self.local_root(
+            ("git@github.com:acme/private_msgs.git", "-", "v1", SHA, "pinned")))
+        self.assertEqual(self.clones(), [SBG])
+        self.assertEqual(prov["source"][0], {"repo": "git@github.com:acme/private_msgs.git",
+                                             "ref": "v1", "rev": SHA, "packages": ["private_msgs"]})
+        self.tearDown()
+        self.setUp()
+        err = self.capture_refusal(ssh, self.local_root((SBG, "-", "v0.11.0", SHA, "pinned")))
+        self.assertIn("neither FLEET_MSGS_LOCAL nor rig's exports cover", err)
 
     def test_malformed_sources_row_is_refused(self):
         root = pathlib.Path(self.local_root(("sbg_msgs", "/w", "a", "unknown")))

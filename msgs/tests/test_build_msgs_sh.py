@@ -2,10 +2,11 @@
 `local-sources` named context before the script's trap deletes it. The default (FLEET_MSGS_LOCAL
 unset) argv carries no named context; with it set, each checkout is snapshotted the way git sees
 it (uncommitted edits + untracked non-ignored files; no .git, no ignored trees, no deleted files)
-through a throwaway index — the checkout's own index and working tree are untouched — and
-sources.tsv carries the identity the host saw (tag/SHA, -dirty, HEAD or unknown). The named context
-rides both rig-build.sh paths (docker build, and buildx with --platform/--push/--load). Real git,
-no daemon. Run: python3 msgs/tests/test_build_msgs_sh.py"""
+read-only — nothing is written to the checkout — and sources.tsv carries the identity the host saw
+(tag/SHA, -dirty, HEAD or unknown). rig's pinned exports ($RIG_BUILD_SOURCES) join the same
+context as `pinned` rows. The named context rides both rig-build.sh paths (docker build, and
+buildx with --platform/--push/--load). Real git, no daemon.
+Run: python3 msgs/tests/test_build_msgs_sh.py"""
 import json
 import os
 import pathlib
@@ -207,6 +208,42 @@ class BuildMsgsSh(unittest.TestCase):
         self.assertTrue((self.capture / "1/pkg/package.xml").is_file())
         (call,) = self.calls()
         self.assertIn("io.rig.build.local=a_msgs,b_msgs", call)
+
+    def rig_exports(self, *rows):
+        """$RIG_BUILD_SOURCES the way rig writes it: <name>/ trees + sources.tsv
+        (name, repo, ref, commit)."""
+        root = self.tmp / "rig-sources"
+        for name, repo, ref, sha in rows:
+            self.write(f"{name}/msg/E.msg", f"# {repo}\n", root=root)
+            (root / name / "link").symlink_to("msg/E.msg")
+        (root / "sources.tsv").write_text("".join(f"{n}\t{r}\t{f}\t{s}\n" for n, r, f, s in rows))
+        return str(root)
+
+    def test_rig_exports_join_the_context_as_pinned_rows_without_a_label(self):
+        repo = "https://github.com/acme/fleet_msgs.git"
+        sha = "f" * 40
+        proc = self.ok(RIG_BUILD_SOURCES=self.rig_exports(("m0", repo, "v1.0.0", sha)))
+        self.assertEqual(self.sources(), [["0", repo, "-", "v1.0.0", sha, "pinned"]])
+        self.assertEqual(self.snapshot(), ["link", "msg/E.msg"])
+        self.assertTrue((self.capture / "0" / "link").is_symlink())
+        self.assertIn(f"{repo} <- v1.0.0 ({sha[:12]}) from rig's git mirror", proc.stderr)
+        (call,) = self.calls()
+        self.assertIn("--build-context", call)
+        self.assertFalse(any("io.rig.build.local" in a for a in call))  # not a local build
+        # with a local checkout too: both rows, and the label names only the local key
+        self.capture_reset()
+        self.ok(RIG_BUILD_SOURCES=str(self.tmp / "rig-sources"),
+                FLEET_MSGS_LOCAL=f"a_msgs={self.repo}")
+        rows = self.sources()
+        self.assertEqual([(r[0], r[1]) for r in rows], [("0", "a_msgs"), ("1", repo)])
+        (call,) = self.calls()
+        self.assertIn("io.rig.build.local=a_msgs", call)
+
+    def test_rig_exports_cover_ssh_repos_without_an_agent(self):
+        self.manifest.write_text(MANIFEST.replace("https://github.com/", "git@github.com:"))
+        proc = self.ok(RIG_BUILD_SOURCES=self.rig_exports(
+            ("m0", "git@github.com:acme/fleet_msgs.git", "v1.0.0", "f" * 40)))
+        self.assertIn("building without agent forwarding", proc.stderr)
 
     def test_buildx_paths_carry_the_named_context(self):
         self.ok(FLEET_MSGS_LOCAL=f"a_msgs={self.repo}", PUSH="1",
