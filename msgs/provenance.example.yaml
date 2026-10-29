@@ -54,3 +54,10 @@ source:
     #                       always records it; a hand-written service entry may omit it).
     # cloned_from: https://git.internal/mirrors/px4_msgs.git
     #                       optional — the remote actually cloned, when it differs from `repo`.
+    # local: /home/dev/ws/px4_msgs
+    #                       optional — the overlay's FLEET_MSGS_LOCAL dev loop: the build used this
+    #                       host checkout instead of cloning `repo`. `ref`/`rev` then describe that
+    #                       working tree (exact tag at HEAD else the SHA, `-dirty` appended when it
+    #                       had uncommitted changes; rev HEAD, or `unknown` when dirty), never the
+    #                       declared pin it replaced. `rig image audit` (>= v0.2.74) warns on it:
+    #                       a local build must not ship.

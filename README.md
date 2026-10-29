@@ -137,6 +137,38 @@ The fix is one thin image, never a fat one: `fleet-ros-msgs` = the deployment's 
   manifest is refused; the same repo at two different refs is a refusal, not a manifest-order
   guess. The manifest is baked at `/opt/fleet-msgs/manifest.yaml` as provenance for a future
   `rig image audit` check.
+- **Local checkouts (opt-in dev loop).** To record message changes that are not pushed yet, point
+  `FLEET_MSGS_LOCAL` at working trees: whitespace-separated `KEY=PATH` entries, where `KEY` names
+  one `source:` entry (a declared package, the repo name, or the repo URL) and `PATH` is absolute or
+  `~/` (rig runs the script from the service directory, so relative paths are refused). rig passes
+  the caller's env through, so it works with any rig version:
+
+  ```sh
+  FLEET_MSGS_LOCAL="sbg_msgs=$HOME/ws/sbg_driver" rig build
+  FLEET_MSGS_LOCAL="sbg_msgs=$HOME/ws/sbg_driver" FLEET_MSGS_MANIFEST=./msgs.yaml \
+    msgs/build-msgs.sh <registry> <tag>    # standalone
+  ```
+
+  Each checkout replaces the clone of exactly that repo; other repos are still cloned at their
+  pins. `build-msgs.sh` snapshots it the way git sees it: tracked files with uncommitted edits, plus
+  untracked files that are not ignored. `.git` and ignored `build/`, `install/` and `log/` trees are
+  left out, and nothing is written to the checkout, so a read-only checkout works. Submodule and
+  nested-repo contents are not included; the pinned clone does not fetch submodules either. A
+  repo with no commits yet is snapshotted the same way. The snapshots reach BuildKit as the
+  `local-sources` named build context. A named context is sent from the client like the main
+  context, so multi-arch `--push` and single-arch `--load` builds work unchanged. Unknown keys,
+  ambiguous keys, keys that name an `apt:` package, and two keys for one repo are refused before
+  anything is cloned. The baked provenance records what was built, not the pin it replaced:
+  `ref` is the exact tag at HEAD (else the SHA) with `-dirty` appended for uncommitted changes,
+  `rev` is HEAD (or `unknown` when dirty), and `local:` is the checkout path. So `rig image audit`
+  flags a clean local build at a different commit from the service image's, but it skips the SHA
+  check for a dirty one (`rev: unknown`). The image is also labelled `io.rig.build.local=<keys>`:
+  `rig image audit` (rig >= v0.2.74) warns about a labelled image or a `local:` provenance entry,
+  and `rig bake` refuses a labelled image unless given `--allow-local`. The image is still pushed
+  under the deployment's normal overlay tag, so rebuild without the variable before shipping.
+  With ssh-form repos and no loaded agent, the
+  build skips agent forwarding and refuses, by name, any ssh repo the checkouts do not cover.
+  Unset (the default), nothing changes.
 - **Consumed.** The ros2 bag logger's compose resolves
   `BAG_LOGGER_IMAGE → RIG_MSGS_IMAGE → RIG_BASE_IMAGE → composed fleet-ros ref`. The moment an
   overlay exists and `RIG_MSGS_IMAGE` names it, the logger records the fleet's custom types — no

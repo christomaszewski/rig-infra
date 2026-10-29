@@ -17,7 +17,8 @@
 # INPUT: msgs-manifest.yaml (staged into the context by build-msgs.sh) — the UNION of the `msgs:`
 # blocks declared by the deployment's service riggings (see msgs-manifest.example.yaml for the
 # schema). `apt:` entries install dpkg-tracked into /opt/ros/<distro>; `source:` entries are built in
-# a throwaway builder stage and land in /opt/fleet-msgs (merge-install).
+# a throwaway builder stage and land in /opt/fleet-msgs (merge-install). Optional second input: the
+# `local-sources` named context (opt-in local checkouts that replace `source:` clones; see below).
 #
 # TWO RECORDS BAKED, two different consumers — keep them separate:
 #   /opt/fleet-msgs/manifest.yaml    the DECLARED union, verbatim (COPYd below) — rig >= v0.2.29's
@@ -49,6 +50,12 @@ RUN pkgs="$(python3 -c "import os, yaml; m = yaml.safe_load(open('/opt/fleet-msg
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
+# Local checkouts — the FLEET_MSGS_LOCAL dev loop (build-msgs.sh): build-msgs.sh passes host-side
+# snapshots of working trees as the `local-sources` named build context, which REPLACES this stage;
+# without one (the default, and any hand-run `docker build`) it stays empty and build_msgs.py clones
+# every source repo at its pin.
+FROM scratch AS local-sources
+
 FROM interfaces AS builder
 ARG ROS_DISTRO
 # An apt-only overlay needs no compiler or repository tooling. Source overlays
@@ -60,10 +67,12 @@ RUN if python3 -c "import yaml, sys; sys.exit(not bool((yaml.safe_load(open('/op
         && rm -rf /var/lib/apt/lists/*; \
     fi
 COPY build_msgs.py /msgs/build_msgs.py
-# Agent forwarding is temporary; keys never enter an image layer.
-RUN --mount=type=ssh . /opt/ros/${ROS_DISTRO}/setup.sh \
+# Agent forwarding is temporary; keys never enter an image layer. The local snapshots are a
+# read-only bind for the same reason: build_msgs.py copies what it builds into the throwaway stage.
+RUN --mount=type=ssh --mount=type=bind,from=local-sources,target=/msgs/local \
+    . /opt/ros/${ROS_DISTRO}/setup.sh \
     && GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
-       python3 /msgs/build_msgs.py /opt/fleet-msgs/manifest.yaml /opt/fleet-msgs
+       python3 /msgs/build_msgs.py /opt/fleet-msgs/manifest.yaml /opt/fleet-msgs /msgs/local
 
 FROM interfaces AS runtime
 COPY --from=builder /opt/fleet-msgs /opt/fleet-msgs

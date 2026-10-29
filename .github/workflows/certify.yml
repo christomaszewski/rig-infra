@@ -147,6 +147,14 @@ jobs:
           ./.rig/rig certify --require-build-check --repo ros2-bag-player
       - name: certify ros1-bag-logger
         run: ./.rig/rig certify --require-build-check --repo ros1-bag-logger
+      # The msgs overlay's FLEET_MSGS_LOCAL dev loop (local checkouts instead of pinned clones):
+      # build-msgs.sh's git-aware snapshot + `local-sources` named context against a docker stub
+      # (default argv unchanged; buildx --push/--load carry the context), and build_msgs.py's key
+      # resolution, refusals and provenance with git + colcon stubbed. No daemon, no ROS.
+      - name: msgs unit tests
+        run: |
+          python3 msgs/tests/test_build_msgs_sh.py
+          python3 msgs/tests/test_build_msgs.py
       # RIG_BASE_IMAGE, consumer side: with a base exported the stacks RUN it; with none — certify's
       # view, and a standalone `docker compose` — they fall back to the composed fleet-ros pull ref.
       # A per-instance ${<SVC>_IMAGE} override still beats both.

@@ -43,3 +43,24 @@ jobs:
           docker run --rm --network none -e FLEET_TEST_MESSAGE=sbg_msgs/msg/Status \
             -v "$PWD/base/test_runtime.py:/test_runtime.py:ro" local/fleet-ros-msgs:ci \
             bash -c 'source /opt/fleet-msgs/setup.bash; python3 /test_runtime.py'
+      # FLEET_MSGS_LOCAL: the same manifest, with sbg_msgs built from a local checkout carrying an
+      # unpushed (untracked) message. The type existing proves the working tree was built, not the
+      # v0.8.2 pin; provenance must name the checkout and refuse to claim the pin's identity, and
+      # the io.rig.build.local label (what `rig bake` refuses) must name the key.
+      - name: Build message typesupport from a local checkout
+        run: |
+          git clone -q --branch v0.8.2 https://github.com/christomaszewski/sbg_driver.git /tmp/sbg_driver
+          printf 'uint8 probe\n' > /tmp/sbg_driver/src/sbg_msgs/msg/LocalProbe.msg
+          sed -i 's#  msg/AirDataStatus.msg#&\n  msg/LocalProbe.msg#' /tmp/sbg_driver/src/sbg_msgs/CMakeLists.txt
+          FLEET_MSGS_LOCAL=sbg_msgs=/tmp/sbg_driver PUSH=0 FLEET_MSGS_MANIFEST=/tmp/messages.yaml \
+            msgs/build-msgs.sh local ci-local
+          docker run --rm --network none -e FLEET_TEST_MESSAGE=sbg_msgs/msg/LocalProbe \
+            -v "$PWD/base/test_runtime.py:/test_runtime.py:ro" local/fleet-ros-msgs:ci-local \
+            bash -c 'source /opt/fleet-msgs/setup.bash; python3 /test_runtime.py'
+          docker run --rm --network none local/fleet-ros-msgs:ci-local python3 -c '
+          import yaml
+          (entry,) = yaml.safe_load(open("/opt/fleet-msgs/provenance.yaml"))["source"]
+          assert entry["local"] == "/tmp/sbg_driver", entry
+          assert (entry["ref"], entry["rev"]) == ("v0.8.2-dirty", "unknown"), entry'
+          test "$(docker image inspect --format '{{index .Config.Labels "io.rig.build.local"}}' \
+            local/fleet-ros-msgs:ci-local)" = sbg_msgs
