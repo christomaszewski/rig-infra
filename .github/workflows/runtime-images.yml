@@ -52,7 +52,8 @@ jobs:
           git clone -q --branch v0.8.2 https://github.com/christomaszewski/sbg_driver.git /tmp/sbg_driver
           printf 'uint8 probe\n' > /tmp/sbg_driver/src/sbg_msgs/msg/LocalProbe.msg
           sed -i 's#  msg/AirDataStatus.msg#&\n  msg/LocalProbe.msg#' /tmp/sbg_driver/src/sbg_msgs/CMakeLists.txt
-          FLEET_MSGS_LOCAL=sbg_msgs=/tmp/sbg_driver PUSH=0 FLEET_MSGS_MANIFEST=/tmp/messages.yaml \
+          RIG_BASE_IMAGE=local/fleet-ros:ci FLEET_MSGS_LOCAL=sbg_msgs=/tmp/sbg_driver \
+            PUSH=0 FLEET_MSGS_MANIFEST=/tmp/messages.yaml \
             msgs/build-msgs.sh local ci-local
           docker run --rm --network none -e FLEET_TEST_MESSAGE=sbg_msgs/msg/LocalProbe \
             -v "$PWD/base/test_runtime.py:/test_runtime.py:ro" local/fleet-ros-msgs:ci-local \
