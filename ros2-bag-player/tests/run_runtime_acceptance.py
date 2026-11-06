@@ -5,8 +5,11 @@ import sys
 import unittest
 
 
+MINIMUM_CASES = 17  # Includes mixed-storage multi-input playback and offline bag proxies.
+
+
 def accepted(result, count):
-    return count >= 13 and result.wasSuccessful() and not result.skipped
+    return count >= MINIMUM_CASES and result.wasSuccessful() and not result.skipped
 
 
 def main():
@@ -15,7 +18,7 @@ def main():
     count = suite.countTestCases()
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not accepted(result, count):
-        print(f"native replay acceptance requires at least 13 passing cases and no skips; "
+        print(f"native replay acceptance requires at least {MINIMUM_CASES} passing cases and no skips; "
               f"discovered={count}, skipped={len(result.skipped)}", file=sys.stderr)
         return 1
     return 0

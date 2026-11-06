@@ -134,6 +134,8 @@ jobs:
           python3 ros2-bag-player/tests/test_play_cmd_gate.py
           python3 ros2-bag-player/tests/test_release_gate.py   # + the wait/hold/release loop, world injected
           python3 ros2-bag-player/tests/test_replay_plan.py
+          python3 ros2-bag-player/tests/test_multi_input.py
+          python3 ros2-bag-player/tests/test_bag_proxy.py
           python3 ros2-bag-player/tests/test_inspect_calls.py
           python3 ros2-bag-player/tests/test_runtime_images.py
           python3 ros2-bag-player/tests/test_runtime_acceptance_runner.py

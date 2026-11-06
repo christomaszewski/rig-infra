@@ -29,6 +29,8 @@ import sys
 
 import yaml
 
+from bag_inputs import metadata_union, merged_records, open_reader, parse_selection
+
 EVENT_SUFFIX = "/_service_event"
 DEFAULT_TIMEOUT_S = 5
 
@@ -101,22 +103,21 @@ def read_events(session: str, source_mode: str) -> tuple[list[tuple], dict]:
     # The session's zero: metadata starting_time — the stamp rosbag2's /clock starts from.
     # storage_id "" = autodetect (lyrical reads mcap and db3 alike; the play side of the same
     # session auto-detects too).
-    start_ns = rosbag2_py.Info().read_metadata(session, "").starting_time.nanoseconds
-
-    reader = rosbag2_py.SequentialReader()
-    reader.open(rosbag2_py.StorageOptions(uri=session, storage_id=""),
-                rosbag2_py.ConverterOptions(input_serialization_format="cdr",
-                                            output_serialization_format="cdr"))
-    types = {t.name: t.type for t in reader.get_all_topics_and_types()}
+    inputs, planned_start = parse_selection(session)
+    infos, channels = metadata_union(inputs)
+    start_ns = min(info.starting_time.nanoseconds for info in infos)
+    if planned_start is not None and planned_start != start_ns:
+        raise ValueError("bag starting_time changed after replay planning")
+    types = {name: identity[0] for name, identity in channels.items()}
+    readers = [open_reader(item) for item in inputs]
     calls: list[tuple] = []
     missing: dict = {}
-    while reader.has_next():
+    for topic, data, t_ns, _send_ns in merged_records(readers):
         # read_next_ext: (topic, data, recv_ns, send_ns) — lyrical deprecation-warns the old
         # 3-tuple read_next. We keep the RECEIVE stamp on purpose: it is what read_next returned
         # and what play paces by, so the exported timeline stays byte-identical across the API
         # move. (send_ns — when the introspecting node published the event — is available here
         # if a future schema wants call-origin time; pre-lyrical readers only have read_next.)
-        topic, data, t_ns, _send_ns = reader.read_next_ext()
         if not topic.endswith(EVENT_SUFFIX):
             continue
         typ = types[topic]                       # pkg/srv/Name_Event

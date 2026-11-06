@@ -27,6 +27,7 @@ services:
       - ${RIG_REPLAY_SOURCE:?exported by rig replay, or by ros2-bag-player-up from source.run}:/replay:ro
       - ${BAG_PLAY_SCRIPT:?set by ros2-bag-player-up}:/play.sh:ro
       - ../tools/export_calls.py:/export_calls.py:ro   # the export-calls one-shot's tool (static, launcher-invoked via `compose run`)
+      - ../tools/bag_inputs.py:/bag_inputs.py:ro
       - ../tools/latch_restore.py:/latch_restore.py:ro # the latch pre-pass (rig-replay-window-handoff §1.2): play.sh
                                                        # backgrounds it before a WINDOWED play (from > 0), never otherwise
       - ../tools/release_gate.py:/release_gate.py:ro   # the release gate (rig-sensor-replay-plan §5): play.sh backgrounds it

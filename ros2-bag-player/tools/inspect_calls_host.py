@@ -9,6 +9,7 @@ import sys
 import uuid
 
 from inspect_calls import load_request
+from bag_inputs import resolved_inputs
 from runtime_images import native_platform, pinned_image
 
 
@@ -17,11 +18,19 @@ def command(request_path, env, name):
         raise ValueError("recorded-request inspection requires verified RIG_RUNTIME_IMAGE_PINS")
     request_path = Path(request_path).resolve(strict=True)
     request = load_request(request_path)
-    session = Path(request["session"]).resolve(strict=True)
-    if str(session) != request["session"] or not session.is_dir() or not (session / "metadata.yaml").is_file():
+    key = "session" if request["version"] == 1 else "source"
+    session = Path(request[key]).resolve(strict=True)
+    if str(session) != request[key] or not session.is_dir():
         raise ValueError("inspection session must be the canonical exact bag directory with metadata.yaml")
+    selected = ([{"path": str(session)}] if request["version"] == 1 else
+                resolved_inputs(str(session), request["bags"]))
+    for item in selected:
+        path = Path(item["path"])
+        if path.resolve() != path or not path.is_relative_to(session) or not (path / "metadata.yaml").is_file():
+            raise ValueError("inspection session must be the canonical exact bag directory with metadata.yaml")
     helper = Path(__file__).with_name("inspect_calls.py").resolve()
-    for path in (session, request_path, helper):
+    shared = Path(__file__).with_name("bag_inputs.py").resolve()
+    for path in (session, request_path, helper, shared):
         if "," in str(path):
             raise ValueError("inspection mount paths cannot contain commas")
     image = env.get("BAG_PLAYER_IMAGE") or env.get("RIG_MSGS_IMAGE") or env.get("RIG_BASE_IMAGE")
@@ -40,6 +49,7 @@ def command(request_path, env, name):
             "--mount", f"type=bind,src={session},dst=/bag,readonly",
             "--mount", f"type=bind,src={request_path},dst=/request.json,readonly",
             "--mount", f"type=bind,src={helper},dst=/inspect_calls.py,readonly",
+            "--mount", f"type=bind,src={shared},dst=/bag_inputs.py,readonly",
             "--entrypoint", "/bin/bash", image, "-c",
             'set -e; . "/opt/ros/$ROS_DISTRO/setup.bash"; '
             'if [ -f /opt/fleet-msgs/setup.bash ]; then . /opt/fleet-msgs/setup.bash; fi; '

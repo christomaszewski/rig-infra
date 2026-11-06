@@ -8,6 +8,7 @@ Fleet-specific message/service types remain the interface overlay's responsibili
 from __future__ import annotations
 
 import json
+import argparse
 from pathlib import Path
 import re
 import subprocess
@@ -16,7 +17,8 @@ import tempfile
 
 PLAY_FLAGS = {"--remap", "--clock", "--start-offset", "--playback-duration", "--start-paused",
               "--publish-service-requests", "--service-requests-source", "--services", "--topics",
-              "--exclude-regex", "--rate", "--loop", "--playback-until-nsec"}
+              "--exclude-regex", "--rate", "--loop", "--playback-until-nsec",
+              "--input", "--message-order"}
 
 
 def require(condition, description):
@@ -55,6 +57,7 @@ def check_runtime():
     import yaml
 
     from ros2bag.verb.play import PlayVerb
+    from ros2bag.api import input_bag_arg_to_storage_options
     require(callable(PlayVerb.add_arguments), "rosbag2 playback selector parser")
     help_text = cli_help("play", PLAY_FLAGS)
     if "client_introspection" not in help_text or "service_introspection" not in help_text:
@@ -105,6 +108,7 @@ def check_runtime():
     message = message_type(data="rig replay runtime v1")
     payload = serialize_message(message)
     with tempfile.TemporaryDirectory(prefix="rig-replay-runtime-") as temporary:
+        inputs = []
         for storage in ("mcap", "sqlite3"):
             path = Path(temporary) / storage
             writer = rosbag2_py.SequentialWriter()
@@ -113,7 +117,7 @@ def check_runtime():
             writer.create_topic(rosbag2_py.TopicMetadata(id=0, name="/runtime_check",
                 type="std_msgs/msg/String", serialization_format="cdr"))
             for stamp in (1_000_000_000, 2_000_000_000):
-                writer.write("/runtime_check", payload, stamp)
+                writer.write("/runtime_check", payload, recv_timestamp=stamp, send_timestamp=stamp - 100)
             writer.close()
             reader = rosbag2_py.SequentialReader()
             reader.open(rosbag2_py.StorageOptions(uri=str(path), storage_id="",
@@ -126,8 +130,11 @@ def check_runtime():
             reader.seek(1_000_000_000)
             require(reader.get_all_topics_and_types()[0].type == "std_msgs/msg/String", "topic type discovery")
             require(reader.has_next(), "bounded reader first message")
-            topic, data, stamp, _ = reader.read_next_ext()
+            topic, data, stamp, sent = reader.read_next_ext()
             require(topic == "/runtime_check" and stamp == 1_000_000_000, "extended reader timestamps")
+            # SQLite stores only reception time; MCAP preserves both timestamps for proxies.
+            if storage == "mcap":
+                require(sent == 999_999_900, "MCAP distinct send/receive timestamp preservation")
             require(deserialize_message(data, message_type) == message, "message deserialization")
             # Storage plugins may treat end_time_ns as a hint; latch_restore also enforces
             # its cutoff on each received timestamp, so storage-side enforcement is not v1.
@@ -142,7 +149,16 @@ def check_runtime():
                            check=True, capture_output=True, text=True, timeout=30)
             require(rosbag2_py.Info().read_metadata(str(path), "").message_count == 2,
                     storage + " reindexed message count")
-    return {"io.rig.rosbag2.replay": "1", "io.rig.replay.coordination": "1", "storage": ["mcap", "sqlite3"]}
+            inputs += ["--input", str(path), storage]
+        parser = argparse.ArgumentParser()
+        PlayVerb().add_arguments(parser, "ros2 bag play")
+        parsed = parser.parse_args(inputs + ["--message-order", "received"])
+        options = input_bag_arg_to_storage_options(parsed.input, "")
+        require(not parsed.bag_path and len(options) == 2, "native repeated --input parsing")
+        require([option.storage_id for option in options] == ["mcap", "sqlite3"], "mixed storage inputs")
+        require(parsed.message_order == "received", "explicit received message order")
+    return {"io.rig.rosbag2.replay": "1", "io.rig.rosbag2.multi_input": "1",
+            "io.rig.replay.coordination": "1", "storage": ["mcap", "sqlite3"]}
 
 
 if __name__ == "__main__":

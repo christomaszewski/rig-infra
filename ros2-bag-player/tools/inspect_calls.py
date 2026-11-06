@@ -16,6 +16,8 @@ import re
 import sys
 import time
 
+from bag_inputs import metadata_union, merged_records, open_reader, resolved_inputs, validate_bags
+
 EVENT_SUFFIX = "/_service_event"
 MAX_REQUEST_BYTES = 256 * 1024
 SCAN_TIMEOUT_S = 75
@@ -23,13 +25,17 @@ REQUEST_SENT, REQUEST_RECEIVED, RESPONSE_SENT, RESPONSE_RECEIVED = range(4)
 
 
 def validate_request(value):
-    fields = {"version", "session", "start_ns", "from_s", "to_s", "services", "source_mode"}
+    if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] not in (1, 2):
+        raise ValueError("inspection request version must be 1 or 2")
+    fields = {"version", "start_ns", "from_s", "to_s", "services", "source_mode"}
+    fields |= {"session"} if value["version"] == 1 else {"source", "bags"}
     if not isinstance(value, dict) or set(value) != fields:
-        raise ValueError("inspection request must contain exactly the v1 request fields")
-    if type(value["version"]) is not int or value["version"] != 1:
-        raise ValueError("inspection request version must be 1")
-    if not isinstance(value["session"], str) or not Path(value["session"]).is_absolute():
-        raise ValueError("inspection session must be an absolute exact bag directory")
+        raise ValueError("inspection request must contain exactly the versioned request fields")
+    path_key = "session" if value["version"] == 1 else "source"
+    if not isinstance(value[path_key], str) or not Path(value[path_key]).is_absolute():
+        raise ValueError(f"inspection {path_key} must be an absolute directory")
+    if value["version"] == 2:
+        validate_bags(value["bags"])
     if type(value["start_ns"]) is not int or not 0 <= value["start_ns"] < 2**63:
         raise ValueError("inspection start_ns must be a nonnegative int64")
     for name in ("from_s", "to_s"):
@@ -116,18 +122,14 @@ def inspect(request, session=None, *, budget_s=SCAN_TIMEOUT_S):
     from rosidl_runtime_py.utilities import get_service
     import rosbag2_py
 
-    session = str(session or request["session"])
-    metadata = rosbag2_py.Info().read_metadata(session, "")
-    if metadata.starting_time.nanoseconds != request["start_ns"]:
+    if request["version"] == 2:
+        inputs = resolved_inputs(str(session or request["source"]), request["bags"])
+    else:
+        inputs = [{"path": str(session or request["session"]), "storage": ""}]
+    metadata, channel_types = metadata_union(inputs)
+    if min(info.starting_time.nanoseconds for info in metadata) != request["start_ns"]:
         raise ValueError("bag starting_time changed after replay planning")
-    reader = rosbag2_py.SequentialReader()
-    reader.open(rosbag2_py.StorageOptions(uri=session, storage_id=""),
-                rosbag2_py.ConverterOptions("cdr", "cdr"))
-    available = {}
-    for topic in reader.get_all_topics_and_types():
-        if topic.name in available and available[topic.name] != topic.type:
-            raise ValueError(f"conflicting recorded types for {topic.name}")
-        available[topic.name] = topic.type
+    available = {name: identity[0] for name, identity in channel_types.items()}
     summaries = {name: ServiceSummary() for name in request["services"]}
     supported = {}
     for name, summary in summaries.items():
@@ -150,19 +152,16 @@ def inspect(request, session=None, *, budget_s=SCAN_TIMEOUT_S):
             continue
         supported[topic] = (summary, event_class)
     if supported:
-        if not reader.set_read_order(rosbag2_py.ReadOrder(
-                sort_by=rosbag2_py.ReadOrderSortBy.ReceivedTimestamp, reverse=False)):
-            raise RuntimeError("storage cannot inspect service events in received timestamp order")
-        reader.set_filter(rosbag2_py.StorageFilter(topics=list(supported),
-                                                 services_events=list(supported)))
+        readers = [open_reader(item) for item in inputs]
         lower = request["start_ns"] + int(request["from_s"] * 1e9)
         upper = (request["start_ns"] + int(request["to_s"] * 1e9)
                  if request["to_s"] is not None else None)
-        reader.seek(lower)
-        while reader.has_next():
+        for reader in readers:
+            reader.set_filter(rosbag2_py.StorageFilter(topics=list(supported), services_events=list(supported)))
+            reader.seek(lower)
+        for topic, payload, received_ns, _sent_ns in merged_records(readers):
             if time.monotonic() >= deadline:
                 raise TimeoutError("service-event inspection exceeded its 75-second scan budget")
-            topic, payload, received_ns, _sent_ns = reader.read_next_ext()
             if upper is not None and received_ns >= upper:
                 break
             # rosbag2 StorageFilter.topics alone can also return service-event topics.

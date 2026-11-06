@@ -111,6 +111,8 @@ import sys
 
 import yaml
 
+from bag_inputs import known_schema_hash, resolved_inputs, selection_token, validate_bags
+
 STAMP_RE = re.compile(r"_\d{8}T\d{6}Z$")  # the logger's runtime UTC stamp suffix
 LATCH_READY = "/tmp/latch_restore.ready"   # in-container marker: the pre-pass has published
 LATCH_WAIT_S = 60                          # bound on how long play.sh waits for that marker
@@ -248,6 +250,11 @@ def read_bag_bounds(text: str, where: str) -> tuple[int, int]:
                          "metadata.yaml?")
     if start < 0 or duration < 0:
         raise SystemExit(f"play_cmd: {where} carries a negative starting_time/duration")
+    if duration == 0:
+        counts = [row.get("message_count", 0) for row in info.get("topics_with_message_count", [])]
+        if not any(type(count) is int and count > 0 for count in counts):
+            raise SystemExit(f"play_cmd: {where} has zero duration without recorded messages")
+        duration = 1  # Nonempty same-timestamp bags span one logical nanosecond; metadata stays unchanged.
     return start, duration
 
 
@@ -305,11 +312,37 @@ def apply_plan(cfg, env, read, *, inspect=False):
         plan = json.loads(read(path))
     except (TypeError, ValueError) as exc:
         raise SystemExit(f"play_cmd: invalid replay plan: {exc}")
-    if not isinstance(plan, dict) or type(plan.get("version")) is not int or plan["version"] != 1:
-        raise SystemExit("play_cmd: replay plan version must be 1")
+    if not isinstance(plan, dict) or type(plan.get("version")) is not int or plan["version"] not in (1, 2):
+        raise SystemExit("play_cmd: replay plan version must be 1 or 2")
     _strict(plan, "replay plan", {"version", "source", "bag", "topics", "remap", "services",
-                                 "services_source", "calls", "clock_only"})
-    bag = _strict(plan.get("bag"), "replay plan bag", {"logger", "session", "start_ns", "duration_ns"})
+                                 "services_source", "calls", "clock_only", "bags", "timeline", "proxy"})
+    if plan["version"] == 2:
+        if "bag" in plan:
+            raise SystemExit("play_cmd: v2 plan uses bags and timeline, not bag")
+        try:
+            validate_bags(plan.get("bags"), allow_unresolved_storage=inspect)
+        except ValueError as exc:
+            raise SystemExit(f"play_cmd: {exc}") from exc
+        timeline = _strict(plan.get("timeline"), "replay plan timeline", {"start_ns", "duration_ns"})
+        if any(not (inspect and timeline.get(key) is None) and
+               (type(timeline.get(key)) is not int or timeline[key] < minimum)
+               for key, minimum in (("start_ns", 0), ("duration_ns", 1))):
+            raise SystemExit("play_cmd: v2 timeline requires nonnegative start_ns and positive duration_ns")
+        bag = {**plan["bags"][0], **timeline}
+    else:
+        if "bags" in plan or "timeline" in plan:
+            raise SystemExit("play_cmd: v1 plan uses one bag")
+        bag = _strict(plan.get("bag"), "replay plan bag", {"logger", "session", "start_ns", "duration_ns"})
+    if "proxy" in plan:
+        proxy = plan["proxy"]
+        if (not isinstance(proxy, dict) or set(proxy) != {"export_id", "time_source", "deduplication"}
+                or not isinstance(proxy["export_id"], str) or not re.fullmatch(r"[0-9a-f]{64}", proxy["export_id"])
+                or proxy["time_source"] not in ("received", "sent", "sensor")
+                or proxy["deduplication"] not in ("off", "conservative", "aggressive")):
+            raise SystemExit("play_cmd: proxy requires exactly a full lowercase 64-hex export_id, "
+                             "time_source received|sent|sensor, and deduplication off|conservative|aggressive")
+        if plan["version"] != 2 or len(plan["bags"]) != 1:
+            raise SystemExit("play_cmd: proxy requires a v2 plan with one combined bag artifact")
     for key in ("logger", "session"):
         value = bag.get(key)
         if not isinstance(value, str) or not value or "/" in value or value in (".", ".."):
@@ -348,10 +381,14 @@ def apply_plan(cfg, env, read, *, inspect=False):
         env["RIG_REPLAY_TOPICS"] = " ".join(topics)
     else:
         # Exact match-nothing allow-list: unlike exclude-regex it does not suppress service calls.
-        meta = {} if inspect else (yaml.safe_load(read(os.path.join(
-            env["RIG_REPLAY_SOURCE"], "bags", bag["logger"], bag["session"], "metadata.yaml")) or "") or {})
-        existing = {t.get("topic_metadata", {}).get("name") for t in
-                    meta.get("rosbag2_bagfile_information", {}).get("topics_with_message_count", [])}
+        inputs = (resolved_inputs(env["RIG_REPLAY_SOURCE"], plan["bags"], allow_unresolved_storage=inspect)
+                  if plan["version"] == 2 else
+                  [{"path": os.path.join(env["RIG_REPLAY_SOURCE"], "bags", bag["logger"], bag["session"])}])
+        existing = set()
+        for item in inputs:
+            meta = {} if inspect else (yaml.safe_load(read(os.path.join(item["path"], "metadata.yaml")) or "") or {})
+            existing.update(t.get("topic_metadata", {}).get("name") for t in
+                            meta.get("rosbag2_bagfile_information", {}).get("topics_with_message_count", []))
         sentinel = "/__rig_replay_no_data__"
         while sentinel in existing:
             sentinel += "_"
@@ -435,6 +472,27 @@ def playback_rate(play):
     return rate
 
 
+def timing_policy(play):
+    """Validate proxy-authoring policy; native replay always consumes receive timestamps."""
+    mode = play.get("time_source", "received")
+    if mode not in ("received", "sent", "sensor"):
+        raise SystemExit("play_cmd: play.time_source must be received, sent or sensor")
+    fallback = play.get("timestamp_fallback", "error")
+    if fallback not in ("error", "received", "sent"):
+        raise SystemExit("play_cmd: play.timestamp_fallback must be error, received or sent")
+    field = play.get("sensor_timestamp_field", "header.stamp")
+    fields = play.get("topic_timestamp_fields", {})
+    if (not isinstance(fields, dict) or any(not isinstance(k, str) or not k.startswith("/") for k in fields)
+            or any(not isinstance(v, str) or not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", v)
+                   for v in [field, *fields.values()])):
+        raise SystemExit("play_cmd: timestamp fields must be dotted message field paths")
+    for key, default in (("max_clock_skew_s", 60), ("dedup_window_ms", 100)):
+        value = play.get(key, default)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise SystemExit(f"play_cmd: play.{key} must be finite and nonnegative")
+    return mode
+
+
 def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str, list[str],
                                                                    list[str], dict]:
     """(name, host-source-dir, container-session-path, play argv AFTER the path, warnings,
@@ -452,8 +510,15 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
     play = _strict(cfg.get("play"), "play",
                    {"topics", "exclude", "rate", "loop", "start_offset_s", "end_offset_s",
                     "start_paused", "services", "services_source",
-                    "clock"})  # `clock` recognized only to refuse it by name below
+                    "clock", "time_source", "sensor_timestamp_field", "timestamp_fallback",
+                    "topic_timestamp_fields", "max_clock_skew_s", "dedup_window_ms"})
     warns: list[str] = []
+    time_source = timing_policy(play)
+    proxy = (plan or {}).get("proxy")
+    if proxy and "time_source" in play and proxy["time_source"] != time_source:
+        raise SystemExit("play_cmd: play.time_source disagrees with selected proxy timing; select/build a matching proxy")
+    if time_source != "received" and not proxy:
+        raise SystemExit("play_cmd: non-received timing requires an offline bag proxy; build/select a proxy first")
 
     if "clock" in play:
         raise SystemExit("play_cmd: play.clock is refused — the sim clock is rig-owned, one token "
@@ -468,9 +533,19 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
     if not os.path.isabs(source):
         raise SystemExit(f"play_cmd: source run must be an absolute host path (got {source!r})")
     logger = str(src.get("logger") or "bag_logger")
-    session = resolve_session(source, logger, str(src.get("session") or "latest"), ls, warns)
-    container_path = f"/replay/bags/{logger}/{session}"
-    host_session = os.path.join(source, "bags", logger, session)
+    inputs = resolved_inputs("/replay", plan["bags"]) if plan and plan["version"] == 2 else None
+    if inputs:
+        host_inputs = resolved_inputs(source, plan["bags"])
+        source_root = pathlib.Path(source).resolve()
+        for item in host_inputs:
+            if not pathlib.Path(item["path"]).resolve().is_relative_to(source_root):
+                raise SystemExit("play_cmd: selected bag escapes source root through a symlink")
+        container_path, host_session = inputs[0]["path"], host_inputs[0]["path"]
+    else:
+        session = resolve_session(source, logger, str(src.get("session") or "latest"), ls, warns)
+        container_path = f"/replay/bags/{logger}/{session}"
+        host_session = os.path.join(source, "bags", logger, session)
+        host_inputs = [{"path": host_session}]
 
     # --- the topic selection (§1.1: env XOR env; config governs standalone) --------------------
     t_env = str(env.get("RIG_REPLAY_TOPICS") or "").split()
@@ -498,20 +573,42 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
     from_s, to_s = resolve_window(play, env, warns)
     bag_start_ns, clamped = None, False
     if from_s > 0 or to_s is not None or calls or plan:
-        meta_path = os.path.join(host_session, "metadata.yaml")
-        text = read(meta_path)
-        if text is None:
-            what = "a window" if (from_s > 0 or to_s is not None) else "the call injector"
-            raise SystemExit(f"play_cmd: {what} needs the session's metadata.yaml (bag start + "
-                             f"duration — the ONE zero every `t` counts from) but none is "
-                             f"readable at {meta_path}")
-        bag_start_ns, duration_ns = read_bag_bounds(text, meta_path)
-        if plan and any(plan["bag"].get(k) is not None and plan["bag"][k] != value
+        bounds, channel_types, channel_hashes = [], {}, {}
+        for item in host_inputs:
+            meta_path = os.path.join(item["path"], "metadata.yaml")
+            text = read(meta_path)
+            if text is None:
+                what = "a window" if (from_s > 0 or to_s is not None) else "the call injector"
+                raise SystemExit(f"play_cmd: {what} needs the session's metadata.yaml (bag start + "
+                                 f"duration — the ONE zero every `t` counts from) but none is "
+                                 f"readable at {meta_path}")
+            bounds.append(read_bag_bounds(text, meta_path))
+            info = (yaml.safe_load(text) or {}).get("rosbag2_bagfile_information", {})
+            if inputs and info.get("storage_identifier") != item["storage"]:
+                raise SystemExit(f"play_cmd: bag storage changed after planning: {meta_path}")
+            for row in info.get("topics_with_message_count", []):
+                topic = row.get("topic_metadata", {})
+                name_key = topic.get("name")
+                identity = (topic.get("type"), topic.get("serialization_format", "cdr"))
+                if name_key in channel_types and channel_types[name_key] != identity:
+                    raise SystemExit(f"play_cmd: conflicting recorded types/serialization for {name_key}")
+                schema_hash = known_schema_hash(topic.get("type_description_hash"))
+                if channel_hashes.get(name_key) and schema_hash and channel_hashes[name_key] != schema_hash:
+                    raise SystemExit(f"play_cmd: conflicting recorded schema hashes for {name_key}")
+                if schema_hash:
+                    channel_hashes[name_key] = schema_hash
+                channel_types[name_key] = identity
+        bag_start_ns = min(start for start, _ in bounds)
+        duration_ns = max(start + duration for start, duration in bounds) - bag_start_ns
+        planned_timeline = plan.get("timeline", plan.get("bag", {})) if plan else {}
+        if plan and any(planned_timeline.get(k) is not None and planned_timeline[k] != value
                         for k, value in (("start_ns", bag_start_ns), ("duration_ns", duration_ns))):
             raise SystemExit("play_cmd: bag metadata changed after planning")
         from_s, to_s, clamped = validate_window(from_s, to_s, duration_ns, warns)
 
     args: list[str] = []
+    if inputs or proxy:
+        args += ["--message-order", "received"]
     rate = playback_rate(play)
     if rate != 1.0:
         args += ["-r", _num(rate)]
@@ -583,6 +680,7 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
         "calls": calls, "services_source": src_mode, "bag_start_ns": bag_start_ns,
         "from_s": from_s, "to_s": to_s, "latch": latch, "start_at": start_at,
         "clock_only": bool(plan and not plan["topics"] and not plan.get("services")),
+        "inputs": inputs,
         "duration_ns": duration_ns if plan else None, "rate": rate,
         "loop": bool(play.get("loop")), "sim_time": env.get("RIG_SIM_TIME") == "1"}
 
@@ -635,7 +733,8 @@ def zenoh_env_lines(cfg: dict, warns: list[str]) -> str:
 
 
 def play_script(path: str, args: list[str], latch: list[str],
-                start_at: float | None = None, zenoh: str = "", coordinated: bool = False) -> str:
+                start_at: float | None = None, zenoh: str = "", coordinated: bool = False,
+                inputs=None, start_ns=None) -> str:
     """play.sh text: source ROS, (windowed) start the latch pre-pass and wait — bounded — for it
     to have published, (gated) start the release-gate companion, then exec `ros2 bag play`.
     Everything is static: no runtime stamps, playback writes nothing — the release instant is a
@@ -644,6 +743,9 @@ def play_script(path: str, args: list[str], latch: list[str],
     then clobbered by the pre-pass's OLDER pre-window value, would leave subscribers holding
     stale state."""
     argv = " ".join(shlex.quote(a) for a in args)
+    input_args = [arg for item in inputs for arg in ("--input", item["path"], item["storage"])] if inputs else [path]
+    input_argv = " ".join(shlex.quote(a) for a in input_args)
+    helper_path = selection_token(inputs, start_ns) if inputs else path
     lines = [
         "#!/usr/bin/env bash",   # bash: ROS `setup.bash` is bash-only
         "set -e",
@@ -657,8 +759,8 @@ def play_script(path: str, args: list[str], latch: list[str],
     if coordinated:
         lines += ["[ -f /opt/fleet-msgs/setup.bash ] && . /opt/fleet-msgs/setup.bash",
                   "exec python3 /coordinated_player.py --latch " +
-                  shlex.quote(json.dumps([path, *latch] if latch else [])) +
-                  " -- ros2 bag play " + shlex.quote(path) + " " + argv]
+                  shlex.quote(json.dumps([helper_path, *latch] if latch else [])) +
+                  " -- ros2 bag play " + input_argv + " " + argv]
         return "\n".join(lines) + "\n"
     if latch:
         latch_argv = " ".join(shlex.quote(a) for a in latch)
@@ -670,7 +772,7 @@ def play_script(path: str, args: list[str], latch: list[str],
             "# overlay types importable in Python (the export_calls precedent); no-op without it.",
             "[ -f /opt/fleet-msgs/setup.bash ] && . /opt/fleet-msgs/setup.bash",
             f"rm -f {LATCH_READY}",
-            f"python3 /latch_restore.py {shlex.quote(path)} {latch_argv} &",
+            f"python3 /latch_restore.py {shlex.quote(helper_path)} {latch_argv} &",
             "LATCH_PID=$!",
             f"for _ in $(seq 1 {LATCH_WAIT_S * 10}); do",
             f"  [ -f {LATCH_READY} ] && break",
@@ -689,7 +791,7 @@ def play_script(path: str, args: list[str], latch: list[str],
             "# instant through rosbag2's own /rosbag2_player/resume — it dies with this container.",
             f"python3 /release_gate.py --at {start_at:.3f} &",
         ]
-    lines.append(f"exec ros2 bag play {shlex.quote(path)}{' ' + argv if argv else ''}")
+    lines.append(f"exec ros2 bag play {input_argv}{' ' + argv if argv else ''}")
     return "\n".join(lines) + "\n"
 
 
@@ -732,9 +834,11 @@ def render(cfg: dict, env: dict, repo: pathlib.Path) -> tuple[str, ...]:
         script.write_text("\n".join(text) + "\n")
     else:
         script.write_text(play_script(path, args, extras["latch"], extras["start_at"], zenoh,
-                                      coordinated=bool(env.get("RIG_REPLAY_CONTROL_DIR"))))
+                                      coordinated=bool(env.get("RIG_REPLAY_CONTROL_DIR")),
+                                      inputs=extras["inputs"], start_ns=extras["bag_start_ns"]))
     script.chmod(0o755)
-    return (name, str(script), source, path, extras["services_source"], extras["calls"],
+    helper_path = selection_token(extras["inputs"], extras["bag_start_ns"]) if extras["inputs"] else path
+    return (name, str(script), source, helper_path, extras["services_source"], extras["calls"],
             "" if extras["bag_start_ns"] is None else str(extras["bag_start_ns"]),
             _num(extras["from_s"]) if extras["from_s"] > 0 else "",
             "" if extras["to_s"] is None else _num(extras["to_s"]), _num(extras["rate"]))

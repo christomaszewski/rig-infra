@@ -38,6 +38,8 @@ import time
 
 import yaml
 
+from bag_inputs import merged_records, open_reader, parse_selection
+
 READY_PATH = "/tmp/latch_restore.ready"
 
 # ---------------------------------------------------------------------------------------------
@@ -121,24 +123,34 @@ def last_before(messages, cutoff_ns: int) -> dict:
     return last
 
 
+def merged_metadata(documents):
+    """Combine offers from every input; mixed/unknown durability never becomes latched."""
+    topics = {}
+    for document in documents:
+        for row in document["rosbag2_bagfile_information"].get("topics_with_message_count", []):
+            tm = row["topic_metadata"]
+            old = topics.setdefault(tm["name"], {**tm, "offered_qos_profiles": []})
+            if (old["type"], old.get("serialization_format", "cdr")) != (tm["type"], tm.get("serialization_format", "cdr")):
+                raise ValueError(f"conflicting recorded types/serialization for {tm['name']}")
+            profiles = tm.get("offered_qos_profiles") or []
+            if isinstance(profiles, str):
+                profiles = yaml.safe_load(profiles) or []
+            old["offered_qos_profiles"].extend(profiles or [{}])
+    return {"rosbag2_bagfile_information": {"topics_with_message_count": [
+        {"topic_metadata": topic} for topic in topics.values()]}}
+
+
 # ---------------------------------------------------------------------------------------------
 # Shell — rosbag2_py reader, rclpy publishers, the ready marker, the resident loop.
 # ---------------------------------------------------------------------------------------------
 
 def read_last(session: str, topics: list[str], cutoff_ns: int) -> dict:
     import rosbag2_py
-    reader = rosbag2_py.SequentialReader()
-    # end_time_ns bounds the storage read at the window; the loop's own cutoff is the guarantee.
-    reader.open(rosbag2_py.StorageOptions(uri=session, storage_id="", end_time_ns=cutoff_ns),
-                rosbag2_py.ConverterOptions(input_serialization_format="cdr",
-                                            output_serialization_format="cdr"))
-    reader.set_filter(rosbag2_py.StorageFilter(topics=topics))
-
-    def stream():
-        while reader.has_next():
-            topic, data, recv_ns, _send_ns = reader.read_next_ext()
-            yield topic, data, recv_ns
-    return last_before(stream(), cutoff_ns)
+    inputs, _ = parse_selection(session)
+    readers = [open_reader(item) for item in inputs]
+    for reader in readers:
+        reader.set_filter(rosbag2_py.StorageFilter(topics=topics))
+    return last_before(((topic, data, recv_ns) for topic, data, recv_ns, _ in merged_records(readers)), cutoff_ns)
 
 
 def main() -> int:
@@ -164,16 +176,21 @@ def main() -> int:
         with open(READY_PATH, "w") as f:
             f.write("empty\n" if restored == 0 else f"restored:{restored}\n")
 
-    meta_path = os.path.join(a.session, "metadata.yaml")
-    try:
-        with open(meta_path) as f:
-            metadata = yaml.safe_load(f) or {}
-    except (OSError, yaml.YAMLError) as exc:
-        raise SystemExit(f"latch_restore: cannot read {meta_path}: {exc}")
-    bag_start_ns = int(metadata["rosbag2_bagfile_information"]["starting_time"]
-                       ["nanoseconds_since_epoch"])
+    inputs, planned_start = parse_selection(a.session)
+    documents = []
+    for item in inputs:
+        meta_path = os.path.join(item["path"], "metadata.yaml")
+        try:
+            with open(meta_path) as f:
+                documents.append(yaml.safe_load(f) or {})
+        except (OSError, yaml.YAMLError) as exc:
+            raise SystemExit(f"latch_restore: cannot read {meta_path}: {exc}")
+    bag_start_ns = min(int(doc["rosbag2_bagfile_information"]["starting_time"]["nanoseconds_since_epoch"])
+                       for doc in documents)
+    if planned_start is not None and planned_start != bag_start_ns:
+        raise ValueError("bag starting_time changed after replay planning")
     cutoff = window_start_ns(bag_start_ns, a.from_s)
-    wanted = select(latched_topics(metadata), a.topics, a.exclude_regex)
+    wanted = select(latched_topics(merged_metadata(documents)), a.topics, a.exclude_regex)
     if not wanted:
         sys.stderr.write("latch-restore: no transient-local topic in the selection — nothing to "
                          "restore\n")

@@ -18,6 +18,7 @@ verbs:
   replay-capabilities: "replay-capabilities"
   replay-reindex: "replay-reindex"
   replay-inspect-calls: "replay-inspect-calls"
+  replay-export-bags: "replay-export-bags"
 ros_distro: lyrical
 tier: autonomy
 examples: [config/ros2-bag-player.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
@@ -30,6 +31,10 @@ launch_surface:
   - tools/runtime_images.py
   - ros2-bag-player-up
   - tools/play_cmd.py
+  - tools/bag_inputs.py
+  - tools/bag_proxy.py
+  - tools/bag_proxy_host.py
+  - export-profiles
   - tools/call_injector.py   # the call injector's tool (mounted, not rendered — the graph-snapshotter pattern)
   - tools/export_calls.py    # the export-calls one-shot's tool (mounted into the player)
   - tools/latch_restore.py   # the latch pre-pass of a windowed replay (mounted into the player)

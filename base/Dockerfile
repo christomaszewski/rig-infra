@@ -50,6 +50,7 @@ RUN . /opt/ros/${ROS_DISTRO}/setup.sh \
     && python3 /usr/local/lib/rig/check_replay_runtime.py
 # Advertise only after the installed runtime passes the player API/storage contract.
 LABEL io.rig.rosbag2.replay="1"
+LABEL io.rig.rosbag2.multi_input="1"
 LABEL io.rig.replay.coordination="1"
 # The ros base image's entrypoint sources /opt/ros/<distro>/setup.bash — commands like
 # `ros2 run rmw_zenoh_cpp rmw_zenohd` and the loggers' record.sh work as-is.

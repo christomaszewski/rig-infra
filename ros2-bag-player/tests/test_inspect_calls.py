@@ -82,7 +82,7 @@ class Inspection(unittest.TestCase):
         self.assertIn("sha256:" + "a" * 64, cmd)
         self.assertNotIn("registry:5000/custom:tag", cmd)
         mounts = [cmd[i + 1] for i, item in enumerate(cmd) if item == "--mount"]
-        self.assertEqual(len(mounts), 3)
+        self.assertEqual(len(mounts), 4)
         self.assertTrue(all(mount.endswith(",readonly") for mount in mounts))
         self.assertIn(f"type=bind,src={self.bag},dst=/bag,readonly", mounts)
         self.assertNotIn("compose", cmd)

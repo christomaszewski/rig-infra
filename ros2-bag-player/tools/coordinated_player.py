@@ -14,6 +14,7 @@ import sys
 import time
 
 from replay_coordination import Participant, CoordinationError
+from bag_inputs import known_schema_hash
 
 
 def selected_topics(topics, options):
@@ -42,14 +43,36 @@ def validate_selected_types(command):
     if command[:3] != ["ros2", "bag", "play"]:
         raise CoordinationError("coordinated player requires the rosbag2 CLI command")
     from ros2bag.verb.play import PlayVerb
+    from ros2bag.api import input_bag_arg_to_storage_options
     import rosbag2_py
     from rosidl_runtime_py.utilities import get_message, get_service
     from rclpy.type_support import check_for_type_support
     parser = argparse.ArgumentParser()
     PlayVerb().add_arguments(parser, "ros2 bag play")
     options = parser.parse_args(command[3:])
-    info = rosbag2_py.Info().read_metadata(options.bag_path, "")
-    for topic in selected_topics([entry.topic_metadata for entry in info.topics_with_message_count], options):
+    if options.bag_path and options.input:
+        raise CoordinationError("cannot mix positional bag and repeated input bags")
+    inputs = input_bag_arg_to_storage_options(options.input or [], "")
+    if options.bag_path:
+        inputs.append(rosbag2_py.StorageOptions(uri=options.bag_path, storage_id=""))
+    if not inputs:
+        raise CoordinationError("no input bags selected")
+    topics = {}
+    for item in inputs:
+        info = rosbag2_py.Info().read_metadata(item.uri, item.storage_id)
+        for entry in info.topics_with_message_count:
+            topic = entry.topic_metadata
+            old = topics.get(topic.name)
+            if old and (old.type, old.serialization_format) != (topic.type, topic.serialization_format):
+                raise CoordinationError(f"conflicting recorded types/serialization for {topic.name}")
+            if (old and known_schema_hash(getattr(old, "type_description_hash", ""))
+                    and known_schema_hash(getattr(topic, "type_description_hash", ""))
+                    and old.type_description_hash != topic.type_description_hash):
+                raise CoordinationError(f"conflicting recorded schema hashes for {topic.name}")
+            if old and not known_schema_hash(getattr(topic, "type_description_hash", "")):
+                continue
+            topics[topic.name] = topic
+    for topic in selected_topics(topics.values(), options):
         try:
             if topic.serialization_format != "cdr":
                 raise ValueError(f"unsupported serialization {topic.serialization_format!r}")

@@ -15,12 +15,14 @@ PYTHON="${BAG_PLAYER_PYTHON:-python3}"
 CONFIG="${1:?usage: ros2-bag-player-up <config.yaml> [up [-d]|down|status|logs|config|export-calls|...]}"; shift || true
 case "${1:-}" in
   replay-capabilities)
-    printf '%s\n' '{"plan":1,"remap":true,"clock_only":true,"reindex":true,"inspect_calls":1,"image_labels":{"bag-player":{"io.rig.rosbag2.replay":"1"}},"coordination":{"version":1,"components":["player","calls","readiness"],"image_labels":{"bag-player":{"io.rig.replay.coordination":"1"}}}}'
+    printf '%s\n' '{"plan":2,"multi_input":1,"remap":true,"clock_only":true,"reindex":true,"inspect_calls":2,"export_bags":1,"image_labels":{"bag-player":{"io.rig.rosbag2.replay":"1"}},"multi_input_image_labels":{"bag-player":{"io.rig.rosbag2.multi_input":"1"}},"coordination":{"version":1,"components":["player","calls","readiness"],"image_labels":{"bag-player":{"io.rig.replay.coordination":"1"}}}}'
     exit 0 ;;
   replay-reindex)
     exec "$PYTHON" "$REPO/tools/reindex.py" "${2:?derived bag directory required}" ;;
   replay-inspect-calls)
     exec "$PYTHON" "$REPO/tools/inspect_calls_host.py" "${2:?inspection request JSON required}" ;;
+  replay-export-bags)
+    exec "$PYTHON" "$REPO/tools/bag_proxy_host.py" "${2:?bag proxy specification JSON required}" ;;
 esac
 [ -f "$CONFIG" ] || { echo "ros2-bag-player-up: config not found: $CONFIG" >&2; exit 1; }
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"

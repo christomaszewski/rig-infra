@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "id": "arrival-conservative",
+  "revision": 1,
+  "format": "rosbag2-proxy/v1",
+  "lossy": true,
+  "policy": {
+    "time_source": "received",
+    "deduplication": "conservative",
+    "sensor_timestamp_field": "header.stamp",
+    "timestamp_fallback": "error",
+    "topic_timestamp_fields": {},
+    "max_clock_skew_s": 60.0,
+    "dedup_window_ms": 100.0
+  }
+}
