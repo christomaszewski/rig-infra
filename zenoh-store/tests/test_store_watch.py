@@ -152,6 +152,49 @@ def test_store_announces_each_file_once():
             st.stop()
 
 
+def test_store_follows_links_as_they_appear():
+    with tempfile.TemporaryDirectory() as td:
+        data = pathlib.Path(td) / "data"
+        run = data / "runs" / RUN
+        scans = run / "recordings" / "lidar_top"
+        scans.mkdir(parents=True)
+        (scans / "scan_1.laz").write_bytes(b"1" * 10)
+        (data / "current").symlink_to(f"runs/{RUN}")
+        st = Store(config.validate({}), str(data), "v1", "store")
+        rec = Recorder()
+        st.add_observer(lambda r, e: rec.on_file((e.path, e.size)))
+        st.start()
+        try:
+            store = run / "store"
+            (store / "lidar_top").mkdir()
+            os.symlink("../../recordings/lidar_top/scan_1.laz", store / "lidar_top" / "scan_1.laz")   # a file link
+            rec.wait(lambda: ("lidar_top/scan_1.laz", 10) in rec.files)
+            os.symlink("../recordings/lidar_top", store / "scans")                                   # a directory link
+            rec.wait(lambda: ("scans/scan_1.laz", 10) in rec.files)
+            rename_into_place(scans / "scan_2.laz", b"2" * 20)          # the recorder keeps writing
+            rec.wait(lambda: ("scans/scan_2.laz", 20) in rec.files)
+            os.link(scans / "scan_2.laz", store / "lidar_top" / "hard_2.laz")                       # a hard link
+            rec.wait(lambda: ("lidar_top/hard_2.laz", 20) in rec.files)
+            (pathlib.Path(td) / "outside.bin").write_bytes(b"x")
+            os.symlink(str(pathlib.Path(td) / "outside.bin"), store / "lidar_top" / "outside.bin")
+            time.sleep(0.3)
+            paths = [p for p, _ in rec.files]
+            assert "lidar_top/outside.bin" not in paths
+            assert st.index(RUN).skipped.get("lidar_top/outside.bin") == "link outside the run"
+            os.unlink(store / "scans")                                   # unlinking forgets what it shared
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and any(f["path"].startswith("scans/") for f in st.index_query("")["files"]):
+                time.sleep(0.05)
+            listed = [f["path"] for f in st.index_query("")["files"]]
+            assert listed == ["lidar_top/scan_1.laz", "lidar_top/hard_2.laz"], listed
+            assert (scans / "scan_2.laz").exists()                       # the recording is untouched
+            rename_into_place(scans / "scan_3.laz", b"3")                # no longer watched through the link
+            time.sleep(0.3)
+            assert not any(p.startswith("scans/") and "scan_3" in p for p in [p for p, _ in rec.files])
+        finally:
+            st.stop()
+
+
 def test_store_falls_back_to_polling():
     import zenoh_store.store as store_mod
     from zenoh_store.inotify import InotifyUnavailable

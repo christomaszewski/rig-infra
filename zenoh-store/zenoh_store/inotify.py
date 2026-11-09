@@ -14,10 +14,13 @@ import errno
 import logging
 import os
 import select
+import stat
 import struct
 import threading
 import time
 from typing import Callable, Optional
+
+from . import keys
 
 log = logging.getLogger(__name__)
 
@@ -104,8 +107,9 @@ class TreeWatcher:
 
     def __init__(self, root: str, on_file: Callable[[str], None], on_gone: Callable[[str], None],
                  on_rescan: Callable[[], None], settle_ms: float = 0,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, bound: Optional[str] = None):
         self.root = root
+        self.bound = bound or root          # linked directories are watched while inside this
         self.on_file, self.on_gone, self.on_rescan = on_file, on_gone, on_rescan
         self.settle_s = settle_ms / 1000.0
         self._clock = clock
@@ -143,8 +147,11 @@ class TreeWatcher:
         return os.path.join(self.root, *rel.split("/")) if rel else self.root
 
     def _add_tree(self, rel: str) -> list:
-        """Watch `rel` and every directory below it; returns the files already inside (the ones
-        written before the watch existed)."""
+        """Watch `rel` and every directory below it, through directory links that stay inside the
+        run (inotify follows a link to the directory it names). Returns the files already inside,
+        in the order they were written: the ones that landed before the watch existed."""
+        real_root = os.path.realpath(self.root)
+        real_bound = os.path.realpath(self.bound)
         files, stack = [], [rel]
         while stack:
             d = stack.pop()
@@ -157,6 +164,10 @@ class TreeWatcher:
                                 "relying on rescans", d or ".")
                     self.on_rescan()
                 continue
+            if wd in self._dirs and self._dirs[wd] != d:
+                log.warning("inotify: %s is the directory %s already watches (linked twice); "
+                            "serving it once", d, self._dirs[wd] or ".")
+                continue
             self._dirs[wd] = d
             self._wds[d] = wd
             try:
@@ -165,18 +176,27 @@ class TreeWatcher:
                         if e.name.startswith("."):
                             continue
                         child = f"{d}/{e.name}" if d else e.name
-                        if e.is_dir(follow_symlinks=False):
+                        if e.is_symlink():
+                            st, _real, why = keys.follow(e.path, real_bound, real_root)
+                            if why:
+                                files.append((0, child))      # the index records why it is skipped
+                            elif stat.S_ISDIR(st.st_mode):
+                                stack.append(child)
+                            else:
+                                files.append((st.st_mtime_ns, child))
+                        elif e.is_dir(follow_symlinks=False):
                             stack.append(child)
                         elif e.is_file(follow_symlinks=False):
                             files.append((e.stat(follow_symlinks=False).st_mtime_ns, child))
             except OSError:
                 pass
-        return [child for _, child in sorted(files)]      # in the order they were written
+        return [child for _, child in sorted(files)]
 
     def _drop_tree(self, rel: str) -> None:
         for d in [d for d in self._wds if d == rel or d.startswith(rel + "/")]:
             wd = self._wds.pop(d)
             self._dirs.pop(wd, None)
+            self._ino.remove(wd)        # a removed LINK leaves its target (and the watch) alive
 
     # ---- event loop --------------------------------------------------------------
     def _due(self) -> float:
@@ -231,16 +251,39 @@ class TreeWatcher:
                 self._drop_tree(rel)
                 self.on_gone(rel + "/")
             return
-        if mask & IN_MOVED_TO:
+        if mask & (IN_DELETE | IN_MOVED_FROM):
             self._pending.pop(rel, None)
-            self._report(rel, settled=True)
+            if rel in self._wds:            # a link to a directory went away
+                self._drop_tree(rel)
+            self.on_gone(rel)
+        elif mask & (IN_CREATE | IN_MOVED_TO):
+            self._created(rel, moved=bool(mask & IN_MOVED_TO))
         elif mask & IN_CLOSE_WRITE:
             self._report(rel, settled=False)
         elif mask & IN_MODIFY and rel in self._pending:
             self._pending[rel] = self._clock() + self.settle_s
-        elif mask & (IN_DELETE | IN_MOVED_FROM):
+
+    def _created(self, rel: str, moved: bool) -> None:
+        """A new name that is not a directory: a file renamed into place (complete), a symlink
+        (complete by construction: point links at finished files, or link a directory), a hard
+        link to an existing file (complete), or a file just opened for writing (wait for close)."""
+        full = self._abs(rel)
+        try:
+            lst = os.lstat(full)
+        except OSError:
+            return
+        if stat.S_ISLNK(lst.st_mode):
+            st, _real, why = keys.follow(full, os.path.realpath(self.bound), os.path.realpath(self.root))
+            if st is not None and stat.S_ISDIR(st.st_mode):
+                for f in self._add_tree(rel):
+                    self._report(f, settled=True)
+            else:
+                self._report(rel, settled=True)     # the index decides whether it is served
+        elif moved:
             self._pending.pop(rel, None)
-            self.on_gone(rel)
+            self._report(rel, settled=True)
+        elif stat.S_ISREG(lst.st_mode) and lst.st_nlink > 1:
+            self._report(rel, settled=True)
 
     def _report(self, rel: str, settled: bool) -> None:
         if settled or self.settle_s <= 0:

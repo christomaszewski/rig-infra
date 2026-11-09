@@ -22,7 +22,35 @@ Any vehicle service can, in one of two ways:
   is closed; set `settle_ms` for writers that close and reopen.
 - **Put** the bytes to `fleet/<vehicle>/store/<open run>/<producer>/…/<name>`. The store writes the
   file the same way. Puts to any other run, wildcard keys, deletes, names that would escape the
-  folder, and payloads over `max_put_mb` are refused and logged (health shows the last refusal).
+  folder (including through a link), and payloads over `max_put_mb` are refused and logged (health
+  shows the last refusal).
+- **Link** data the run already holds, with no second copy: a **relative** symlink under
+  `store/<producer>/` pointing at a file or a directory elsewhere in the same run. A recorder that
+  keeps laser scans in `recordings/lidar_top/` can share all of them with one link:
+
+  ```
+  runs/<run>/store/lidar_top/scans -> ../../recordings/lidar_top
+  ```
+
+  or one scan at a time, once each is complete:
+
+  ```python
+  os.symlink(os.path.relpath(scan, os.path.dirname(link)), link)   # link = <run>/store/lidar_top/clouds/<name>
+  ```
+
+  - The store follows a link only while its target stays **inside the run**. Links elsewhere,
+    dangling links, and links to a directory containing `store/` are not served; health counts them.
+  - A linked directory is watched through the link, so scans the recorder writes later are
+    announced too (renamed into place, or closed after writing). Link a single file only once it
+    is complete: the store does not watch a lone link's target for growth (rescans catch it).
+  - Keys, fetch rules and listings use the path under `store/`, not the target's.
+  - **Relative, not absolute:** the run's absolute path differs between containers and on the
+    ground.
+  - **Symlinks, not hard links:** `rig fleet sync` (`rsync -a`) carries a symlink as a link, but
+    copies a hard-linked file twice. Hard links work on the vehicle (they are announced when
+    created); they only cost transfer and ground disk.
+  - A slim export (`export_profiles`) that leaves out the link's target leaves a dangling link in
+    the export.
 
 File names must also be valid Zenoh key chunks: no `*`, `$`, `?`, `#`, no leading `.` or `@`. Other
 files are skipped and counted in health.

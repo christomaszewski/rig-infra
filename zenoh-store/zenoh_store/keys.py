@@ -11,6 +11,7 @@ verbatim (`@`) chunks, no control characters.
 from __future__ import annotations
 
 import os
+import stat
 from typing import Optional
 
 _FORBIDDEN = set("*$?#\\")
@@ -95,12 +96,39 @@ def relpath_of(root: str, path: str) -> Optional[str]:
     return rel
 
 
-def resolve(root: str, relpath: str) -> str:
-    """The absolute file for a checked relpath, refusing anything that resolves outside `root`
-    (a symlinked directory inside store/ must not expose the rest of the disk over the link)."""
-    path = os.path.join(root, *relpath.split("/"))
-    real_root = os.path.realpath(root)
-    real = os.path.realpath(path)
-    if real != real_root and not real.startswith(real_root + os.sep):
-        raise KeyError_(f"{relpath!r} resolves outside the store")
-    return path
+class OutsideRun(KeyError_):
+    """A path whose links lead outside the directory it must stay in (served as not_found)."""
+
+
+def within(real: str, real_bound: str) -> bool:
+    return real == real_bound or real.startswith(real_bound + os.sep)
+
+
+def follow(path: str, real_bound: str, real_store: str) -> tuple:
+    """Where a symlink inside store/ leads: (stat of the target, real target, None), or
+    (None, None, reason) when the store must not follow it. Links are followed only to a regular
+    file or directory inside `real_bound` (the run directory), never to a directory that contains
+    store/ itself (a cycle)."""
+    try:
+        real = os.path.realpath(path, strict=True)
+        st = os.stat(real)
+    except (OSError, RuntimeError):
+        return None, None, "dangling link"
+    if not within(real, real_bound):
+        return None, None, "link outside the run"
+    if stat.S_ISDIR(st.st_mode):
+        if within(real_store, real):
+            return None, None, "link to a directory containing store/"
+    elif not stat.S_ISREG(st.st_mode):
+        return None, None, "link to a special file"
+    return st, real, None
+
+
+def resolve(root: str, relpath: str, bound: Optional[str] = None) -> str:
+    """The real file behind a checked relpath. Symlinks are followed only while they stay inside
+    `bound` (the run directory, for gets) or `root` itself (the default, for puts): a stray link
+    must not expose the rest of the disk over the radio, and a put never writes outside store/."""
+    real = os.path.realpath(os.path.join(root, *relpath.split("/")))
+    if not within(real, os.path.realpath(bound or root)):
+        raise OutsideRun(f"{relpath!r} resolves outside the {'run' if bound else 'store'}")
+    return real

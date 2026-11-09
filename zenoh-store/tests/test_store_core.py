@@ -232,7 +232,8 @@ def test_index_scan_orders_by_mtime_then_lists_after_cursor():
         idx = RunIndex(RUN, str(root), "e1")
         changed = idx.scan(1.0)
         assert [e.path for e in changed] == ["cam/k/b.jpg", "cam/k/a.jpg"]
-        assert idx.bytes == 5 and idx.skipped == {"cam/k/bad#name.jpg", "top.jpg"}
+        assert idx.bytes == 5 and idx.skipped == {"cam/k/bad#name.jpg": "not usable as a key",
+                                                  "top.jpg": "not usable as a key"}
         files, nxt, more = idx.list(0, limit=1)
         assert [e.path for e in files] == ["cam/k/b.jpg"] and more and nxt == "e1.1"
         after, reset = idx.parse_cursor(nxt)
@@ -340,9 +341,9 @@ def test_get_whole_range_meta_sha_and_errors():
             r = st.handle_get(key, params)
             assert not r.ok and r.error["error"] == code, (key, params, r.error)
         assert st.counters["gets_failed"] == 8 and st.counters["bytes_served"] == 100 + 10 + 904
-        os.symlink(big, data / "runs" / OLD / "store" / "lidar_top" / "clouds" / "alias.laz")
+        os.symlink("1.laz", data / "runs" / OLD / "store" / "lidar_top" / "clouds" / "alias.laz")
         r = st.handle_get(keys.data_key(VID, OLD, "lidar_top/clouds/alias.laz"), "offset=0;length=10")
-        assert not r.ok and r.error["error"] == "not_found"
+        assert r.ok and r.payload == b"L" * 10 and r.attachment["size"] == 5000   # a link inside the run
 
 
 def test_put_open_run_only_and_events():
@@ -396,6 +397,52 @@ def test_index_query_and_descriptor():
         assert runs[RUN]["files"] == 6 and runs[OLD]["state"] == "sealed"
         assert d["fetch"]["rules"][0] == {"match": "*/keyframes/*.json", "fetch": "auto", "priority": 10}
         json.dumps(d, allow_nan=False)
+
+
+def link_fixture(tmp: pathlib.Path):
+    """An open run whose lidar recorder writes scans under recordings/, shared into store/ by links."""
+    data = registry(tmp)
+    run = data / "runs" / RUN
+    write(run / "recordings" / "lidar_top" / "scan_000001.laz", b"S" * 300, mtime_ns=1_000)
+    write(run / "recordings" / "lidar_top" / "scan_000002.laz", b"T" * 400, mtime_ns=2_000)
+    store = run / "store"
+    (store / "lidar_top" / "clouds").mkdir(parents=True)
+    os.symlink("../../../recordings/lidar_top/scan_000001.laz", store / "lidar_top" / "clouds" / "scan_000001.laz")
+    os.symlink("../recordings/lidar_top", store / "lidar_scans")                     # a whole directory
+    (tmp / "secret.pem").write_text("key")
+    (store / "evil").mkdir()
+    os.symlink(str(tmp / "secret.pem"), store / "evil" / "key.pem")                 # outside the run
+    os.symlink("../../../" + OLD + "/store/cam_front/keyframes/1.jpg", store / "evil" / "other_run.jpg")
+    os.symlink("nowhere.laz", store / "evil" / "dangling.laz")
+    os.symlink("../..", store / "evil" / "loop")                                    # contains store/
+    os.symlink("../recordings/lidar_top", store / "lidar_again")                    # linked twice
+    return data
+
+
+def test_links_inside_the_run_are_served_and_others_are_not():
+    with tempfile.TemporaryDirectory() as td:
+        data = link_fixture(pathlib.Path(td))
+        st = make_store(data)
+        q = st.index_query("")
+        listed = {f["path"]: (f["size"], f["fetch"]) for f in q["files"]}
+        assert listed == {"lidar_top/clouds/scan_000001.laz": (300, "auto"),          # rule: lidar_*/clouds/*.laz
+                          "lidar_scans/scan_000001.laz": (300, "on_request"),
+                          "lidar_scans/scan_000002.laz": (400, "on_request")}, listed
+        assert st.index(RUN).skipped == {"evil/key.pem": "link outside the run",
+                                         "evil/other_run.jpg": "link outside the run",
+                                         "evil/dangling.laz": "dangling link",
+                                         "evil/loop": "link to a directory containing store/",
+                                         "lidar_again": "directory linked twice"}
+        r = st.handle_get(keys.data_key(VID, RUN, "lidar_scans/scan_000002.laz"), "offset=100;length=10")
+        assert r.ok and r.payload == b"T" * 10 and r.attachment["size"] == 400
+        for path in ("evil/key.pem", "evil/other_run.jpg", "evil/dangling.laz"):
+            r = st.handle_get(keys.data_key(VID, RUN, path), "meta")
+            assert not r.ok and r.error["error"] == "not_found", (path, r.error)
+        # a put never writes through a link out of store/ (here: into recordings/)
+        r = st.handle_put(keys.data_key(VID, RUN, "lidar_scans/scan_000003.laz"), b"x")
+        assert r["error"] == "bad_key" and not (data / "runs" / RUN / "recordings" / "lidar_top" / "scan_000003.laz").exists()
+        msg = st.health()["status"][0]["message"]
+        assert "not served:" in msg and "2 link outside the run" in msg and "1 dangling link" in msg, msg
 
 
 def test_no_open_run_serves_read_only():

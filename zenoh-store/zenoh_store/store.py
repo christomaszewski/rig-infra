@@ -107,7 +107,7 @@ class Store:
             idx = self.index(self.open_run)
             log.info("store: open run %s: %d file(s), %.1f MB", self.open_run, len(idx), idx.bytes / MB)
             self.watcher = TreeWatcher(idx.root, self._on_file, self._on_gone, self._rescan_now.set,
-                                       settle_ms=self.settings["settle_ms"], clock=self._mono)
+                                       settle_ms=self.settings["settle_ms"], clock=self._mono, bound=idx.bound)
             try:
                 self.watcher.start()
                 self.watch_mode = "inotify"
@@ -151,7 +151,10 @@ class Store:
         if self.open_run is None:
             return
         idx = self.index(self.open_run)
-        idx.forget_prefix(rel) if rel.endswith("/") else idx.forget(rel)
+        if not rel.endswith("/"):
+            idx.forget(rel)
+            rel += "/"                      # it may have been a link to a directory
+        idx.forget_prefix(rel)
 
     def rescan(self) -> list:
         if self.open_run is None:
@@ -185,7 +188,7 @@ class Store:
         with self._index_lock:
             idx = self._indexes.get(run)
             if idx is None:
-                idx = RunIndex(run, self.registry.store_dir(run), self.epoch)
+                idx = RunIndex(run, self.registry.store_dir(run), self.epoch, bound=self.registry.run_dir(run))
                 self._indexes[run] = idx
         if idx.scanned_mono is None or (run != self.open_run
                                          and self._mono() - idx.scanned_mono > self.settings["sealed_ttl_s"]):
@@ -221,9 +224,11 @@ class Store:
             run = self.open_run
         root = self.registry.store_dir(run)
         try:
-            path = keys.resolve(root, rel)
+            path = keys.resolve(root, rel, bound=self.registry.run_dir(run))   # links: inside the run only
             offset = _int(params, "offset", 0)
             length = _int(params, "length", None, minimum=1)
+        except keys.OutsideRun:
+            return _err("not_found", f"{rel} is not in run {run} (it links outside the run)")
         except keys.KeyError_ as e:
             return _err("bad_key", str(e))
         except RangeError as e:
@@ -352,7 +357,7 @@ class Store:
         level, problems = 0, []
         if self.open_run is not None:
             idx = self.index(self.open_run)
-            values.update({"files": len(idx), "bytes": idx.bytes, "skipped_names": len(idx.skipped),
+            values.update({"files": len(idx), "bytes": idx.bytes, "skipped": len(idx.skipped),
                            "rescan_age_s": round(now_mono - idx.scanned_mono, 1) if idx.scanned_mono else None})
             if self.watcher is not None:
                 values.update({"watched_dirs": self.watcher.watching, "overflows": self.watcher.overflows})
@@ -362,7 +367,10 @@ class Store:
             message = f"run {self.open_run}: {len(idx)} file(s), {idx.bytes / MB:.1f} MB"
             if idx.skipped:
                 level = max(level, 1)
-                problems.append(f"{len(idx.skipped)} file name(s) unusable as keys")
+                reasons: dict = {}
+                for why in idx.skipped.values():
+                    reasons[why] = reasons.get(why, 0) + 1
+                problems.append("not served: " + ", ".join(f"{n} {why}" for why, n in sorted(reasons.items())))
         else:
             message = f"no open run; serving {len(self.registry.runs(None))} run(s) read-only"
         if self.watch_mode == "polling":

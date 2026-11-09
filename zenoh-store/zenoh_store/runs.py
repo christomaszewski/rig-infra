@@ -59,6 +59,12 @@ class Registry:
             return os.path.join(self.data_dir, "store")
         return os.path.join(self.runs_dir, run, "store")
 
+    def run_dir(self, run: str) -> str:
+        """The directory a run's store/ links may point into: the run itself (the data dir, flat)."""
+        if run == FLAT_RUN and self.flat:
+            return self.data_dir
+        return os.path.join(self.runs_dir, run)
+
     def exists(self, run: str) -> bool:
         if run == FLAT_RUN:
             return self.flat and os.path.isdir(self.data_dir)

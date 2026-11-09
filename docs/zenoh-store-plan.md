@@ -98,8 +98,15 @@ file:  <data_dir>/runs/<run_id>/store/<producer>/<path…>/<name>.<ext>
   - write a sidecar last, if there is one;
   - use unique names and never rewrite or delete (retention is per run).
 - **Put** to the data key, open run only. The store validates the key and writes the file the same
-  way. Wildcard keys, path escapes (`..`, empty or dot-prefixed chunks), deletes, and payloads over
-  `max_put_mb` are refused and logged.
+  way. Wildcard keys, path escapes (`..`, empty or dot-prefixed chunks, links out of `store/`),
+  deletes, and payloads over `max_put_mb` are refused and logged.
+- **Link** to data the run already holds (laser scans under `recordings/`, say): a relative symlink
+  under `store/<producer>/` to a file or a directory in the same run. No second copy on the vehicle,
+  and `rig fleet sync` (`rsync -a`, links preserved) carries it as a link rather than a second file.
+  - The store follows links only to targets inside the run. Anything else is not served (and
+    counted in health), so a stray link cannot expose the rest of the disk over the radio.
+  - A linked directory is watched through the link; a lone file link should point at a finished file.
+  - Hard links work on the vehicle, but `rsync -a` (no `-H`) copies them twice.
 
 **Gets** on `fleet/<vid>/store/**` are answered from disk, for any run that has a `store/`
 (`<run_id>` may be `open`):
@@ -215,6 +222,11 @@ don't share the vehicle's disk.
 - **Layout:** `fleet-runs/<label>/<vehicle>/<run-id>/store/…`, the tree `rig fleet sync` uses, so
   the later full sync finds the files already there. Vehicle names come from the `fleet.yaml`
   roster, labels from the run id.
+- **Links (open):** where the vehicle's `store/` entry is a symlink, a later `rig fleet sync`
+  replaces the mirror's fetched copy with that link. A full sync also brings the target, so
+  nothing is lost; a slim export that omits the target would leave only a dangling link. The mirror
+  should keep fetched copies of linked files where sync won't overwrite them (or place them at the
+  link's target path, which the store could report).
 
 ## Router configuration (zenoh-router example)
 

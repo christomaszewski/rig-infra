@@ -16,6 +16,7 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from . import keys
 from .keys import relpath_of
 
 
@@ -27,11 +28,18 @@ class Entry:
     seq: int
 
 
-def walk(root: str, on_skip: Optional[Callable[[str], None]] = None):
-    """(relpath, stat) of every regular file under root that fits the contract. Dot-prefixed
-    entries (temp files, hidden dirs) are skipped silently; symlinks are never followed; other
-    unusable names are reported to on_skip."""
-    stack = [root]
+def walk(root: str, bound: Optional[str] = None, on_skip: Optional[Callable[[str, str], None]] = None):
+    """(relpath, stat) of every file under root that fits the contract.
+
+    Symlinks are followed only to targets inside `bound` (the run directory; default root): a
+    linked file is listed with its target's size and mtime, a linked directory is walked like a
+    real one. That is how a producer shares data the run already holds (laser scans under
+    recordings/, say) without a second copy. Dot-prefixed entries (temp files, hidden dirs) are
+    skipped silently; anything else unusable is reported as on_skip(relpath, reason)."""
+    real_root = os.path.realpath(root)
+    real_bound = os.path.realpath(bound or root)
+    skip = on_skip or (lambda rel, why: None)
+    stack, linked_dirs = [root], set()
     while stack:
         d = stack.pop()
         try:
@@ -42,33 +50,47 @@ def walk(root: str, on_skip: Optional[Callable[[str], None]] = None):
             for e in it:
                 if e.name.startswith("."):
                     continue
+                shown = os.path.relpath(e.path, root).replace(os.sep, "/")
                 try:
-                    if e.is_dir(follow_symlinks=False):
+                    if e.is_symlink():
+                        st, real, why = keys.follow(e.path, real_bound, real_root)
+                        if why:
+                            skip(shown, why)
+                            continue
+                        if stat.S_ISDIR(st.st_mode):
+                            if real in linked_dirs:
+                                skip(shown, "directory linked twice")
+                            else:
+                                linked_dirs.add(real)
+                                stack.append(e.path)
+                            continue
+                    elif e.is_dir(follow_symlinks=False):
                         stack.append(e.path)
                         continue
-                    if not e.is_file(follow_symlinks=False):
+                    elif e.is_file(follow_symlinks=False):
+                        st = e.stat(follow_symlinks=False)
+                    else:
                         continue
-                    st = e.stat(follow_symlinks=False)
                 except OSError:
                     continue
                 rel = relpath_of(root, e.path)
                 if rel is None:
-                    if on_skip is not None:
-                        on_skip(os.path.relpath(e.path, root))
+                    skip(shown, "not usable as a key")
                     continue
                 yield rel, st
 
 
 class RunIndex:
-    def __init__(self, run: str, root: str, epoch: str):
+    def __init__(self, run: str, root: str, epoch: str, bound: Optional[str] = None):
         self.run = run
         self.root = root
+        self.bound = bound or root          # links are followed while they stay inside this
         self.epoch = epoch
         self._lock = threading.Lock()
         self._entries: dict = {}
         self._order: list = []        # (seq, path), seq ascending; stale pairs skipped on read
         self._seq = 0
-        self.skipped: set = set()     # names outside the contract (reported in health)
+        self.skipped: dict = {}       # relpath -> why it is not served (reported in health)
         self.scanned_mono: Optional[float] = None
         self.bytes = 0
 
@@ -90,16 +112,24 @@ class RunIndex:
         self._order = sorted((e.seq, p) for p, e in self._entries.items())
 
     def note(self, path: str) -> Optional[Entry]:
-        """Stat one store-relative path. Returns the entry when it is new or changed, None when
-        it is unchanged; a vanished file is forgotten."""
+        """Stat one store-relative path (through links that stay inside the run). Returns the entry
+        when it is new or changed, None when it is unchanged; a vanished file is forgotten."""
+        full = os.path.join(self.root, *path.split("/"))
         try:
-            st = os.stat(os.path.join(self.root, *path.split("/")), follow_symlinks=False)
-        except OSError:
+            real = os.path.realpath(full, strict=True)
+            st = os.stat(real)
+        except (OSError, RuntimeError):
             self.forget(path)
+            return None
+        if not keys.within(real, os.path.realpath(self.bound)):
+            self.forget(path)
+            with self._lock:
+                self.skipped[path] = "link outside the run"
             return None
         if not stat.S_ISREG(st.st_mode):
             return None
         with self._lock:
+            self.skipped.pop(path, None)
             return self._assign(path, st.st_size, st.st_mtime_ns)
 
     def forget(self, path: str) -> None:
@@ -116,9 +146,9 @@ class RunIndex:
     def scan(self, monotonic: float) -> list:
         """Reconcile with the disk. New and changed files get sequence numbers in (mtime, path)
         order, so a first scan lists the run in the order it was written. Returns them."""
-        found, skipped = {}, set()
+        found, skipped = {}, {}
         if os.path.isdir(self.root):
-            for rel, st in walk(self.root, skipped.add):
+            for rel, st in walk(self.root, self.bound, skipped.__setitem__):
                 found[rel] = (st.st_size, st.st_mtime_ns)
         changed = []
         with self._lock:
