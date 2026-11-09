@@ -168,10 +168,10 @@ class TreeWatcher:
                         if e.is_dir(follow_symlinks=False):
                             stack.append(child)
                         elif e.is_file(follow_symlinks=False):
-                            files.append(child)
+                            files.append((e.stat(follow_symlinks=False).st_mtime_ns, child))
             except OSError:
                 pass
-        return files
+        return [child for _, child in sorted(files)]      # in the order they were written
 
     def _drop_tree(self, rel: str) -> None:
         for d in [d for d in self._wds if d == rel or d.startswith(rel + "/")]:
