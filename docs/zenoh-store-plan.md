@@ -1,19 +1,19 @@
 # Vehicle store over Zenoh: plan
 
-Status: **plan**, with Phase 0 (spike) done. Decisions marked *(confirm)* are recommendations
-waiting on a yes.
+Status: **plan**, with Phase 0 (spike) done and decisions 1–6 confirmed; Phase 1 in progress.
 
 ## Goal
 
 Get selected run data, starting with camera-service's `frame-capture` keyframes (JPEG, 16-bit TIFF,
-JSON sidecars), from a vehicle to the ground **while the run is still going**. It has to survive a
+JSON sidecars) but open to any file type a service produces (point clouds, logs, reports), from a
+vehicle to the ground **while the run is still going**. It has to survive a
 spotty radio link and must not starve telemetry or commands on that link. `rig fleet sync` stays the
 way whole sealed runs come home; this covers the gap before that.
 
 ## Decisions
 
 1. **The store is a small Python service on the fleet's Zenoh binding, not `zenohd` with the
-   storage-manager and filesystem-backend plugins.** *(confirm)*
+   storage-manager and filesystem-backend plugins.**
    - We are not using Zenoh replication. Replication is symmetric: deletes propagate, and a wiped
      replica re-downloads everything. That doesn't fit a vehicle with a small disk feeding a ground
      station.
@@ -28,11 +28,14 @@ way whole sealed runs come home; this covers the gap before that.
 3. **A run's `store/` folder is the contract.** Any vehicle service can write files into it, or put
    to the matching keys. The store serves both the same way.
 4. **frame-capture writes its files straight into `store/`** (new `file_root: store`), rather than
-   putting them through the router. *(confirm)*
+   putting them through the router.
 5. **The store serves every run on disk, read-only once sealed,** so a ground station that missed
-   the end of a run can still catch up. *(confirm)*
-6. **Default ground policy:** sidecars and JPEGs as they appear; TIFFs on request or via
-   `fleet sync`. *(confirm)*
+   the end of a run can still catch up.
+6. **Nothing crosses the link unless a rule says so.** The store's config lists fetch rules by
+   path pattern. A matching file is fetched as soon as it appears (`auto`), or only the newest one is
+   (`latest`); everything else is listed but fetched only on request. The example config makes
+   keyframe sidecars and JPEGs `auto`; TIFFs, point clouds and anything else stay on request until
+   a rule names them. See [File types and fetch rules](#file-types-and-fetch-rules).
 7. **Where the ground mirror runs** (a rig row in the ground station's deployment, a laptop tool, or
    part of the dashboard): *(open)*.
 
@@ -109,9 +112,46 @@ file:  <data_dir>/runs/<run_id>/store/<producer>/<path…>/<name>.<ext>
 | Key | Kind | Content |
 |---|---|---|
 | `…/store` | liveliness + queryable | descriptor: vehicle, instance, open run, runs on disk, put limits, a chunk-size hint |
-| `…/store/index` | queryable | `?run=<id\|open>;since_ns=<mtime>;prefix=<producer/…>;limit=<n>` → `{run, files: [{key, size, mtime_ns}], next_since_ns, truncated}`; no file contents |
-| `…/store/events` | publisher | `{run, key, size, mtime_ns}` for each completed file, however it was written |
+| `…/store/index` | queryable | `?run=<id\|open>;after=<cursor>;prefix=<producer/…>;fetch=<auto\|latest\|on_request>;limit=<n>` → `{run, files: [{key, size, mtime_ns, fetch, priority}], next, truncated}`; no file contents |
+| `…/store/events` | publisher | `{run, key, size, mtime_ns, fetch, priority}` for each completed file, however it was written |
 | `…/health`, `…/health/state` | queryable / publisher | camera-service's `HEALTH.md` shape: files, bytes, free disk, last write per producer, index/inotify state. The dashboard's health widget shows it unchanged. |
+
+## File types and fetch rules
+
+Any file type works: the store serves bytes. The extension only picks the reply's encoding, from
+built-in defaults (`jpg`, `tif`, `json`, `png`, `las`, `laz`, `pcd`, `ply`, `csv`, `yaml`, `mcap`, …)
+plus any the config adds; unknown extensions are `application/octet-stream`. File names must be
+valid Zenoh key chunks (no `*`, `$`, `?`, `#`); others are skipped and counted in health.
+
+What crosses the link is decided by **fetch rules** in the store's config, so the policy is
+versioned with the vehicle's deployment and captured in each run's config snapshot:
+
+```yaml
+store:
+  fetch:                                # first match wins; unmatched files are on_request
+    - {match: "*/keyframes/*.json", fetch: auto, priority: 10}
+    - {match: "*/keyframes/*.jpg",  fetch: auto, priority: 20}
+    # - {match: "lidar_*/clouds/*.laz",    fetch: auto,   priority: 50, max_mb: 20}
+    # - {match: "lidar_*/snapshots/*.laz", fetch: latest, priority: 40}
+  mime:
+    pcd: application/x-pcd              # extension -> encoding, on top of the defaults
+```
+
+| `fetch` | The mirror… |
+|---|---|
+| `auto` | fetches every matching file as it appears |
+| `latest` | fetches only the newest matching file per directory, skipping older ones queued during an outage (situational-awareness streams) |
+| `on_request` (default) | lists it, and fetches it only when someone asks |
+
+- `match` is a path glob relative to the run's `store/` (`*` within one directory level, `**`
+  across levels).
+- `priority`: lower is fetched first, so keyframe JPEGs go ahead of a backlog of clouds.
+- `max_mb`: an `auto` or `latest` file bigger than this is treated as `on_request`.
+
+The store attaches each file's rule result (`fetch`, `priority`) to the index, events and replies.
+The mirror follows it, and the ground can only narrow it (deny patterns, a link budget). Point
+clouds are fetched in the same paced, resumable chunks as everything else, so a 30 MB cloud costs
+link time but never blocks telemetry or commands.
 
 ## Vehicle service: `zenoh-store` (rig-infra)
 
@@ -147,8 +187,9 @@ don't share the vehicle's disk.
   (small messages).
 - **Catches up** after a reconnect or its own restart by asking each store's index for anything
   newer than its saved position.
-- **Fetch rules** by glob, e.g. `**/*.json` and `**/*.jpg` live, `**/*.tif` on request. A small
-  query (or CLI) on the ground asks for more: `fetch <vehicle> <glob>`.
+- **Follows the store's fetch rules** (`auto`, `latest`, `on_request`, priority), narrowed by its own
+  config if needed. A small query (or CLI) on the ground fetches on request:
+  `fetch <vehicle> <run> <glob>`.
 - **Fetching:**
   - one request in flight per vehicle, `priority=DATA_LOW`;
   - chunks sized to the measured link rate and the target delay, clamped to 8 KB – 1 MB;
