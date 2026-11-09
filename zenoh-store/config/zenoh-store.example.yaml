@@ -1,0 +1,42 @@
+# Drop this into your deployment as config/infra/zenoh-store.yaml and reference it from vehicle.yaml's
+# `infra:` list right after the router:
+#   infra:
+#     - {name: zenoh-router, service: zenoh-router, order: 0}
+#     - {name: zenoh-store,  service: zenoh-store,  order: 1}
+#
+# The store serves every run's store/ folder (<data_dir>/runs/<id>/store/) over Zenoh:
+#   fleet/<vehicle>/store/<run>/<producer>/.../<file>       a file (whole, or ?offset=<n>;length=<n>)
+#   fleet/<vehicle>/svc/<name>/store[/index|/events]         descriptor, listings, new-file events
+#   fleet/<vehicle>/svc/<name>/health[/state]                health (camera-service HEALTH.md shape)
+# Any service may write files into the open run's store/<its instance>/... (temp name, then rename),
+# or put them to the matching key. Contract: docs/zenoh-store-plan.md.
+service: zenoh-store
+name: zenoh-store
+
+store:
+  # What crosses the link on its own. First match wins; a file no rule matches is listed and
+  # fetched only on request. Paths are relative to the run's store/: `*` stays within one
+  # directory, `**` spans directories, `{a,b}` is either.
+  #   auto        the ground fetches every matching file as it appears
+  #   latest      the ground fetches only the newest matching file per directory (skips a backlog)
+  #   on_request  listed; fetched when someone asks
+  # priority: lower is fetched first. max_mb: bigger files fall back to on_request.
+  fetch:
+    - {match: "*/keyframes/*.json", fetch: auto, priority: 10}   # frame-capture sidecars (pose, GPS)
+    - {match: "*/keyframes/*.jpg",  fetch: auto, priority: 20}   # frame-capture JPEGs
+    # - {match: "*/keyframes/*.tif",       fetch: auto,   priority: 60}             # radiometric thermal
+    # - {match: "lidar_*/clouds/*.laz",    fetch: auto,   priority: 50, max_mb: 20} # every cloud
+    # - {match: "lidar_*/snapshots/*.laz", fetch: latest, priority: 40}             # only the newest
+
+  # Extension -> Zenoh encoding, on top of the built-in table (jpg, tif, png, json, yaml, csv, txt,
+  # las, laz, pcd, ply, mcap, gz, zst, ...). Unknown extensions are served as application/octet-stream.
+  # mime:
+  #   xyz: text/x-xyz
+
+  # max_put_mb: 32          # largest put accepted on a data key
+  # max_reply_mb: 16        # largest single reply; bigger files are fetched in ranges
+  # chunk_kb: 32            # chunk size suggested to ground fetchers (Phase 0: ~0.3 s of telemetry delay at 1 Mbit/s)
+  # settle_ms: 0            # >0 for producers that write in place and close more than once
+  # rescan_s: 300           # safety-net rescan of the open run (inotify does the real work)
+  # zenoh_connect: "tcp/localhost:7447"   # default; or $ZENOH_CONNECT
+  # zenoh_listen: "tcp/127.0.0.1:0"       # default: onboard peers only, works without IPv6

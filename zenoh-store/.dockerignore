@@ -1,0 +1,9 @@
+tests
+config
+docker
+tools
+**/__pycache__
+*.md
+rigging.yaml
+zenoh-store-up
+var

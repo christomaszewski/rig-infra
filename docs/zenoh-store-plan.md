@@ -1,6 +1,7 @@
 # Vehicle store over Zenoh: plan
 
-Status: **plan**, with Phase 0 (spike) done and decisions 1–6 confirmed; Phase 1 in progress.
+Status: Phase 0 (spike) done, decisions 1–6 confirmed, Phase 1 vehicle service built
+([zenoh-store/](../zenoh-store/)); the plugin's `file_root: store` is next.
 
 ## Goal
 
@@ -100,21 +101,33 @@ file:  <data_dir>/runs/<run_id>/store/<producer>/<path…>/<name>.<ext>
   way. Wildcard keys, path escapes (`..`, empty or dot-prefixed chunks), deletes, and payloads over
   `max_put_mb` are refused and logged.
 
-**Gets** on `fleet/<vid>/store/**` are answered from disk, for any run that has a `store/`:
-- `…/<file>`: the whole file. Meant for small files; the mirror chunks anything bigger than its
-  chunk size.
+**Gets** on `fleet/<vid>/store/**` are answered from disk, for any run that has a `store/`
+(`<run_id>` may be `open`):
+- `…/<file>`: the whole file, up to `max_reply_mb`. Meant for small files; the mirror chunks
+  anything bigger than its chunk size.
 - `…/<file>?offset=<n>;length=<n>`: that byte range.
-- Every reply carries an attachment `{"size", "offset", "mtime_ns"}` and an encoding taken from the
-  extension. A missing file or bad range is a `reply_err` with `{"error": …}`.
+- `…/<file>?meta`: the attachment only; `?meta;sha256` adds the file's digest.
+- Every reply carries an attachment `{"size", "offset", "mtime_ns", "fetch", "priority"}` and an
+  encoding taken from the extension.
+- Errors are a `reply_err` with `{"error": <code>, "detail": …}`: `bad_key` (including any wildcard
+  get: list with the index instead), `no_such_run`, `not_found`, `bad_range`, `too_large`, `busy`.
 
 ### Management (`fleet/<vid>/svc/<instance>/store…`)
 
 | Key | Kind | Content |
 |---|---|---|
 | `…/store` | liveliness + queryable | descriptor: vehicle, instance, open run, runs on disk, put limits, a chunk-size hint |
-| `…/store/index` | queryable | `?run=<id\|open>;after=<cursor>;prefix=<producer/…>;fetch=<auto\|latest\|on_request>;limit=<n>` → `{run, files: [{key, size, mtime_ns, fetch, priority}], next, truncated}`; no file contents |
-| `…/store/events` | publisher | `{run, key, size, mtime_ns, fetch, priority}` for each completed file, however it was written |
+| `…/store/index` | queryable | `?run=<id\|open>;after=<cursor>;prefix=<producer/…>;fetch=<auto,latest,…>;limit=<n>` → `{run, state, files: [{path, size, mtime_ns, fetch, priority}], next, more, reset}`; no file contents |
+| `…/store/events` | publisher | `{run, path, size, mtime_ns, fetch, priority, cursor}` for each new or changed file, however it was written |
 | `…/health`, `…/health/state` | queryable / publisher | camera-service's `HEALTH.md` shape: files, bytes, free disk, last write per producer, index/inotify state. The dashboard's health widget shows it unchanged. |
+
+**Cursors.** The store numbers files in the order it sees them (new, or changed: an appended log
+is listed again). A cursor is `<epoch>.<seq>`; `after=<cursor>` lists what came since, and each
+event carries its own cursor, so a mirror that follows events can resume the index from the last
+one and spot a gap. Sequence numbers, not mtimes, because a vehicle clock that jumps after boot
+(GPS/NTP sync) would otherwise hide files. The epoch names the store process: after a restart an old
+cursor gets the listing from the start with `reset: true`, and the mirror skips what it already
+holds (asking for `fetch=auto,latest` keeps that listing small).
 
 ## File types and fetch rules
 
@@ -163,11 +176,15 @@ link time but never blocks telemetry or commands.
   compose variable, which would get frozen into baked artifacts). Rig refuses to rotate a run while
   any row is up, so the store restarts at every run boundary, like the plugin. Replay runs get their
   own run ids.
-- **Index:** in memory, `{key: (size, mtime)}`. One scan of every run's `store/` at startup, inotify
-  on the open run, a rescan every few minutes as a safety net. Sealed runs are scanned on first use
-  and cached.
+- **Index:** in memory, `{path: (size, mtime, seq)}`. The open run is scanned at startup, then kept
+  live by inotify (rename into place, close after writing, new directories, overflow → rescan),
+  with a rescan every `rescan_s` as a safety net, or every 2 s if inotify is unavailable. Sealed
+  runs are scanned on first use and cached for `sealed_ttl_s`.
 - **Session:** Zenoh peer connecting to `tcp/localhost:7447` (`ZENOH_CONNECT` overrides), same
-  settings as camera-service's control plane.
+  settings as camera-service's control plane, listening on loopback only. Zenoh's default peer
+  listener (`tcp/[::]:0`) fails to open where IPv6 is disabled, and nothing off the vehicle needs to
+  dial the store directly. Gets are answered by worker threads (`busy` when the queue is full),
+  puts are written by one thread.
 - **Failure behaviour:**
   - no `data_dir`, or no open run: serves what is on disk and refuses puts;
   - disk errors: the put is refused, and health goes WARN or ERROR;
@@ -230,6 +247,6 @@ don't share the vehicle's disk.
 | Phase | Work | Repo |
 |---|---|---|
 | 0 | Spike (done, above) | rig-infra |
-| 1 | `zenoh-store` service, tests, certify, docs; plugin `file_root: store` | rig-infra, camera-service |
+| 1 | `zenoh-store` service, client, tests, certify, docs (done); plugin `file_root: store` | rig-infra, camera-service |
 | 2 | Ground mirror (location per decision 7), fetch rules, resume | rig-infra |
 | 3 | Router example rules; dashboard keyframe gallery and store health | rig-infra, dashboard |

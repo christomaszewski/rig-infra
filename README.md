@@ -30,6 +30,12 @@ one in CI).
   `export-calls` verb). Beside per-sensor replay sources it starts paused and resumes itself at
   rig's one release instant. See [SIL replay](#sil-replay--the-ros2-bag-player-service).
 - **`ros1-bag-logger/`** — the ROS 1 sibling (`rosbag record`), for ROS 1 fleets with a roscore.
+- **`zenoh-store/`** — the vehicle's run store over Zenoh (infra, order 1): serves every run's
+  `store/` folder on `fleet/<vehicle>/store/**` (whole files or byte ranges), indexes the open run
+  live and announces new files, so a ground station can fetch keyframes, point clouds or any other
+  file mid-run. Fetch rules in its config decide what crosses the link on its own; everything else
+  is fetched on request. Its own small image (python + zenoh-python 1.9.0, no ROS). See
+  [zenoh-store/README.md](zenoh-store/README.md) and the [plan](docs/zenoh-store-plan.md).
 - **`base/`** — the `fleet-ros` image: `ros:<distro>-ros-core` + the ROS base packages + the fleet's rmw + `rosbag2` (+ mcap).
   `base/build.sh <registry> [tag]` follows the rig build contract; the router and ros2 bag logger
   riggings declare it (`build: { command: ../base/build.sh, images: [fleet-ros], provides: base }`),
@@ -647,6 +653,7 @@ Use from a rig deployment (clone as a sibling):
 services:
   zenoh-router:    { path: ../rig-infra/zenoh-router }
   ros2-bag-logger: { path: ../rig-infra/ros2-bag-logger }
+  zenoh-store:     { path: ../rig-infra/zenoh-store }
 ```
 
 or scaffold directly: `rig init my-vehicle --infra zenoh-router --infra ros2-bag-logger` (bare names

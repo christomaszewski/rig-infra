@@ -149,6 +149,17 @@ jobs:
           ./.rig/rig certify --require-build-check --repo ros2-bag-player
       - name: certify ros1-bag-logger
         run: ./.rig/rig certify --require-build-check --repo ros1-bag-logger
+      # The run store: certify (launcher + its own image's build contract), then its unit tests --
+      # the store core (stdlib), the live index on real inotify, and real Zenoh sessions against the
+      # fleet's zenoh-python pin (the only step here that installs it).
+      - name: certify zenoh-store
+        run: ./.rig/rig certify --require-build-check --repo zenoh-store
+      - name: zenoh-store unit tests
+        run: |
+          python3 -m pip install --user eclipse-zenoh==1.9.0
+          python3 zenoh-store/tests/test_store_core.py
+          python3 zenoh-store/tests/test_store_watch.py
+          python3 zenoh-store/tests/test_store_zenoh.py
       # The msgs overlay's FLEET_MSGS_LOCAL dev loop (local checkouts instead of pinned clones):
       # build-msgs.sh's git-aware snapshot + `local-sources` named context against a docker stub
       # (default argv unchanged; buildx --push/--load carry the context), and build_msgs.py's key

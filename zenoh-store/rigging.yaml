@@ -1,0 +1,26 @@
+# rig descriptor for the vehicle's run store over Zenoh (infra tier — rig brings it up right after the
+# router). Serves every run's store/ folder on fleet/<vehicle>/store/**, keeps an index of the open run,
+# and announces new files, so a ground station can fetch keyframes, point clouds or any other file
+# while the run is still going. Contract and rationale: docs/zenoh-store-plan.md.
+service: zenoh-store
+launcher: zenoh-store-up
+verbs:
+  up: "up -d"
+  down: "down"
+  status: "ps"
+  logs: "logs"
+  config: "config"
+  images: "images"
+  runtime-images: "runtime-images"
+tier: infra
+examples: [config/zenoh-store.example.yaml]   # default config for `rig certify --repo`; copied by `rig init`
+# Its own small image: python:3.12-slim + eclipse-zenoh 1.9.0 (the fleet's zenoh-python pin) + the
+# zenoh_store package. Not FROM the fleet's ROS base: the store runs no ROS node. The build directory
+# is self-contained (Dockerfile, build.sh, rig-build.sh copy, package), which is also rig's build
+# dedupe identity.
+build: { architectures: [arm64, amd64], capabilities: {no_cache: true, platforms: true}, command: build.sh, images: [zenoh-store] }
+launch_surface:
+  - tools/runtime_images.py
+  - zenoh-store-up
+  - zenoh_store/config.py     # the launcher validates + renders the `store:` block with it (stdlib + PyYAML)
+  - docker/compose.deploy.yaml

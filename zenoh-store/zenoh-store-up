@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Launcher for the vehicle's run store (infra). rig brings it up right after the zenoh router, exporting
+# VEHICLE_ID and RIG_DATA_DIR; the compose mounts the data dir and the store finds the open run through
+# its `current` link INSIDE the container (never a compose variable: a run id frozen into a baked
+# artifact would be wrong at the next run, and would break certify's determinism).
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${ZENOH_STORE_PYTHON:-python3}"
+
+CONFIG="${1:?usage: zenoh-store-up <config.yaml> [up [-d]|down|status|logs|config|...]}"; shift || true
+[ -f "$CONFIG" ] || { echo "zenoh-store-up: config not found: $CONFIG" >&2; exit 1; }
+
+# Validate the instance config and render the `store:` block to one canonical JSON string (sorted keys,
+# defaults filled in) -- a bad rule fails HERE, at `config`/`up`, not in a restarting container.
+RENDERED="$("$PYTHON" "$REPO/zenoh_store/config.py" render "$CONFIG")"
+export ZENOH_STORE_NAME="${RENDERED%%$'\t'*}"
+export ZENOH_STORE_CONFIG="${RENDERED#*$'\t'}"
+
+# rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-zenoh-store_${ZENOH_STORE_NAME}}"
+FILES=(-f "$REPO/docker/compose.deploy.yaml")
+ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+case "${ARGS[0]}" in
+  runtime-images|images)
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" "${ARGS[0]}" "${FILES[@]}" ;;
+  up)
+    if [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+      exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" -- "${ARGS[@]:1}"
+    fi ;;
+esac
+echo "zenoh-store-up: project=${COMPOSE_PROJECT_NAME} data=${RIG_DATA_DIR:-/data} vehicle=${VEHICLE_ID:-?}" >&2
+exec docker compose "${FILES[@]}" "${ARGS[@]}"

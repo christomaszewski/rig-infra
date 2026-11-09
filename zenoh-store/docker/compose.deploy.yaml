@@ -1,0 +1,22 @@
+# The vehicle's run store — ONE per vehicle, brought up by rig right after the zenoh router. Serves
+# <data_dir>/runs/*/store/ on fleet/<vehicle>/store/** and writes puts into the OPEN run's store/.
+#
+# The DATA ROOT is mounted (not one run) so the store can follow the registry's relative `current`
+# link and also serve sealed runs. It is mounted read-write: puts to the open run are written there.
+# Sealed runs are never written (the store refuses puts to anything but the open run).
+#
+# IMAGE: ZENOH_STORE_IMAGE (this instance's override) -> the composed zenoh-store pull ref, which is
+# what `rig build` pushes and certify renders.
+services:
+  store:
+    image: ${ZENOH_STORE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}zenoh-store:${RIG_IMAGE_TAG:-latest}}
+    network_mode: host            # reach the router at localhost:7447
+    restart: unless-stopped
+    stop_grace_period: 5s
+    environment:
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      ZENOH_STORE_INSTANCE: ${ZENOH_STORE_NAME:?set by zenoh-store-up}
+      ZENOH_STORE_CONFIG: ${ZENOH_STORE_CONFIG:?set by zenoh-store-up}
+      ZENOH_STORE_DATA: /data
+    volumes:
+      - ${RIG_DATA_DIR:-/data}:/data
