@@ -150,7 +150,8 @@ class MultiInput(unittest.TestCase):
         self.assertEqual(yaml.safe_load(path.read_text())["rosbag2_bagfile_information"]["duration"]["nanoseconds"], 0)
 
     def test_sensor_timing_requires_proxy_and_never_changes_native_order(self):
-        config = {"play": {"time_source": "sensor", "sensor_timestamp_field": "header.stamp"}}
+        config = {"play": {"time_source": "sensor", "sensor_timestamp_field": "header.stamp",
+                           "tf_lead_time_ms": 25}}
         with self.assertRaisesRegex(SystemExit, "offline bag proxy"):
             self.build(config)
         self.plan["bags"] = [self.bags[0]]
@@ -159,7 +160,9 @@ class MultiInput(unittest.TestCase):
         args = self.build(config)[3]
         self.assertEqual(args[args.index("--message-order") + 1], "received")
         for change in ({"time_source": "invalid"}, {"timestamp_fallback": "silent"},
-                       {"sensor_timestamp_field": ""}, {"dedup_window_ms": -1}):
+                       {"sensor_timestamp_field": ""}, {"dedup_window_ms": -1},
+                       *({"tf_lead_time_ms": value} for value in
+                         (-1, True, "100", None, float("nan"), float("inf")))):
             with self.assertRaises(SystemExit):
                 self.build({"play": {**config["play"], **change}})
         with self.assertRaisesRegex(SystemExit, "disagrees"):

@@ -5,7 +5,7 @@ import sys
 import unittest
 
 
-MINIMUM_CASES = 17  # Includes mixed-storage multi-input playback and offline bag proxies.
+MINIMUM_CASES = 21  # Includes mixed-storage playback, bag proxies, and native tf2 prefetch checks.
 
 
 def accepted(result, count):

@@ -41,6 +41,7 @@ play:
   # timestamp_fallback: received  # error | received | sent; profile default if omitted
   # max_clock_skew_s: 60.0       # reject incompatible sensor/send vs receive clock domains
   # dedup_window_ms: 100.0       # likely-match window used only by offline export
+  # tf_lead_time_ms: 100.0      # sensor proxy: publish dynamic TF ahead of its nested stamps
   topics: []             # standalone allow-list (exact topic names); RIG_REPLAY_TOPICS shadows it
   #                        (WARN). Empty + no excludes = play everything in the session.
   #                        Topics named here but absent from the bag are tolerated, not an error.

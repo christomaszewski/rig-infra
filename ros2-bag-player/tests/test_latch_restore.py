@@ -8,6 +8,7 @@ window. Run: `python3 tests/test_latch_restore.py` (no ROS — the rclpy/rosbag2
 lazily)."""
 import pathlib
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "tools"))
 
@@ -117,6 +118,68 @@ def test_window_cutoff_and_last_message_before_it():
             yield m
     latch_restore.last_before(gen(), cutoff)
     assert consumed == [b"v1", b"tf", b"v2", b"v3"]
+
+
+def test_static_tf_detection_requires_type_and_selected_latched_topic():
+    meta = _meta([
+        ("/tf_static", "tf2_msgs/msg/TFMessage", [_profile("transient_local")]),
+        ("/vehicle/tf_static", "tf2_msgs/msg/TFMessage", [_profile("transient_local")]),
+        ("/other/tf_static", "std_msgs/msg/String", [_profile("transient_local")]),
+        ("/tf", "tf2_msgs/msg/TFMessage", [_profile("transient_local")]),
+        ("/unknown/tf_static", "tf2_msgs/msg/TFMessage", []),
+    ])
+    latched = latch_restore.latched_topics(meta)
+    assert latch_restore.static_tf_names(latched) == {"/tf_static", "/vehicle/tf_static"}
+    selected = latch_restore.select(latched, None, "/tf_static")
+    assert latch_restore.static_tf_names(selected) == {"/vehicle/tf_static"}
+    assert latch_restore.static_tf_names(latch_restore.select(latched, ["/tf"], None)) == set()
+
+
+def test_static_tf_union_restores_each_child_and_latest_edge_before_window():
+    def transform(child, parent, value):
+        return SimpleNamespace(child_frame_id=child, header=SimpleNamespace(frame_id=parent),
+                               translation=value)
+
+    first = transform("lidar", "base", 1)
+    second = transform("camera", "base", 2)
+    updated = transform("lidar", "mount", 3)
+    future = transform("lidar", "future", 4)
+    other_namespace = transform("camera", "other_base", 5)
+    first_payload, second_payload, update_payload = [first], [second], [updated]
+    stream = [
+        ("/tf_static", first_payload, 1),
+        ("/map", b"old", 2),
+        ("/tf_static", second_payload, 3),
+        ("/vehicle/tf_static", [other_namespace], 3),
+        ("/map", b"new", 4),
+        ("/tf_static", update_payload, 5),
+        ("/tf_static", [], 6),  # An empty update does not erase existing static edges.
+        ("/tf_static", [future], 7),  # At the cutoff belongs to normal playback.
+    ]
+    result = latch_restore.last_before(iter(stream), 7, {"/tf_static", "/vehicle/tf_static"},
+                                       decode_tf=lambda data: data, encode_tf=tuple)
+    assert result == {"/tf_static": (6, (second, updated)),
+                      "/vehicle/tf_static": (3, (other_namespace,)), "/map": (4, b"new")}
+    # Restoring a union must not mutate any original payload collection.
+    assert first_payload == [first] and second_payload == [second] and update_payload == [updated]
+
+
+def test_static_tf_accumulation_keeps_latest_per_child_without_reading_past_window():
+    consumed = []
+
+    def stream():
+        for stamp in range(1001):
+            consumed.append(stamp)
+            yield "/tf_static", [SimpleNamespace(child_frame_id="lidar", value=stamp)], stamp
+        raise AssertionError("read past the first in-window message")
+
+    result = latch_restore.last_before(stream(), 1000, {"/tf_static"},
+                                       decode_tf=lambda data: data, encode_tf=tuple)
+    stamp, transforms = result["/tf_static"]
+    assert stamp == 999 and len(transforms) == 1 and transforms[0].value == 999
+    assert consumed[-1] == 1000
+    assert latch_restore.last_before(iter([]), 10, {"/tf_static"},
+                                     decode_tf=lambda data: data, encode_tf=tuple) == {}
 
 
 if __name__ == "__main__":

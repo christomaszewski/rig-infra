@@ -8,16 +8,16 @@ from run_runtime_acceptance import MINIMUM_CASES, accepted
 class RuntimeAcceptanceGate(unittest.TestCase):
     def test_requires_complete_successful_unskipped_suite(self):
         result = SimpleNamespace(wasSuccessful=lambda: True, skipped=[])
-        self.assertEqual(MINIMUM_CASES, 17)
-        self.assertTrue(accepted(result, 17))
-        self.assertTrue(accepted(result, 18))
-        self.assertFalse(accepted(result, 16))
+        self.assertEqual(MINIMUM_CASES, 21)
+        self.assertTrue(accepted(result, 21))
+        self.assertTrue(accepted(result, 22))
+        self.assertFalse(accepted(result, 20))
         self.assertFalse(accepted(result, 13))
         result.skipped = [("case", "ROS missing")]
-        self.assertFalse(accepted(result, 17))
+        self.assertFalse(accepted(result, 21))
         result.skipped = []
         result.wasSuccessful = lambda: False
-        self.assertFalse(accepted(result, 17))
+        self.assertFalse(accepted(result, 21))
 
 
 if __name__ == "__main__":

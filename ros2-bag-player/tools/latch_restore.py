@@ -17,7 +17,9 @@ published at t=0 — a silently broken experiment. So, before ``play.sh`` execs 
      holds for latches too);
   3. reads the bag with a ``StorageFilter`` on that topic set, stopping at the window start
      (``bag_start + from``), and keeps the LAST message per topic with a receive stamp before it
-     (a topic with no message before ``from`` publishes nothing);
+     (a topic with no message before ``from`` publishes nothing). For ``tf_static`` topics,
+     combines the latest transform for each child frame across those messages, so independent
+     broadcasters' static edges are all restored;
   4. publishes each once with the RECORDED QoS (transient-local, the recorded reliability, depth
      1) from a node grouped under the player instance — ``/<name>/latch_restore`` (rig's epoch
      reader groups by instance namespace) — touches the ready marker play.sh waits on, and STAYS
@@ -111,15 +113,36 @@ def window_start_ns(bag_start_ns: int, from_s: float) -> int:
     return int(bag_start_ns) + int(float(from_s) * 1e9)
 
 
-def last_before(messages, cutoff_ns: int) -> dict:
+def static_tf_names(topics: list[dict]) -> set[str]:
+    """Recognize static TF only within the already selected, transient-local topic set."""
+    return {topic["name"] for topic in topics
+            if topic["type"] == "tf2_msgs/msg/TFMessage" and
+            topic["name"].rsplit("/", 1)[-1] == "tf_static"}
+
+
+def last_before(messages, cutoff_ns: int, static_tf_topics=(), *, decode_tf=None, encode_tf=None) -> dict:
     """{topic: (stamp_ns, data)} — the last message per topic with stamp < cutoff, over a stream
     of (topic, data, stamp_ns) in receive order; stops at the first stamp >= cutoff (the stream is
-    ordered, so nothing later can be earlier)."""
+    ordered, so nothing later can be earlier). Static TF keeps the latest transform per child,
+    not merely the last broadcaster's message. Codecs convert bytes <-> transform lists and
+    keep this streaming core independent of ROS; memory is bounded by the static frame set.
+    Only the runtime restore message is reserialized; recorded bag payloads are never changed.
+    """
+    static_topics = set(static_tf_topics)
+    if static_topics and (decode_tf is None or encode_tf is None):
+        raise ValueError("static TF restoration requires decode_tf and encode_tf")
     last: dict = {}
+    transforms: dict = {}
     for topic, data, t_ns in messages:
         if t_ns >= cutoff_ns:
             break
         last[topic] = (t_ns, data)
+        if topic in static_topics:
+            frames = transforms.setdefault(topic, {})
+            for transform in decode_tf(data):
+                frames[transform.child_frame_id] = transform
+    for topic, frames in transforms.items():
+        last[topic] = (last[topic][0], encode_tf([frames[child] for child in sorted(frames)]))
     return last
 
 
@@ -144,13 +167,22 @@ def merged_metadata(documents):
 # Shell — rosbag2_py reader, rclpy publishers, the ready marker, the resident loop.
 # ---------------------------------------------------------------------------------------------
 
-def read_last(session: str, topics: list[str], cutoff_ns: int) -> dict:
+def read_last(session: str, topics: list[str], cutoff_ns: int, *, static_tf_topics=()) -> dict:
     import rosbag2_py
     inputs, _ = parse_selection(session)
     readers = [open_reader(item) for item in inputs]
     for reader in readers:
         reader.set_filter(rosbag2_py.StorageFilter(topics=topics))
-    return last_before(((topic, data, recv_ns) for topic, data, recv_ns, _ in merged_records(readers)), cutoff_ns)
+    static_topics = set(static_tf_topics).intersection(topics)
+    codecs = {}
+    if static_topics:
+        from rclpy.serialization import deserialize_message, serialize_message
+        from tf2_msgs.msg import TFMessage
+
+        codecs = dict(decode_tf=lambda data: deserialize_message(data, TFMessage).transforms,
+                      encode_tf=lambda transforms: serialize_message(TFMessage(transforms=transforms)))
+    return last_before(((topic, data, recv_ns) for topic, data, recv_ns, _ in merged_records(readers)),
+                       cutoff_ns, static_topics, **codecs)
 
 
 def main() -> int:
@@ -198,7 +230,8 @@ def main() -> int:
         return 0
 
     t0 = time.monotonic()
-    last = read_last(a.session, [t["name"] for t in wanted], cutoff)
+    last = read_last(a.session, [t["name"] for t in wanted], cutoff,
+                     static_tf_topics=static_tf_names(wanted))
     read_ms = (time.monotonic() - t0) * 1000
     have = [t for t in wanted if t["name"] in last]
     missing = [t["name"] for t in wanted if t["name"] not in last]

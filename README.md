@@ -5,6 +5,11 @@ plus the **`fleet-ros` base image** they default to. Each service dir is an ordi
 service: a launcher + `rigging.yaml` meeting the launcher contract (`rig certify` runs against every
 one in CI).
 
+[v1.20.1](docs/releases/v1.20.1.md) fixes TF scheduling in sensor-time bag proxies and restores
+every static child frame during windowed replay. Use Rig v0.2.81, re-export the sensor profile,
+and prepare its recipe again to adopt the new proxy timing. Existing proxy generations remain
+unchanged. See the [proxy timing contract](ros2-bag-player/REPLAY_PLAN.md#multiple-inputs-and-bag-proxies).
+
 - **`zenoh-router/`** — the vehicle's shared `rmw_zenoh` router (infra, order 0). Default: `fleet-ros`
   running `ros2 run rmw_zenoh_cpp rmw_zenohd` — the router and the sessions share one distro's zenoh
   packages by construction. On the default image it **requires `ros.rmw: rmw_zenoh_cpp`**; see
@@ -361,7 +366,9 @@ with it): it takes the recording's transient-local topics (every offered QoS pro
 is not restored either), intersects them with **the main play's own selection** (the identical
 `--topics`/`--exclude-regex` argv — it can never publish a topic the main play would not, so
 rig's self-echo subtraction holds for latches too), reads the bag up to the window start and
-keeps the **last** message per topic before it, publishes each once with the recorded QoS
+keeps the **last** message per topic before it. For `/tf_static` and namespaced `*/tf_static`,
+v1.20.1 instead combines the latest transform for every child frame across the pre-window
+messages. It publishes each restored message once with the recorded QoS
 (transient-local, the recorded reliability, depth 1) from `/<name>/latch_restore` — a node that
 groups under the player instance in rig's epoch reader, as does the injector's
 `/<name>/call_injector` (verified with `rig graph`; rosbag2's own `/rosbag2_player` sits at the

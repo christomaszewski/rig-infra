@@ -95,8 +95,32 @@ and must be explicitly selected. Both preserve repetitions within an individual 
 
 Sensor profiles use `header.stamp` by default and explicitly fall back to receive time
 when unavailable. `play.sensor_timestamp_field`, `topic_timestamp_fields`,
-`timestamp_fallback`, `max_clock_skew_s`, and `dedup_window_ms` refine export policy.
+`timestamp_fallback`, `max_clock_skew_s`, `dedup_window_ms`, and `tf_lead_time_ms` refine export policy.
 An incompatible clock domain fails conversion; no clock correction is inferred.
+Sensor profile revision 2 (rig-infra v1.20.1 with Rig v0.2.81) schedules a dynamic
+`tf2_msgs/msg/TFMessage` at its earliest nested
+transform stamp minus `tf_lead_time_ms` (default 100 ms), clamped at zero, with TF-first ordering
+at equal schedule times. The entire payload remains unchanged, including messages with multiple
+transforms. Every dynamic transform stamp is checked for clock skew; per-topic timestamp-field
+overrides for TFMessage are refused. `/tf_static` and namespaced `*/tf_static` messages are
+preloaded before sensor data, accepting zero static stamps. Conflicting static transforms for
+the same child cannot be preloaded safely and fail conversion.
+Window restoration combines the latest transform for each child across all pre-window static
+TF messages, retaining the normal selection, remap, and recorded transient-local QoS checks.
+
+TF lead is recorded time, so its wall-clock duration scales with playback rate. It must cover
+the interpolation interval and delivery/processing delay; it does not acknowledge execution of
+another process's subscription callback. Consumers still need a TF message filter or bounded
+wait. A window needs preceding dynamic TF samples for warmup. Unbounded prefetch is unsafe:
+future transform stamps can evict history from a consumer's TF cache.
+
+Sensor ordering preserves PointCloud2 payloads, including point layout and per-point timestamps,
+but not the original causal order across topics. Snapshot triggers and arrival-dependent
+consumers may consequently select different data. Conservative mode retains ordinary overlapping
+clouds, including copies that now share a schedule timestamp. The native proxy tests compare
+arrival and sensor profiles with organized PointCloud2 payloads and TF to cover these semantics.
+Existing proxy generations remain immutable; re-export a sensor profile and re-prepare its recipe
+to adopt revision 2. Explicit artifact IDs continue selecting the original generation.
 Original indexes must already be valid for export. Missing images are reported with
 an acquisition instruction; this helper does not pull images or start replay services.
 

@@ -486,7 +486,8 @@ def timing_policy(play):
             or any(not isinstance(v, str) or not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", v)
                    for v in [field, *fields.values()])):
         raise SystemExit("play_cmd: timestamp fields must be dotted message field paths")
-    for key, default in (("max_clock_skew_s", 60), ("dedup_window_ms", 100)):
+    for key, default in (("max_clock_skew_s", 60), ("dedup_window_ms", 100),
+                         ("tf_lead_time_ms", 100)):
         value = play.get(key, default)
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise SystemExit(f"play_cmd: play.{key} must be finite and nonnegative")
@@ -511,7 +512,8 @@ def build_args(cfg: dict, env: dict, ls=_ls, read=_read) -> tuple[str, str, str,
                    {"topics", "exclude", "rate", "loop", "start_offset_s", "end_offset_s",
                     "start_paused", "services", "services_source",
                     "clock", "time_source", "sensor_timestamp_field", "timestamp_fallback",
-                    "topic_timestamp_fields", "max_clock_skew_s", "dedup_window_ms"})
+                    "topic_timestamp_fields", "max_clock_skew_s", "dedup_window_ms",
+                    "tf_lead_time_ms"})
     warns: list[str] = []
     time_source = timing_policy(play)
     proxy = (plan or {}).get("proxy")

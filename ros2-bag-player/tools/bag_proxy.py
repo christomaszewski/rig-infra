@@ -20,10 +20,12 @@ import sys
 DEFAULTS = dict(time_source="received", deduplication="conservative",
                 sensor_timestamp_field="header.stamp", timestamp_fallback="error",
                 topic_timestamp_fields={}, max_clock_skew_s=60.0, dedup_window_ms=100.0)
+TF_TYPE = "tf2_msgs/msg/TFMessage"
+DEFAULT_TF_LEAD_MS = 100.0
 
 
 def policy(value):
-    if not isinstance(value, dict) or set(value) - set(DEFAULTS):
+    if not isinstance(value, dict) or set(value) - set(DEFAULTS) - {"tf_lead_time_ms"}:
         raise ValueError("bag proxy: unknown policy fields")
     result = {**DEFAULTS, **value}
     if result["time_source"] not in ("received", "sent", "sensor"):
@@ -38,7 +40,9 @@ def policy(value):
     for field in [result["sensor_timestamp_field"], *fields.values()]:
         if not isinstance(field, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_][A-Za-z_0-9]*)*", field):
             raise ValueError("bag proxy: timestamp fields must be dotted ROS field paths")
-    for key in ("max_clock_skew_s", "dedup_window_ms"):
+    for key in ("max_clock_skew_s", "dedup_window_ms", "tf_lead_time_ms"):
+        if key not in result:
+            continue  # Keep legacy profile policies byte-for-byte comparable to their requests.
         if type(result[key]) not in (float, int) or not math.isfinite(result[key]) or result[key] < 0:
             raise ValueError(f"bag proxy: {key} must be finite and nonnegative")
     return result
@@ -57,15 +61,40 @@ def timestamp(message, field):
     return result
 
 
-def effective_timestamp(topic, received, sent, message, settings):
+def effective_timestamp(topic, received, sent, message, settings, topic_type=None):
     source = settings["time_source"]
     if source == "received":
         return received, False
+    is_tf = source == "sensor" and topic_type == TF_TYPE
+    if is_tf and topic in settings["topic_timestamp_fields"]:
+        raise ValueError(f"{topic}: TFMessage timing uses nested transform headers; "
+                         "topic_timestamp_fields cannot override TF")
+    def validate_clock(stamp):
+        if abs(stamp - received) > settings["max_clock_skew_s"] * 1e9:
+            raise ValueError(f"{topic}: {source} timestamp is outside max_clock_skew_s of receive time; "
+                             "verify the clock domain before increasing the bound")
+
+    stamps, invalid_tf_stamp = [], False
+    if is_tf:
+        # Check every usable clock before fallback: one missing stamp must not hide
+        # an incompatible clock on a different transform in the same payload.
+        for transform in getattr(message, "transforms", []):
+            try:
+                stamp = timestamp(transform, "header.stamp")
+            except (AttributeError, ValueError):
+                invalid_tf_stamp = True
+            else:
+                validate_clock(stamp)
+                stamps.append(stamp)
     try:
         if source == "sent":
             if not 0 < sent < 2**63:
                 raise ValueError("missing send timestamp")
             value = sent
+        elif is_tf:
+            if invalid_tf_stamp or not stamps:
+                raise ValueError("TFMessage has missing or invalid transform timestamps")
+            value = min(stamps)
         else:
             value = timestamp(message, settings["topic_timestamp_fields"].get(
                 topic, settings["sensor_timestamp_field"]))
@@ -82,9 +111,9 @@ def effective_timestamp(topic, received, sent, message, settings):
     else:
         fell_back = False
     # A missing field may fall back; an incompatible clock must never be hidden.
-    if abs(value - received) > settings["max_clock_skew_s"] * 1e9:
-        raise ValueError(f"{topic}: {source} timestamp is outside max_clock_skew_s of receive time; "
-                         "verify the clock domain before increasing the bound")
+    validate_clock(value)
+    if is_tf and not fell_back:
+        value = max(0, value - int(settings.get("tf_lead_time_ms", DEFAULT_TF_LEAD_MS) * 1e6))
     return value, fell_back
 
 
@@ -116,12 +145,15 @@ class MergeIndex:
             PRAGMA cache_size=-16384;
             CREATE TABLE records(id INTEGER PRIMARY KEY, source INTEGER, ordinal INTEGER,
               topic TEXT, received INTEGER, sent INTEGER, effective INTEGER, payload BLOB,
-              signature TEXT, identity TEXT, keep INTEGER DEFAULT 1, duplicate_of INTEGER,
+              signature TEXT, identity TEXT, priority INTEGER, schedule_basis TEXT,
+              keep INTEGER DEFAULT 1, duplicate_of INTEGER,
               reason TEXT DEFAULT 'retained');
             CREATE INDEX receive_order ON records(received,source,ordinal);
             CREATE INDEX signature ON records(signature,received);
             CREATE INDEX identity ON records(identity);
-            CREATE INDEX schedule ON records(effective,source,ordinal);
+            CREATE INDEX schedule ON records(effective,priority,source,ordinal);
+            CREATE TABLE static_frames(topic TEXT, child TEXT, geometry TEXT,
+                                       PRIMARY KEY(topic,child));
             CREATE TABLE matched(canonical INTEGER, source INTEGER,
                                  PRIMARY KEY(canonical,source));
         """)
@@ -131,19 +163,52 @@ class MergeIndex:
     def add(self, source, ordinal, topic, topic_type, payload, received, sent, message=None):
         if type(received) is not int or not 0 <= received < 2**63 or type(sent) is not int:
             raise ValueError(f"{topic}: invalid original timestamp")
-        effective, fallback = effective_timestamp(topic, received, sent, message, self.settings)
+        sensor_tf = self.settings["time_source"] == "sensor" and topic_type == TF_TYPE
+        static_tf = sensor_tf and topic.rsplit("/", 1)[-1] == "tf_static"
+        priority = 0 if static_tf else 1 if sensor_tf else 2
+        if sensor_tf and topic in self.settings["topic_timestamp_fields"]:
+            raise ValueError(f"{topic}: TFMessage timing uses nested transform headers; "
+                             "topic_timestamp_fields cannot override TF")
+        if static_tf:
+            self._static_frames(topic, message)
+            effective, fallback, basis = received, False, "tf_static_prelude"
+        else:
+            effective, fallback = effective_timestamp(topic, received, sent, message, self.settings, topic_type)
+            basis = (self.settings["timestamp_fallback"] + "_fallback" if fallback else
+                     "tf_transform_stamp" if sensor_tf else self.settings["time_source"] + "_stamp")
         checksum = hashlib.sha256(payload).hexdigest()
         signature = json.dumps([topic, topic_type, checksum])
         identity = proven_identity(topic_type, message)
         if identity is not None:
             identity = json.dumps([signature, identity])
         self.db.execute("INSERT INTO records(source,ordinal,topic,received,sent,effective,payload,"
-                        "signature,identity) VALUES (?,?,?,?,?,?,?,?,?)",
-                        (source, ordinal, topic, received, sent, effective, payload, signature, identity))
+                        "signature,identity,priority,schedule_basis) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (source, ordinal, topic, received, sent, effective, payload, signature, identity,
+                         priority, basis))
         self.count += 1
         self.fallback_count += fallback
         if self.count % 1000 == 0:
             self.db.commit()
+
+    def _static_frames(self, topic, message):
+        """Only immutable static geometry can safely be available for the entire proxy."""
+        if message is None:
+            raise ValueError(f"{topic}: TFMessage type must be available to prepare static transforms")
+        for transform in message.transforms:
+            child, parent = transform.child_frame_id, transform.header.frame_id
+            translation, rotation = transform.transform.translation, transform.transform.rotation
+            coordinates = [translation.x, translation.y, translation.z,
+                           rotation.x, rotation.y, rotation.z, rotation.w]
+            if not child or not parent or not all(math.isfinite(value) for value in coordinates):
+                raise ValueError(f"{topic}: invalid static transform for child {child!r}")
+            geometry = json.dumps([parent, *coordinates])
+            previous = self.db.execute("SELECT geometry FROM static_frames WHERE topic=? AND child=?",
+                                       (topic, child)).fetchone()
+            if previous and previous[0] != geometry:
+                raise ValueError(f"{topic}: conflicting static transform for {child!r}; sensor-time "
+                                 "preloading requires constant geometry; use an arrival profile "
+                                 "for recordings with changing static transforms")
+            self.db.execute("INSERT OR IGNORE INTO static_frames VALUES (?,?,?)", (topic, child, geometry))
 
     def deduplicate(self):
         self.db.commit()
@@ -183,19 +248,30 @@ class MergeIndex:
                                 (match[0], reason, rid))
                 self.db.execute("INSERT INTO matched VALUES (?,?)", (match[0], source))
                 stats["output_messages"] -= 1
+        # Static TF stamps are timeless (often zero). Make every retained static frame
+        # available before the earliest dynamic TF/data, without rewriting any payload.
+        first = self.db.execute("SELECT MIN(effective) FROM records WHERE keep=1 AND priority!=0").fetchone()[0]
+        if first is None:
+            first = self.db.execute("SELECT MIN(received) FROM records WHERE keep=1").fetchone()[0]
+        if first is not None:
+            lead = max(1, int(self.settings.get("tf_lead_time_ms", DEFAULT_TF_LEAD_MS) * 1e6))
+            self.db.execute("UPDATE records SET effective=? WHERE priority=0", (max(0, first - lead),))
+        stats["tf_messages"] = self.db.execute("SELECT COUNT(*) FROM records WHERE keep=1 AND priority=1").fetchone()[0]
+        stats["tf_static_messages"] = self.db.execute("SELECT COUNT(*) FROM records WHERE keep=1 AND priority=0").fetchone()[0]
         self.db.commit()
         return stats
 
     def output(self):
         return self.db.execute("SELECT topic,payload,effective,sent FROM records WHERE keep=1 "
-                               "ORDER BY effective,source,ordinal")
+                               "ORDER BY effective,priority,source,ordinal")
 
     def provenance(self, path):
         with Path(path).open("w") as stream:
             for row in self.db.execute("SELECT id,source,ordinal,topic,received,sent,effective,"
-                                       "duplicate_of,reason FROM records ORDER BY id"):
+                                       "duplicate_of,reason,schedule_basis,priority FROM records ORDER BY id"):
                 stream.write(json.dumps(dict(zip(("id", "input", "ordinal", "topic", "received_ns",
-                    "sent_ns", "schedule_ns", "duplicate_of", "decision"), row)), separators=(",", ":")) + "\n")
+                    "sent_ns", "schedule_ns", "duplicate_of", "decision", "schedule_basis",
+                    "schedule_priority"), row)), separators=(",", ":")) + "\n")
 
     def close(self):
         self.db.close()
