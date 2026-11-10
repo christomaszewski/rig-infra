@@ -157,6 +157,11 @@ jobs:
         run: |
           python3 msgs/tests/test_build_msgs_sh.py
           python3 msgs/tests/test_build_msgs.py
+      # No Dockerfile names a frontend image: a `syntax` directive makes every build, cached or
+      # not, resolve it on Docker Hub first, which fails a rate-limited or disconnected builder
+      # (`rig build --offline`).
+      - name: Dockerfile guards
+        run: python3 tests/test_dockerfiles.py
       # RIG_BASE_IMAGE, consumer side: with a base exported the stacks RUN it; with none — certify's
       # view, and a standalone `docker compose` — they fall back to the composed fleet-ros pull ref.
       # A per-instance ${<SVC>_IMAGE} override still beats both.

@@ -181,7 +181,10 @@ The fix is one thin image, never a fat one: `fleet-ros-msgs` = the deployment's 
   is needed. `rig src sync` fills the mirrors; `rig build --offline` then builds the overlay with
   no remote git, its apt steps coming from the build cache of an earlier online build. A
   `FLEET_MSGS_LOCAL` checkout of the same repo still wins. Standalone `build-msgs.sh` (no rig)
-  clones in the builder as before.
+  clones in the builder as before. `msgs/Dockerfile` names no `syntax` frontend (v1.20.2): with
+  one, every build, a fully cached one included, first resolved `docker/dockerfile` on Docker
+  Hub, and a rate limit or a disconnected builder failed the overlay before any step ran. The
+  frontend built into BuildKit 0.10 and later covers everything the file uses.
 - **Consumed.** The ros2 bag logger's compose resolves
   `BAG_LOGGER_IMAGE → RIG_MSGS_IMAGE → RIG_BASE_IMAGE → composed fleet-ros ref`. The moment an
   overlay exists and `RIG_MSGS_IMAGE` names it, the logger records the fleet's custom types — no
