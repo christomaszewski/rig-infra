@@ -5,10 +5,16 @@ plus the **`fleet-ros` base image** they default to. Each service dir is an ordi
 service: a launcher + `rigging.yaml` meeting the launcher contract (`rig certify` runs against every
 one in CI).
 
-[v1.20.1](docs/releases/v1.20.1.md) fixes TF scheduling in sensor-time bag proxies and restores
-every static child frame during windowed replay. Use Rig v0.2.81, re-export the sensor profile,
-and prepare its recipe again to adopt the new proxy timing. Existing proxy generations remain
-unchanged. See the [proxy timing contract](ros2-bag-player/REPLAY_PLAN.md#multiple-inputs-and-bag-proxies).
+[v1.20.2](docs/releases/v1.20.2.md) keeps the `fleet-ros` base image unchanged when only its
+replay check script changes, and builds the messages overlay without resolving a Dockerfile
+frontend on Docker Hub. The first build after upgrading publishes new base and overlay images
+once; with Rig v0.2.82, later builds that change nothing keep their digests. See
+[what changes the base image](#what-changes-the-base-image).
+
+[v1.20.1](docs/releases/v1.20.1.md) fixed TF scheduling in sensor-time bag proxies and restored
+every static child frame during windowed replay. Re-export the sensor profile and prepare its
+recipe again to adopt the new proxy timing. Existing proxy generations remain unchanged. See the
+[proxy timing contract](ros2-bag-player/REPLAY_PLAN.md#multiple-inputs-and-bag-proxies).
 
 - **`zenoh-router/`** — the vehicle's shared `rmw_zenoh` router (infra, order 0). Default: `fleet-ros`
   running `ros2 run rmw_zenoh_cpp rmw_zenohd` — the router and the sessions share one distro's zenoh
