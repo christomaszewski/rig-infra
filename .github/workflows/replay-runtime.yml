@@ -21,10 +21,26 @@ jobs:
           PUSH=0 FLEET_MSGS_MANIFEST=/tmp/replay-messages.yaml msgs/build-msgs.sh local replay-ci
       - name: Verify replay capability declaration
         run: python3 -m unittest discover -s base -p test_replay_contract.py -v
+      # base/Dockerfile runs the check in a side stage and gives the image one constant marker, so
+      # an edit of the script must run the gate again and reuse every layer of the image. An image
+      # that changed instead would rebuild the messages overlay and every service image FROM it.
+      - name: Base image is unchanged by an edit of its check script
+        run: |
+          identity() { docker image inspect "$1" --format '{{json .RootFS.Layers}} {{.Created}}'; }
+          cp -R base "$RUNNER_TEMP/base-edited"
+          printf '\nprint("edited replay check ran")\n' >> "$RUNNER_TEMP/base-edited/check_replay_runtime.py"
+          BUILDKIT_PROGRESS=plain PUSH=0 "$RUNNER_TEMP/base-edited/build.sh" local replay-ci-edited \
+            > "$RUNNER_TEMP/base-edited.log" 2>&1 || { cat "$RUNNER_TEMP/base-edited.log"; exit 1; }
+          grep -q 'edited replay check ran' "$RUNNER_TEMP/base-edited.log" || {
+            echo "::error::the edited check did not run"; cat "$RUNNER_TEMP/base-edited.log"; exit 1; }
+          test "$(identity local/fleet-ros:replay-ci-edited)" = "$(identity local/fleet-ros:replay-ci)" || {
+            echo "::error::editing base/check_replay_runtime.py changed the base image"; exit 1; }
       - name: Verify declared overlay typesupport
         run: |
           docker run --rm --pull=never --network none local/fleet-ros-msgs:replay-ci \
             python3 -c 'from nmea_msgs.msg import Sentence; from rclpy.serialization import serialize_message, deserialize_message; message = Sentence(sentence="replay overlay"); assert deserialize_message(serialize_message(message), Sentence) == message'
+      # The images do not carry the check script (the base build bind-mounts it into its gate
+      # stage), so it is mounted here as well.
       - name: Native base and overlay replay acceptance (no skips)
         run: |
           for image in local/fleet-ros:replay-ci local/fleet-ros-msgs:replay-ci; do
@@ -35,7 +51,8 @@ jobs:
               --security-opt no-new-privileges --pids-limit 256 \
               -e RMW_IMPLEMENTATION=rmw_zenoh_cpp -e PYTHONDONTWRITEBYTECODE=1 \
               --mount "type=bind,source=$PWD/ros2-bag-player,target=/replay-source,readonly" \
-              "$image" bash -c 'set -e; if [ -f /opt/fleet-msgs/setup.bash ]; then source /opt/fleet-msgs/setup.bash; fi; python3 /usr/local/lib/rig/check_replay_runtime.py; timeout 120s python3 /replay-source/tests/run_runtime_acceptance.py'
+              --mount "type=bind,source=$PWD/base/check_replay_runtime.py,target=/check_replay_runtime.py,readonly" \
+              "$image" bash -c 'set -e; if [ -f /opt/fleet-msgs/setup.bash ]; then source /opt/fleet-msgs/setup.bash; fi; python3 /check_replay_runtime.py; timeout 120s python3 /replay-source/tests/run_runtime_acceptance.py'
           done
       - name: Validated image survives a moved runtime tag
         run: RIG_TEST_RUNTIME_IMAGE=local/fleet-ros:replay-ci python3 ros2-bag-player/tests/test_runtime_images_docker.py -v

@@ -232,7 +232,10 @@ the launcher alone is insufficient: rebuild/publish the `fleet-ros` base and its
 `fleet-ros-msgs` descendants together, or use an equivalent compatible image. The overlay
 inherits the base's label; fleet-specific message and service types still belong in that overlay.
 
-`base/check_replay_runtime.py` must pass before the base image receives the label. Version 1
+`base/check_replay_runtime.py` must pass before the base image receives the label. The base
+build runs it in a stage of its own against the installed packages; the image carries the labels
+and a marker file, not the script ([what changes the base image](#what-changes-the-base-image)).
+Version 1
 covers the current topic/remap/window/clock/pause and recorded-service CLI options, both
 service-introspection source modes, integer-nanosecond end bounds, Python request/event serialization and inspection filters,
 clock and pause/resume interfaces, the latch reader's storage cutoff/filter APIs and extended timestamps, and
@@ -670,6 +673,27 @@ overlay and service consumers. `--no-cache` disables instruction caching in both
 keeps its deliberate no-pull policy. `rig certify --repo zenoh-router --require-build-check` tests
 both build entrypoints in isolation without building images (requires Bubblewrap on Linux or
 sandbox-exec on macOS). The router, logger and player CI gates require completed build checks.
+
+### What changes the base image
+
+The messages overlay and the service images are built `FROM` the base, so a base that changes
+rebuilds all of them in full. `base/Dockerfile` therefore keeps its replay check out of the image
+(v1.20.2): `check_replay_runtime.py` is bind-mounted into a separate `replay-gate`
+stage, which runs it against the installed packages and writes one constant marker file. The
+image copies that marker to `/usr/local/share/rig/replay-runtime-checked` and then sets its
+`io.rig.*` labels. BuildKit keys the copy on the marker's content, so an edit of the script runs
+the check again, produces the same marker and reuses every layer of the image. Each architecture
+keeps its manifest digest; Rig v0.2.82 and later then keep the published index digest, and
+dependents stay cached. A failing check writes no marker and fails the build.
+
+The base does change when its package or label steps change, when the parent `ros` image is
+pulled again, or when the builder has no cache for those steps: a new builder, `--no-cache`, or
+cache the builder has collected. To run the check against a built image, mount the script:
+
+```sh
+docker run --rm -v "$PWD/base/check_replay_runtime.py:/check_replay_runtime.py:ro" \
+    <registry>/fleet-ros:<tag> python3 /check_replay_runtime.py
+```
 
 ### Runtime and SDK images
 

@@ -20,7 +20,7 @@
 # ${RIG_BASE_IMAGE}, falling back to ${RIG_IMAGE_REGISTRY}/fleet-ros:${RIG_IMAGE_TAG} — certify
 # (which never inherits a RIG_BASE_IMAGE) enforces that build/pull tag agreement.
 ARG ROS_DISTRO=lyrical
-FROM ros:${ROS_DISTRO}-ros-core AS runtime-deps
+FROM ros:${ROS_DISTRO}-ros-core AS packages
 ARG ROS_DISTRO
 # The rmw to install, as its ROS name; build.sh sources it from vehicle.yaml `ros.rmw` (rig exports
 # it as RIG_ROS_RMW, rig >= v0.2.23). The apt package is ros-<distro>-<name, '_' -> '-'> — exactly
@@ -45,10 +45,29 @@ RUN rmw_pkg="ros-${ROS_DISTRO}-$(echo "${RMW_IMPLEMENTATION}" | tr '_' '-')" \
         ros-${ROS_DISTRO}-rosbag2 \
         ros-${ROS_DISTRO}-rosbag2-storage-mcap \
     && rm -rf /var/lib/apt/lists/*
-COPY check_replay_runtime.py /usr/local/lib/rig/check_replay_runtime.py
-RUN . /opt/ros/${ROS_DISTRO}/setup.sh \
-    && python3 /usr/local/lib/rig/check_replay_runtime.py
-# Advertise only after the installed runtime passes the player API/storage contract.
+
+# The replay gate: check_replay_runtime.py exercises the packages installed above against the
+# player API/storage contract. It runs in a stage of its own with the script bind-mounted, and
+# the image receives one constant file from it, never the script. BuildKit keys a COPY on the
+# content it copies, so when only the script changes the gate runs again, writes the same marker,
+# and the COPY below and every later step stay cached: the image keeps its layers and its
+# per-architecture manifest, and nothing built FROM it rebuilds. (A script copied into the image
+# gave the base new layers, and every dependent a full rebuild, each time the script changed.)
+# A failing check writes no marker and fails the build. Keep the marker's text constant: editing
+# it changes the image.
+FROM packages AS replay-gate
+ARG ROS_DISTRO
+RUN --mount=type=bind,source=check_replay_runtime.py,target=/check_replay_runtime.py \
+    . /opt/ros/${ROS_DISTRO}/setup.sh \
+    && python3 /check_replay_runtime.py \
+    && mkdir /replay-gate \
+    && printf 'base/check_replay_runtime.py passed when this image was built.\n' \
+        > /replay-gate/replay-runtime-checked
+
+FROM packages AS runtime-deps
+# Advertise only after the installed runtime passes the player API/storage contract: the labels
+# follow the gate's marker, in the stage both published targets below start from.
+COPY --from=replay-gate /replay-gate/replay-runtime-checked /usr/local/share/rig/replay-runtime-checked
 LABEL io.rig.rosbag2.replay="1"
 LABEL io.rig.rosbag2.multi_input="1"
 LABEL io.rig.replay.coordination="1"
