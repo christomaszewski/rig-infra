@@ -13,7 +13,9 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-SERVICES = ("ros2-bag-player", "ros2-bag-logger", "ros1-bag-logger", "zenoh-router")
+SERVICES = {"ros2-bag-player": "BAG_PLAYER_IMAGE", "ros2-bag-logger": "BAG_LOGGER_IMAGE",
+            "ros1-bag-logger": "BAG_LOGGER_IMAGE", "zenoh-router": "ZENOH_ROUTER_IMAGE",
+            "observer": "OBSERVER_IMAGE"}
 sys.path.insert(0, str(ROOT / "ros2-bag-player/tools"))
 import reindex
 
@@ -30,6 +32,8 @@ if "config" in args:
         raise SystemExit(result.returncode)
     record["model"] = json.loads(result.stdout)
     print(result.stdout)
+elif args[-6:] == ["--profile", "legacy-observer", "rm", "--stop", "--force", "graph-snapshotter"]:
+    pass  # The logger removes its old sidecar before a migrated or capture-disabled up.
 elif args[:3] == ["compose", "-f", "-"] and args[3] in ("up", "run"):
     raw = sys.stdin.read()
     record["raw"] = json.loads(raw)
@@ -102,19 +106,17 @@ class RuntimeImages(unittest.TestCase):
         return {"RIG_RUNTIME_IMAGE_PINS": json.dumps({"version": 1,
                 "images": {image: "sha256:" + str(i + 1) * 64 for i, image in enumerate(images)}})}
 
-    def sidecar_image(self, name, sidecar):
+    def sidecar_image(self, name, sidecar, compose="compose.deploy.yaml"):
         repo, _ = self.service(name)
-        path = repo / "docker/compose.deploy.yaml"
+        path = repo / "docker" / compose
         model = yaml.safe_load(path.read_text())
         model["services"][sidecar]["image"] = "sidecar:chosen"
         model["services"][sidecar]["build"] = {"context": str(self.root)}
         path.write_text(yaml.safe_dump(model))
 
     def test_queries_are_read_only_and_resolve_real_overrides_for_all_bundles(self):
-        for name in SERVICES:
+        for name, override in SERVICES.items():
             with self.subTest(service=name):
-                override = "ZENOH_ROUTER_IMAGE" if name == "zenoh-router" else (
-                    "BAG_PLAYER_IMAGE" if name == "ros2-bag-player" else "BAG_LOGGER_IMAGE")
                 config = {"router_config": {"mode": "router"}} if name == "zenoh-router" else {}
                 extra = {override: "localhost:5000/actual@sha256:" + "a" * 64,
                          "RIG_MSGS_IMAGE": "unused:msgs", "RIG_BASE_IMAGE": "unused:base"}
@@ -132,9 +134,10 @@ class RuntimeImages(unittest.TestCase):
         self.assertTrue(all("config" in row["args"] for row in self.logs()))
 
     def test_profiles_include_only_selected_sidecars(self):
-        for name, sidecar, config in (("ros2-bag-player", "call-injector", {"calls": "/calls.yaml"}),
-                ("ros2-bag-logger", "graph-snapshotter", {"graph": {"enabled": True}})):
-            self.sidecar_image(name, sidecar)
+        for name, sidecar, compose, config in (
+                ("ros2-bag-player", "call-injector", "compose.deploy.yaml", {"calls": "/calls.yaml"}),
+                ("ros2-bag-logger", "graph-snapshotter", "compose.legacy-observer.yaml", {"graph": {"enabled": True}})):
+            self.sidecar_image(name, sidecar, compose)
             proc, _ = self.launch(name, "runtime-images")
             self.assertEqual(json.loads(proc.stdout)["images"], ["fleet-ros:latest"], proc.stderr)
             proc, _ = self.launch(name, "runtime-images", **config)
@@ -192,9 +195,10 @@ class RuntimeImages(unittest.TestCase):
         self.assertNotIn("python3 /release_gate.py", script)
 
     def test_other_bundles_enforce_image_pins(self):
-        for name in SERVICES[1:]:
+        for name in SERVICES.keys() - {"ros2-bag-player"}:
             image = "ros1-bridge:latest" if name == "ros1-bag-logger" else "fleet-ros:latest"
-            proc, _ = self.launch(name, "up", args=("-d",), extra=self.pins(image))
+            config = {"system": {"enabled": False}, "diagnostics": {"enabled": False}} if name == "observer" else {}
+            proc, _ = self.launch(name, "up", args=("-d",), extra=self.pins(image), **config)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertTrue(all(service["image"] == "sha256:" + "1" * 64
                                 for service in self.logs()[-1]["model"]["services"].values()))
