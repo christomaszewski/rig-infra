@@ -10,7 +10,7 @@ import check_replay_runtime as check
 
 ROOT = Path(__file__).resolve().parent.parent
 LABELS = ('LABEL io.rig.rosbag2.replay="1"', 'LABEL io.rig.rosbag2.multi_input="1"',
-          'LABEL io.rig.replay.coordination="1"')
+          'LABEL io.rig.replay.coordination="1"', 'LABEL io.rig.rosbag2.publication_provenance="1"')
 MARKER = "/replay-gate/replay-runtime-checked"
 
 
@@ -54,21 +54,36 @@ class ReplayContract(unittest.TestCase):
         installed = "\n".join(self.stages["packages"][1])
         self.assertIn("ros-${ROS_DISTRO}-rosbag2-storage-mcap", installed)
         parent, run, commands = self.gate_commands()
-        self.assertEqual(parent, "packages")  # the gate sees exactly the packages the image ships
+        self.assertEqual(parent, "provenance-runtime")  # the gate sees the exact patched runtime
         # Every command is chained with &&: a failed check cannot reach the marker.
         self.assertNotRegex(run, r";|\|\|")
         self.assertLess(commands.index("python3 /check_replay_runtime.py"),
                         next(i for i, command in enumerate(commands) if command.endswith("> " + MARKER)))
+        self.assertLess(commands.index("python3 /test_publication_provenance.py"),
+                        next(i for i, command in enumerate(commands) if command.endswith("> " + MARKER)))
         parent, steps = self.stages["runtime-deps"]
-        self.assertEqual(parent, "packages")
+        self.assertEqual(parent, "provenance-runtime")
         self.assertRegex(steps[0], rf"^COPY --from=replay-gate {MARKER} \S+$")
         self.assertEqual([step for step in steps if step.startswith("LABEL io.rig.")], list(LABELS))
         # Only that stage is labelled, and every target is built from it.
         for name, (parent, steps) in self.stages.items():
-            if name not in ("packages", "replay-gate", "runtime-deps"):
+            if name not in ("packages", "provenance-build", "provenance-runtime", "replay-gate", "runtime-deps"):
                 self.assertEqual(parent, "runtime-deps", name)
                 self.assertFalse([step for step in steps if step.startswith("LABEL io.rig.")], name)
         self.assertIn("runtime", self.stages)
+
+    def test_provenance_build_is_pinned_and_keeps_the_runtime_abi(self):
+        parent, steps = self.stages['provenance-build']
+        self.assertEqual(parent, 'packages')
+        self.assertTrue(any('8bbdcf3cb93981de6040ced30c874f1c854b325d8f85f8f667ef656428e915e8' in s
+                            and '/0.33.4.tar.gz' in s for s in steps))
+        self.assertEqual(self.stages['provenance-runtime'][0], 'packages')
+        script = (ROOT / 'base/provenance/build.sh').read_text()
+        self.assertIn("version != '0.33.4'", script)
+        self.assertIn('for package in rosbag2_transport rosbag2_storage_mcap', script)
+        self.assertNotIn('colcon build', script)
+        patch = (ROOT / 'base/provenance/rosbag2-0.33.4.patch').read_text()
+        self.assertNotIn('serialized_bag_message.hpp', patch)
 
     def test_check_script_edits_cannot_change_the_image(self):
         # The script reaches the build as a bind mount of that one file, in a stage no image is
@@ -77,7 +92,8 @@ class ReplayContract(unittest.TestCase):
         # images built FROM the base are not rebuilt.
         _, run, commands = self.gate_commands()
         self.assertEqual(re.findall(r"--mount=(\S+)", run),
-                         ["type=bind,source=check_replay_runtime.py,target=/check_replay_runtime.py"])
+                         ["type=bind,source=check_replay_runtime.py,target=/check_replay_runtime.py",
+                          "type=bind,source=test_publication_provenance.py,target=/test_publication_provenance.py"])
         (marker,) = [command for command in commands if MARKER in command]
         self.assertRegex(marker, rf"^printf '[^'$`]*' > {MARKER}$")
         for name, (parent, steps) in self.stages.items():

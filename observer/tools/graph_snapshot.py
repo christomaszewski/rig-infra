@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ros2-bag-logger graph-snapshotter: record the live ROS 2 graph topology (per-node pubs / subs /
+"""Observer graph worker: record the live ROS 2 graph topology (per-node pubs / subs /
 service servers / clients) into the run directory as append-only, change-deduped EPOCH files —
 `<run>/graph/<name>/epoch_<UTCstamp>.yaml` (flat `<data>/graph/<name>` without a run registry,
 mirroring `bags/`). Bags record data; this records who talked to what. rig (`rig graph`,
@@ -27,15 +27,16 @@ Split like `bag_cmd.py`: a pure core (observation -> canonical form / hash / epo
 no I/O, no ROS — unit-tested in ../tests/) and a thin rclpy shell (`walk` + the resident loop).
 rclpy imports lazily so the core is importable on a dev box without ROS. Parameters travel by env
 (`GRAPH_SNAPSHOT_NAME`, `GRAPH_SNAPSHOT_INTERVAL_S`, `GRAPH_SNAPSHOT_SETTLE_S` — exported by
-ros2-bag-logger-up from the config's `graph:` block); run-dir resolution mirrors record.sh: resolve
+observer-up from the config's `graph:` block); run-dir resolution mirrors recorders: resolve
 `<root>/current` ONCE at process start and pin it (a symlink flip mid-run must not retarget the
-writer).
+writer). Under run_observer, `RIG_OBSERVER_RUN_DIR` pins the same location across worker restarts.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import sys
@@ -161,8 +162,10 @@ def walk(node) -> dict:
 
 
 def resolve_out_dir(root: str, name: str) -> str:
-    """record.sh's resolve-`current`-once block with `graph` in place of `bags` — called ONCE at
-    process start; the result is pinned for the container's life."""
+    """Use the supervisor's pin, or resolve `current` once for standalone execution."""
+    pinned = os.environ.get("RIG_OBSERVER_RUN_DIR")
+    if pinned:
+        return os.path.join(pinned, "graph", name)
     cur = os.path.join(root, "current")
     base = os.path.join(os.path.realpath(cur), "graph") if os.path.exists(cur) \
         else os.path.join(root, "graph")
@@ -195,14 +198,19 @@ def wait_for_stop(seconds: float, stopping) -> bool:
 
 
 def main() -> int:
+    if os.environ.get("OBSERVER_RECORDING_ENABLED", "true").lower() in ("false", "0", "no", "off"):
+        return 0  # graph capture is disk-only; no ROS or run-directory writes
     import rclpy  # lazy: the pure core above stays importable (testable) without ROS
     from rclpy.signals import SignalHandlerOptions
 
-    name = os.environ.get("GRAPH_SNAPSHOT_NAME") or "bag_logger"
+    name = os.environ.get("GRAPH_SNAPSHOT_NAME") or os.environ.get("OBSERVER_NAME") or "bag_logger"
     interval = float(os.environ.get("GRAPH_SNAPSHOT_INTERVAL_S") or 60)
     settle = float(os.environ.get("GRAPH_SNAPSHOT_SETTLE_S") or 2)
     rmw = os.environ.get("RMW_IMPLEMENTATION") or "unknown"
     domain = int(os.environ.get("ROS_DOMAIN_ID") or 0)
+    capture_endpoints = os.environ.get("GRAPH_SNAPSHOT_ENDPOINTS_ENABLED", "true").lower() not in ("false", "0", "no", "off")
+    if capture_endpoints:
+        from endpoint_snapshot import EndpointTracker, atomic_json, observe as observe_endpoints
 
     out_dir = resolve_out_dir(os.environ.get("RIG_BAG_ROOT") or "/data", name)
     os.makedirs(out_dir, exist_ok=True)
@@ -214,13 +222,17 @@ def main() -> int:
         stopping = True
 
     # Own both signals so a stop never invalidates ROS mid-observation or interrupts a write.
-    # The compose command execs Python, so Docker's normal SIGTERM reaches this handler.
+    # The supervisor forwards container stop signals to this worker's process group.
+    # Its shared shutdown deadline also bounds a stalled walk or middleware cleanup,
+    # without interrupting a healthy atomic write here.
     previous_handlers = {sig: signal.signal(sig, request_stop)
                          for sig in (signal.SIGTERM, signal.SIGINT)}
     node = None
     try:
         rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
-        node = rclpy.create_node("graph_snapshotter_" + re.sub(r"[^A-Za-z0-9_]", "_", name))
+        observer = os.environ.get("OBSERVER_NAME")
+        node = (rclpy.create_node("graph_snapshotter", namespace="/" + observer.strip("/"))
+                if observer else rclpy.create_node("graph_snapshotter_" + re.sub(r"[^A-Za-z0-9_]", "_", name)))
         self_fqn = node.get_fully_qualified_name()
         sys.stderr.write(f"graph-snapshotter: {self_fqn} -> {out_dir} "
                          f"(interval={interval:g}s settle={settle:g}s rmw={rmw} domain={domain})\n")
@@ -229,6 +241,7 @@ def main() -> int:
             return 0
 
         tracker = EpochTracker(rmw, domain)
+        endpoint_tracker = EndpointTracker(rmw, domain) if capture_endpoints else None
         while not stopping and rclpy.ok():
             t0 = time.monotonic()
             try:
@@ -241,13 +254,27 @@ def main() -> int:
             now, stamp = _utc()
             action, fname, text = tracker.tick(
                 nodes, now, stamp, lambda f: os.path.exists(os.path.join(out_dir, f)))
+            topology_written = False
             try:
                 atomic_write(os.path.join(out_dir, fname), text)
+                topology_written = True
                 if action == "open":
                     sys.stderr.write(f"graph-snapshotter: epoch {fname} "
                                      f"({len(nodes)} nodes, walk {walk_ms:.0f} ms)\n")
             except OSError as exc:  # disk trouble: keep observing, retry next tick
                 sys.stderr.write(f"graph-snapshotter: write failed ({exc}); retrying next tick\n")
+            if endpoint_tracker is not None and not stopping:
+                try:
+                    topics = {edge["topic"] for entry in nodes.values()
+                              for kind in ("pubs", "subs") for edge in entry[kind]}
+                    observation = observe_endpoints(node, topics, self_fqn)
+                    _, endpoint_file, document = endpoint_tracker.tick(
+                        observation, identity_hash(nodes), fname,
+                        lambda name: os.path.exists(os.path.join(out_dir, name)),
+                        topology_written=topology_written)
+                    atomic_json(Path(out_dir) / endpoint_file, document)
+                except Exception as exc:  # optional provenance never takes down topology capture
+                    sys.stderr.write(f"graph-snapshotter: endpoint capture failed ({exc}); retrying next tick\n")
             if wait_for_stop(interval, lambda: stopping):
                 break
     finally:

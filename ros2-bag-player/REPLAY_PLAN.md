@@ -86,12 +86,15 @@ and writes per-message receive/send/schedule and deduplication provenance. Rig v
 source/output hashes and atomically publishes the immutable generation.
 
 Profiles in `export-profiles/` combine arrival, middleware send, or sensor timing with
-`off`, `conservative`, or `aggressive` deduplication. Conservative mode retains ordinary
-equal-payload messages: typical ROS bags cannot prove their original publisher identity.
-It can remove identical service events with matching client GID, sequence, event kind,
-and event timestamp across inputs. Aggressive mode additionally collapses equal payloads
-on the same topic/type within `dedup_window_ms`; it can remove legitimate repetitions
-and must be explicitly selected. Both preserve repetitions within an individual input.
+`off`, `conservative`, or `aggressive` deduplication. Conservative mode can match ordinary MCAP messages across input recordings
+when both carry the same recorder-attested scope, RMW, ROS domain, writer GID and 64-bit publication
+sequence. The topic, message type, schema, send timestamp and serialized bytes must also agree.
+A conflict for any one publication identity preserves every record with that identity.
+Copies match one-to-one across input recordings, preserving repeats within each recording.
+For legacy or unmarked ordinary messages, even byte-identical samples remain distinct.
+Service events retain their existing match on client GID, sequence, event kind and timestamp.
+Aggressive mode can additionally collapse unmarked equal payloads within `dedup_window_ms`.
+Re-export with the updated profile to use publication identity in a new generation.
 
 Sensor profiles use `header.stamp` by default and explicitly fall back to receive time
 when unavailable. `play.sensor_timestamp_field`, `topic_timestamp_fields`,
@@ -116,11 +119,11 @@ future transform stamps can evict history from a consumer's TF cache.
 
 Sensor ordering preserves PointCloud2 payloads, including point layout and per-point timestamps,
 but not the original causal order across topics. Snapshot triggers and arrival-dependent
-consumers may consequently select different data. Conservative mode retains ordinary overlapping
-clouds, including copies that now share a schedule timestamp. The native proxy tests compare
+consumers may consequently select different data. Conservative mode retains overlapping clouds without publication evidence,
+including copies that share a schedule timestamp. The native proxy tests compare
 arrival and sensor profiles with organized PointCloud2 payloads and TF to cover these semantics.
 Existing proxy generations remain immutable; re-export a sensor profile and re-prepare its recipe
-to adopt revision 2. Explicit artifact IDs continue selecting the original generation.
+to adopt the current revision. Explicit artifact IDs continue selecting the original generation.
 Original indexes must already be valid for export. Missing images are reported with
 an acquisition instruction; this helper does not pull images or start replay services.
 

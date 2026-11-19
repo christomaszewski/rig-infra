@@ -23,6 +23,14 @@ jobs:
               -v "$PWD/base/test_runtime.py:/test_runtime.py:ro" local/fleet-ros:ci \
               python3 /test_runtime.py
           done
+      - name: Record the same publications with two loggers, export and merge
+        run: |
+          docker run --rm --network none -v "$PWD:/src:ro" local/fleet-ros:ci \
+            python3 /src/tests/publication_identity_runtime.py
+      - name: Preserve selected hidden topics, service and action events through export
+        run: |
+          docker run --rm --network none -v "$PWD:/src:ro" local/fleet-ros:ci \
+            python3 /src/ros2-bag-logger/tests/export_runtime_check.py --output /tmp/export-check
       - name: Build and test apt-only messages overlay
         run: |
           printf 'apt: [nmea_msgs]\n' > /tmp/messages.yaml

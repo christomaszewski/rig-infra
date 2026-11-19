@@ -1,6 +1,6 @@
-# On every published GitHub release (tag vX.Y.Z) update this repo's FOUR service entries in the
+# On every published GitHub release (tag vX.Y.Z) update this repo's service entries in the
 # public rig registry — rig-infra is a collection repo, so one repo-wide version covers
-# zenoh-router, ros2-bag-logger, ros2-bag-player and ros1-bag-logger (they ship together and
+# zenoh-router, observer, ros2-bag-logger, ros2-bag-player and ros1-bag-logger (they ship together and
 # share the fleet-ros base). Rewrites each services/<name>/manifest.yaml wholesale (version +
 # source.rev), regenerates
 # index.json with the registry's own tooling, pushes ONE commit. The manifests are OWNED by this
@@ -71,6 +71,7 @@ jobs:
           EOF
           done <<'SERVICES'
           zenoh-router lyrical
+          observer lyrical
           ros2-bag-logger lyrical
           ros2-bag-player lyrical
           ros1-bag-logger noetic
@@ -90,6 +91,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add services/zenoh-router/manifest.yaml \
+                  services/observer/manifest.yaml \
                   services/ros2-bag-logger/manifest.yaml \
                   services/ros2-bag-player/manifest.yaml \
                   services/ros1-bag-logger/manifest.yaml index.json
@@ -97,5 +99,5 @@ jobs:
             echo "registry already current for rig-infra ${VERSION}"
             exit 0
           fi
-          git commit -m "rig-infra ${VERSION} — zenoh-router, ros2-bag-logger, ros2-bag-player, ros1-bag-logger (auto: release ${GITHUB_REF_NAME})"
+          git commit -m "rig-infra ${VERSION} — zenoh-router, observer, ros2-bag-logger, ros2-bag-player, ros1-bag-logger (auto: release ${GITHUB_REF_NAME})"
           git push

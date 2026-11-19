@@ -39,12 +39,36 @@ ARG RMW_IMPLEMENTATION=rmw_zenoh_cpp
 # what it drags in. Accepted.
 RUN rmw_pkg="ros-${ROS_DISTRO}-$(echo "${RMW_IMPLEMENTATION}" | tr '_' '-')" \
     && apt-get update && apt-get install -y --no-install-recommends --no-upgrade \
-        python3-yaml \
+        python3-yaml python3-lz4 python3-zstandard \
         ros-${ROS_DISTRO}-ros-base \
         "${rmw_pkg}" \
         ros-${ROS_DISTRO}-rosbag2 \
         ros-${ROS_DISTRO}-rosbag2-storage-mcap \
     && rm -rf /var/lib/apt/lists/*
+
+# MCAP channel metadata and the full publication sequence are needed during bag export.
+# This pure Python wheel is common to arm64 and amd64. Its codecs come from Ubuntu above.
+ADD --checksum=sha256:9098685d67288a8087166504cf4adf617cfa8639bb60e936af113f62c11c293f https://files.pythonhosted.org/packages/63/22/dad47e86047344f110a9d589d90de49d9c54db7a7ea4f0ef91fb3e8e9f3f/mcap-1.3.1-py3-none-any.whl /tmp/mcap.whl
+RUN python3 -m zipfile -e /tmp/mcap.whl /usr/lib/python3/dist-packages \
+    && rm /tmp/mcap.whl && python3 -c 'import mcap.reader, lz4.frame, zstandard'
+
+# The capture extension is pinned to the installed rosbag2 ABI. Only three implementation
+# libraries change; public structs, CLI, Python bindings and other ROS libraries stay stock.
+# The compression implementation carries identity across both MESSAGE and FILE zstd paths.
+# Fail the version guard on an upstream upgrade until its source patch is revalidated.
+FROM packages AS provenance-build
+ARG ROS_DISTRO
+RUN apt-get update && apt-get install -y --no-install-recommends --no-upgrade \
+        build-essential cmake patch \
+    && rm -rf /var/lib/apt/lists/*
+ADD --checksum=sha256:8bbdcf3cb93981de6040ced30c874f1c854b325d8f85f8f667ef656428e915e8 https://github.com/ros2/rosbag2/archive/refs/tags/0.33.4.tar.gz /tmp/rosbag2.tar.gz
+COPY provenance /provenance
+RUN tar -xzf /tmp/rosbag2.tar.gz -C /tmp \
+    && bash /provenance/build.sh /tmp/rosbag2-0.33.4
+
+FROM packages AS provenance-runtime
+ARG ROS_DISTRO
+COPY --from=provenance-build /rig-provenance/ /opt/ros/${ROS_DISTRO}/
 
 # The replay gate: check_replay_runtime.py exercises the packages installed above against the
 # player API/storage contract. It runs in a stage of its own with the script bind-mounted, and
@@ -55,22 +79,25 @@ RUN rmw_pkg="ros-${ROS_DISTRO}-$(echo "${RMW_IMPLEMENTATION}" | tr '_' '-')" \
 # gave the base new layers, and every dependent a full rebuild, each time the script changed.)
 # A failing check writes no marker and fails the build. Keep the marker's text constant: editing
 # it changes the image.
-FROM packages AS replay-gate
+FROM provenance-runtime AS replay-gate
 ARG ROS_DISTRO
 RUN --mount=type=bind,source=check_replay_runtime.py,target=/check_replay_runtime.py \
+    --mount=type=bind,source=test_publication_provenance.py,target=/test_publication_provenance.py \
     . /opt/ros/${ROS_DISTRO}/setup.sh \
     && python3 /check_replay_runtime.py \
+    && python3 /test_publication_provenance.py \
     && mkdir /replay-gate \
     && printf 'base/check_replay_runtime.py passed when this image was built.\n' \
         > /replay-gate/replay-runtime-checked
 
-FROM packages AS runtime-deps
+FROM provenance-runtime AS runtime-deps
 # Advertise only after the installed runtime passes the player API/storage contract: the labels
 # follow the gate's marker, in the stage both published targets below start from.
 COPY --from=replay-gate /replay-gate/replay-runtime-checked /usr/local/share/rig/replay-runtime-checked
 LABEL io.rig.rosbag2.replay="1"
 LABEL io.rig.rosbag2.multi_input="1"
 LABEL io.rig.replay.coordination="1"
+LABEL io.rig.rosbag2.publication_provenance="1"
 # The ros base image's entrypoint sources /opt/ros/<distro>/setup.bash — commands like
 # `ros2 run rmw_zenoh_cpp rmw_zenohd` and the loggers' record.sh work as-is.
 

@@ -10,7 +10,7 @@ The channel (rig's, per the rigging's ``export: {data: bags/{name}}``):
   RIG_EXPORT_OPTIONS  a YAML file: the profile's block for this instance (schema below; rig
                       never reads it — absent/empty = the defaults)
   RIG_EXPORT_PROFILE  its name (log lines only)
-  RIG_EXPORT_FORCE    "1": redo a session already exported (its output dir is removed first)
+  RIG_EXPORT_FORCE    "1": redo a session already exported (replace only after verification)
   RIG_EXPORT_NAME     the DATA name to work on when it is not this config's `name` — a run from
                       another deployment, an instance since renamed (rig >= v0.2.59)
   RIG_EXPORT_INPLACE  "1": REWRITE the sessions inside the run (`rig run export --in-place`):
@@ -24,7 +24,8 @@ The channel (rig's, per the rigging's ``export: {data: bags/{name}}``):
 The options (every key optional; unknown keys REFUSE — a typo must not silently keep the data):
   preset: zstd_small        mcap chunk compression for the output (none|fastwrite|zstd_fast|
                             zstd_small; default zstd_small — smallest, the point of an export)
-  exclude: [regex, ...]     topics to DROP (joined into one --exclude-regex; e.g. '.*/points$')
+  exclude: [regex, ...]     full topic names to DROP (e.g. '.*/points$'); resolved to exact
+                            retained names so hidden, service and action interfaces agree
   topics: [/exact, ...]     an ALLOW list instead of everything (composes with exclude)
   from_s / to_s: seconds    a time window, counted from EACH session's bag start (its
                             metadata.yaml starting_time — the same zero rig replay --from uses)
@@ -37,23 +38,26 @@ is SKIPPED with a warning naming the fix (``ros2 bag reindex`` on the vehicle) �
 Idempotent: a session whose output already carries a metadata.yaml is skipped unless FORCE.
 
 ``plan(...)`` is the pure core (sessions -> specs + the script text); ``main`` writes the specs
-and the script under <dest>/.rig/export/<name>/ (visible in-container at the same path, since
+and the script under <dest>/.rig/export/<name>/<invocation>/ (visible in-container at the same path, since
 the launcher mounts both dirs at their host paths) and prints ``<script>\\t<count>\\t<name>``.
 """
 from __future__ import annotations
 
 import os
+import math
 import pathlib
 import re
 import shlex
 import shutil
 import sys
+import uuid
 
 import yaml
 
 PRESETS = ("none", "fastwrite", "zstd_fast", "zstd_small")
 KNOWN = {"preset", "exclude", "topics", "from_s", "to_s", "split_duration_s", "max_size_mb"}
 REWRITE_DIR = ".rig-rewrite"
+EXPORT_WORK_DIR = ".rig-export"
 
 # Runs INSIDE the image (python3 + yaml ship with ros2cli): compare the converted session's
 # per-topic message counts with the original's. all = every topic with messages must match
@@ -122,8 +126,8 @@ def parse_options(raw) -> dict:
             sec = float(val)
         except (TypeError, ValueError):
             raise SystemExit(f"bag_export: {key} must be seconds (got {val!r})")
-        if sec < 0:
-            raise SystemExit(f"bag_export: {key} must be >= 0")
+        if not math.isfinite(sec) or sec < 0:
+            raise SystemExit(f"bag_export: {key} must be finite and >= 0")
         out[key] = sec
     if out["from_s"] is not None and out["to_s"] is not None and out["to_s"] <= out["from_s"]:
         raise SystemExit("bag_export: to_s must be greater than from_s")
@@ -167,32 +171,42 @@ def read_bag_start(text: str, where: str) -> int:
                          f"is this a rosbag2 metadata.yaml?")
 
 
-def session_spec(session_src: str, session_dest: str, opts: dict, bag_start_ns: int | None) -> dict:
+def session_spec(session_src: str, session_dest: str, opts: dict, bag_start_ns: int | None,
+                 topic_names: list[str] | None = None) -> dict:
     """One `ros2 bag convert` output spec (the YAML rosbag2 takes with -o), pure."""
     spec: dict = {"uri": session_dest, "storage_id": "mcap"}
     if opts["preset"] != "none":
         spec["storage_preset_profile"] = opts["preset"]
-    if opts["topics"]:
-        spec["topics"] = list(opts["topics"])
-        spec["all_topics"] = False
+    spec["include_hidden_topics"] = True
+    if opts["topics"] or opts["exclude"]:
+        # TopicFilter's regex changes meaning for service/action interfaces
+        # (it matches their base name). Resolve the user's full-topic filter
+        # once instead, then use exact regular/action topic + service-event lists.
+        names = opts["topics"] or topic_names or []
+        selected = sorted({name for name in names
+                           if not any(re.search(pattern, name) for pattern in opts["exclude"])})
+        spec.update(topics=selected, services=selected, all_topics=False,
+                    all_services=False, all_actions=False)
     else:
-        spec["all_topics"] = True
-    if opts["exclude"]:
-        pats = opts["exclude"]
-        spec["exclude_regex"] = pats[0] if len(pats) == 1 else "|".join(f"(?:{p})" for p in pats)
+        spec.update(all_topics=True, all_services=True, all_actions=True)
     if opts.get("split_duration_s"):
         spec["max_bagfile_duration"] = int(opts["split_duration_s"])
     if opts.get("max_size_mb"):
         spec["max_bagfile_size"] = int(opts["max_size_mb"]) * 1024 * 1024
+    result = {"output_bags": [spec]}
     if opts["from_s"] is not None or opts["to_s"] is not None:
         if bag_start_ns is None:
             raise SystemExit(f"bag_export: {session_src}: from_s/to_s need the session's "
                              f"metadata.yaml (its starting_time is the window's zero)")
+        # rosbag2 applies time bounds to the INPUT StorageOptions. Putting them
+        # on the output silently converts the entire session.
+        input_spec = {"uri": session_src}
         if opts["from_s"] is not None:
-            spec["start_time_ns"] = bag_start_ns + int(round(opts["from_s"] * 1e9))
+            input_spec["start_time_ns"] = bag_start_ns + int(round(opts["from_s"] * 1e9))
         if opts["to_s"] is not None:
-            spec["end_time_ns"] = bag_start_ns + int(round(opts["to_s"] * 1e9))
-    return {"output_bags": [spec]}
+            input_spec["end_time_ns"] = bag_start_ns + int(round(opts["to_s"] * 1e9))
+        result["input_bags"] = [input_spec]
+    return result
 
 
 def find_sessions(tree: pathlib.Path) -> tuple[list[pathlib.Path], list[str]]:
@@ -202,7 +216,7 @@ def find_sessions(tree: pathlib.Path) -> tuple[list[pathlib.Path], list[str]]:
     if not tree.is_dir():
         return sessions, warns
     for d in sorted(p for p in tree.iterdir() if p.is_dir() and not p.name.startswith(".")):
-        bags = [f for f in d.iterdir() if f.suffix == ".mcap" or f.suffix == ".db3"]
+        bags = [f for f in d.iterdir() if f.name.endswith((".mcap", ".db3", ".mcap.zstd", ".db3.zstd"))]
         if not bags:
             continue
         if not (d / "metadata.yaml").is_file():
@@ -222,21 +236,38 @@ def plan(source: str, dest: str, subdir: str, name: str, opts: dict, *, force: b
     rosbag2 names the files after the session, and the same filesystem, so the swap is a
     rename), is verified by verify.py, then replaces the original."""
     tree = pathlib.Path(source) / subdir / name
+    destination_tree = tree if in_place else pathlib.Path(dest) / subdir / name
+    work = destination_tree / (REWRITE_DIR if in_place else EXPORT_WORK_DIR)
     sessions, warns = find_sessions(tree)
+    metadata_paths = {sess: sess / "metadata.yaml" for sess in sessions}
+    if in_place:
+        # A crash can leave the source at .orig between the two publication
+        # renames. Plan from that metadata, then restore it under the runtime
+        # lock before reading/converting. Do not strand it behind count=0.
+        for backup in sorted(work.glob("*.orig")):
+            original = tree / backup.name.removesuffix(".orig")
+            if not original.exists() and (backup / "metadata.yaml").is_file():
+                sessions.append(original)
+                metadata_paths[original] = backup / "metadata.yaml"
+        sessions.sort()
     if not sessions:
         warns.append(f"no sessions under {tree} — nothing to export")
-    work = tree / REWRITE_DIR
     jobs: list[tuple[pathlib.Path, dict, pathlib.Path]] = []
     for sess in sessions:
-        out_dir = (work / sess.name) if in_place else pathlib.Path(dest) / subdir / name / sess.name
-        if not in_place and (out_dir / "metadata.yaml").is_file() and not force:
-            warns.append(f"{sess.name}: already exported ({out_dir}) — skipped (RIG_EXPORT_FORCE=1 "
+        final_dir = destination_tree / sess.name
+        out_dir = work / sess.name
+        if not in_place and (final_dir / "metadata.yaml").is_file() and not force:
+            warns.append(f"{sess.name}: already exported ({final_dir}) — skipped (RIG_EXPORT_FORCE=1 "
                          f"redoes it)")
             continue
         bag_start = None
         if opts["from_s"] is not None or opts["to_s"] is not None:
-            bag_start = read_bag_start((sess / "metadata.yaml").read_text(), str(sess / "metadata.yaml"))
-        spec = session_spec(str(sess), str(out_dir), opts, bag_start)
+            bag_start = read_bag_start(metadata_paths[sess].read_text(), str(metadata_paths[sess]))
+        info = (yaml.safe_load(metadata_paths[sess].read_text()) or {}).get("rosbag2_bagfile_information", {})
+        topic_names = [entry.get("topic_metadata", {}).get("name")
+                       for entry in info.get("topics_with_message_count", [])]
+        topic_names = [topic for topic in topic_names if isinstance(topic, str)]
+        spec = session_spec(str(sess), str(out_dir), opts, bag_start, topic_names)
         jobs.append((sess, spec, spec_dir / f"{sess.name}.yaml"))
     lines = ["#!/usr/bin/env bash",
              f"# rendered by bag_export.py — `ros2 bag convert` per session, {name}: "
@@ -248,49 +279,69 @@ def plan(source: str, dest: str, subdir: str, name: str, opts: dict, *, force: b
              "set -o pipefail   # never -u: ROS setup.bash reads unset vars (AMENT_TRACE_SETUP_FILES)",
              ROS_SOURCE,
              "rc=0"]
-    if in_place:
-        q_work, q_tree = shlex.quote(str(work)), shlex.quote(str(tree))
-        q_verify = shlex.quote(str(spec_dir / "verify.py"))
-        mode = verify_mode(opts)
-        lines += [f"mkdir -p {q_work}",
-                  "# a crash between the two renames of an earlier run left <session>.orig and no",
-                  "# <session>: put the original back before anything else",
-                  f"for o in {q_work}/*.orig; do [ -e \"$o\" ] || continue; "
-                  f"s={q_tree}/$(basename \"${{o%.orig}}\"); "
-                  f"if [ -e \"$s\" ]; then rm -rf \"$o\"; else mv \"$o\" \"$s\"; fi; done"]
-        for sess, spec, spec_path in jobs:
-            out_dir = spec["output_bags"][0]["uri"]
-            q_sess, q_spec, q_out = shlex.quote(str(sess)), shlex.quote(str(spec_path)), shlex.quote(out_dir)
-            q_orig = shlex.quote(str(work / f"{sess.name}.orig"))
-            lines += [
-                f"need=$(du -sk {q_sess} | cut -f1); have=$(df -Pk {q_tree} | awk 'NR==2{{print $4}}')",
-                f"if [ \"${{have:-0}}\" -lt \"$need\" ]; then",
-                f"  echo \"bag_export: {sess.name}: needs ${{need}} KB free for the rewrite, "
-                f"${{have:-0}} KB available — skipped, original untouched\" >&2; rc=1",
-                "else",
-                f"  rm -rf {q_out}",
-                f"  if ros2 bag convert -i {q_sess} -o {q_spec} "
-                f"&& python3 {q_verify} {q_sess}/metadata.yaml {q_out}/metadata.yaml {mode}; then",
-                f"    if mv {q_sess} {q_orig} && mv {q_out} {q_sess}; then",
-                f"      rm -rf {q_orig}",
-                f"      echo \"bag_export: {sess.name}: ${{need}} KB -> $(du -sk {q_sess} | cut -f1) KB "
-                f"(in place)\" >&2",
-                f"    else [ -e {q_sess} ] || mv {q_orig} {q_sess}; "
-                f"echo \"bag_export: {sess.name}: swap FAILED — original restored\" >&2; rc=1; fi",
-                f"  else echo \"bag_export: {sess.name}: convert/verify FAILED — original "
-                f"untouched\" >&2; rm -rf {q_out}; rc=1; fi",
-                "fi"]
-        lines.append(f"rmdir {q_work} 2>/dev/null")
-    else:
-        for sess, spec, spec_path in jobs:
-            out_dir = spec["output_bags"][0]["uri"]
-            q_sess, q_spec, q_out = shlex.quote(str(sess)), shlex.quote(str(spec_path)), shlex.quote(out_dir)
-            lines += [f"rm -rf {q_out}  # convert refuses an existing output dir",
-                      f"if ros2 bag convert -i {q_sess} -o {q_spec}; then",
-                      f"  echo \"bag_export: {sess.name}: $(du -sk {q_sess} | cut -f1) KB -> "
-                      f"$(du -sk {q_out} | cut -f1) KB\" >&2",
-                      f"else echo \"bag_export: {sess.name}: ros2 bag convert FAILED\" >&2; "
-                      f"rm -rf {q_out}; rc=1; fi"]
+    q_work, q_tree = shlex.quote(str(work)), shlex.quote(str(destination_tree))
+    q_verify = shlex.quote(str(spec_dir / "verify.py"))
+    q_provenance = shlex.quote(str(spec_dir / "export_provenance.py"))
+    mode = verify_mode(opts)
+    q_lock = shlex.quote(str(destination_tree / ".rig-export.lock"))
+    lines += ["command -v flock >/dev/null 2>&1 || { echo 'bag_export: runtime needs flock for safe concurrent exports; use fleet-ros' >&2; exit 1; }",
+              f"mkdir -p {q_tree} || exit 1",
+              f"exec 9>{q_lock} || exit 1",
+              "flock -n 9 || { echo 'bag_export: another export is active for this destination/logger; retry after it finishes' >&2; exit 1; }",
+              f"mkdir -p {q_work} || exit 1",
+              "# Recover a crash between verified publication's two renames.",
+              f"for o in {q_work}/*.orig; do [ -e \"$o\" ] || continue; "
+              f"s={q_tree}/$(basename \"${{o%.orig}}\"); "
+              f"if [ -e \"$s\" ]; then rm -rf \"$o\"; else mv \"$o\" \"$s\"; fi; done"]
+    for sess, spec, spec_path in jobs:
+        out_dir = spec["output_bags"][0]["uri"]
+        q_sess, q_spec, q_out = shlex.quote(str(sess)), shlex.quote(str(spec_path)), shlex.quote(out_dir)
+        q_final = shlex.quote(str(destination_tree / sess.name))
+        q_orig = shlex.quote(str(work / f"{sess.name}.orig"))
+        if not in_place and not force:
+            lines += [f"if [ -f {q_final}/metadata.yaml ]; then",
+                      f"  echo 'bag_export: {sess.name}: already exported after locking — skipped' >&2",
+                      "else"]
+        lines += [f"need=$(du -sk {q_sess} | cut -f1)"]
+        if in_place:
+            lines += [f"have=$(df -Pk {q_tree} | awk 'NR==2{{print $4}}')",
+                      "if [ \"${have:-0}\" -lt \"$need\" ]; then",
+                      f"  echo \"bag_export: {sess.name}: needs ${{need}} KB free for the rewrite, "
+                      "${have:-0} KB available — skipped, original untouched\" >&2; rc=1",
+                      "else"]
+        q_state = shlex.quote(str(spec_dir / f"{sess.name}.provenance.sqlite"))
+        input_args = f"--input-options {q_spec}" if "input_bags" in spec else f"-i {q_sess}"
+        info = (yaml.safe_load(metadata_paths[sess].read_text()) or {}).get("rosbag2_bagfile_information", {})
+        file_compressed = str(info.get("compression_mode", "")).lower() == "file"
+        prepare = f"python3 {q_provenance} prepare {q_sess} {q_spec} {q_state}"
+        if file_compressed:
+            q_input = shlex.quote(str(work / f"{sess.name}.input"))
+            q_input_spec = shlex.quote(str(spec_dir / f"{sess.name}.input.yaml"))
+            lines += [f"rm -rf {q_input}"]
+            prepare += f" && python3 {q_provenance} stage-input {q_sess} {q_input} {q_spec} {q_input_spec}"
+            input_args = f"--input-options {q_input_spec}"
+        convert = (f"{prepare} && ros2 bag convert {input_args} -o {q_spec}"
+                   f" && python3 {q_provenance} verify {q_out} {q_state}")
+        if in_place:
+            convert += f" && python3 {q_verify} {q_sess}/metadata.yaml {q_out}/metadata.yaml {mode}"
+        lines += [f"rm -rf {q_out}  # only remove staging; preserve a prior exported session",
+                  f"if {convert}; then",
+                  f"  if {{ [ ! -e {q_final} ] || mv {q_final} {q_orig}; }} && mv {q_out} {q_final}; then",
+                  f"    rm -rf {q_orig}",
+                  f"    echo \"bag_export: {sess.name}: ${{need}} KB -> $(du -sk {q_final} | cut -f1) KB"
+                  + (" (in place)" if in_place else "") + "\" >&2",
+                  f"  else [ -e {q_final} ] || {{ [ ! -e {q_orig} ] || mv {q_orig} {q_final}; }}; "
+                  f"echo \"bag_export: {sess.name}: publish FAILED — original restored\" >&2; rc=1; fi",
+                  f"else echo \"bag_export: {sess.name}: convert/verify FAILED — original untouched\" "
+                  f">&2; rm -rf {q_out}; rc=1; fi",
+                  f"rm -f {q_state} {q_state}-journal"]
+        if file_compressed:
+            lines += [f"rm -rf {q_input}", f"rm -f {q_input_spec}"]
+        if in_place:
+            lines.append("fi")
+        if not in_place and not force:
+            lines.append("fi")
+    lines.append(f"rmdir {q_work} 2>/dev/null || true")
     lines.append("exit $rc")
     return jobs, "\n".join(lines) + "\n", warns
 
@@ -324,7 +375,9 @@ def main(argv: list[str], env: dict | None = None) -> int:
             raise SystemExit("bag_export: these options DROP data and in place that is permanent: "
                              + "; ".join(drops) + " — `rig run export --in-place --lossy` to "
                              "mean it, or drop them for a lossless recompress")
-    spec_dir = pathlib.Path(dest) / ".rig" / "export" / name
+    # Each launch owns immutable scripts/specs while another container may still
+    # be using an earlier render. The runtime lock protects staging/publication.
+    spec_dir = pathlib.Path(dest) / ".rig" / "export" / name / uuid.uuid4().hex
     jobs, script, warns = plan(source, dest, subdir, name, opts, force=force, spec_dir=spec_dir,
                                in_place=in_place)
     for w in warns:
@@ -332,6 +385,8 @@ def main(argv: list[str], env: dict | None = None) -> int:
     spec_dir.mkdir(parents=True, exist_ok=True)
     for _, spec, spec_path in jobs:
         spec_path.write_text(yaml.safe_dump(spec, sort_keys=False))
+    for helper in ("export_provenance.py", "publication_identity.py"):
+        shutil.copyfile(pathlib.Path(__file__).resolve().parent / helper, spec_dir / helper)
     if in_place:
         (spec_dir / "verify.py").write_text(VERIFY_PY)
     script_path = spec_dir / "convert.sh"

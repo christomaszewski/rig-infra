@@ -16,6 +16,9 @@ import re
 import sqlite3
 import sys
 
+from publication_identity import compression, identity_key, iter_mcap_records
+from mcap_proxy import descriptor as mcap_descriptor, descriptor_hash, write_proxy
+
 
 DEFAULTS = dict(time_source="received", deduplication="conservative",
                 sensor_timestamp_field="header.stamp", timestamp_fallback="error",
@@ -146,11 +149,14 @@ class MergeIndex:
             CREATE TABLE records(id INTEGER PRIMARY KEY, source INTEGER, ordinal INTEGER,
               topic TEXT, received INTEGER, sent INTEGER, effective INTEGER, payload BLOB,
               signature TEXT, identity TEXT, priority INTEGER, schedule_basis TEXT,
+              publication_identity TEXT, publication_content TEXT, channel INTEGER,
+              sequence INTEGER, source_record TEXT,
               keep INTEGER DEFAULT 1, duplicate_of INTEGER,
               reason TEXT DEFAULT 'retained');
             CREATE INDEX receive_order ON records(received,source,ordinal);
             CREATE INDEX signature ON records(signature,received);
             CREATE INDEX identity ON records(identity);
+            CREATE INDEX publication_identity ON records(publication_identity);
             CREATE INDEX schedule ON records(effective,priority,source,ordinal);
             CREATE TABLE static_frames(topic TEXT, child TEXT, geometry TEXT,
                                        PRIMARY KEY(topic,child));
@@ -159,8 +165,21 @@ class MergeIndex:
         """)
         self.count = 0
         self.fallback_count = 0
+        self.channels = {}
+        self._channel_ids = {}
+        self._channel_schema_hashes = {}
 
-    def add(self, source, ordinal, topic, topic_type, payload, received, sent, message=None):
+    def channel(self, descriptor):
+        key = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+        if key not in self._channel_ids:
+            channel = len(self.channels) + 1
+            self._channel_ids[key] = channel
+            self.channels[channel] = descriptor
+            self._channel_schema_hashes[channel] = descriptor_hash(descriptor.get("schema"))
+        return self._channel_ids[key]
+
+    def add(self, source, ordinal, topic, topic_type, payload, received, sent, message=None,
+            *, channel=None, sequence=0, source_record=None):
         if type(received) is not int or not 0 <= received < 2**63 or type(sent) is not int:
             raise ValueError(f"{topic}: invalid original timestamp")
         sensor_tf = self.settings["time_source"] == "sensor" and topic_type == TF_TYPE
@@ -181,10 +200,21 @@ class MergeIndex:
         identity = proven_identity(topic_type, message)
         if identity is not None:
             identity = json.dumps([signature, identity])
+        descriptor = self.channels.get(channel, {})
+        # Preserve the established service-event identity policy. Its client/request
+        # identity can intentionally span different publishing service endpoints.
+        publication = (None if topic_type.endswith("_Event") and "/srv/" in topic_type else
+                       identity_key(descriptor.get("metadata", {}), sequence))
+        content = json.dumps([signature, sent, self._channel_schema_hashes.get(channel),
+                              descriptor.get("metadata", {}).get("topic_type_hash", "")],
+                             sort_keys=True, separators=(",", ":")) if publication else None
         self.db.execute("INSERT INTO records(source,ordinal,topic,received,sent,effective,payload,"
-                        "signature,identity,priority,schedule_basis) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        "signature,identity,priority,schedule_basis,publication_identity,"
+                        "publication_content,channel,sequence,source_record) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (source, ordinal, topic, received, sent, effective, payload, signature, identity,
-                         priority, basis))
+                         priority, basis, publication, content, channel, sequence,
+                         json.dumps(source_record) if source_record is not None else None))
         self.count += 1
         self.fallback_count += fallback
         if self.count % 1000 == 0:
@@ -213,29 +243,53 @@ class MergeIndex:
     def deduplicate(self):
         self.db.commit()
         stats = dict(input_messages=self.count, output_messages=self.count, proven_duplicates=0,
-                     likely_duplicates=0, ambiguous_preserved=0, timestamp_fallbacks=self.fallback_count)
+                     publication_duplicates=0, likely_duplicates=0, ambiguous_preserved=0,
+                     timestamp_fallbacks=self.fallback_count)
+        # A later conflicting payload must invalidate earlier potential matches too.
+        # Scope/domain/GID/sequence identifies the publication independently of bytes.
+        self.db.executescript("""
+            CREATE TEMP TABLE identity_conflicts AS
+              SELECT publication_identity FROM records WHERE publication_identity IS NOT NULL
+              GROUP BY publication_identity HAVING COUNT(DISTINCT publication_content)>1;
+            CREATE UNIQUE INDEX conflicting_identity ON identity_conflicts(publication_identity);
+            UPDATE records SET reason='publication_identity_conflict'
+              WHERE publication_identity IN (SELECT publication_identity FROM identity_conflicts);
+        """)
+        stats["conflicting_publication_identities"] = self.db.execute(
+            "SELECT COUNT(*) FROM identity_conflicts").fetchone()[0]
+        stats["conflicting_publication_records"] = self.db.execute(
+            "SELECT COUNT(*) FROM records WHERE reason='publication_identity_conflict'").fetchone()[0]
+        stats["publication_identity_records"] = self.db.execute(
+            "SELECT COUNT(*) FROM records WHERE publication_identity IS NOT NULL").fetchone()[0]
         mode = self.settings["deduplication"]
         window = int(self.settings["dedup_window_ms"] * 1e6)
         # The selected canonical must precede this record in the total receive order.
-        for rid, source, ordinal, received, signature, identity in self.db.execute(
-                "SELECT id,source,ordinal,received,signature,identity FROM records "
+        for rid, source, ordinal, received, signature, identity, publication, conflict in self.db.execute(
+                "SELECT id,source,ordinal,received,signature,identity,publication_identity,"
+                "reason='publication_identity_conflict' FROM records "
                 "ORDER BY received,source,ordinal"):
-            if mode == "off":
+            if mode == "off" or conflict:
                 continue
             common = (" AND keep=1 AND source!=? AND (received,source,ordinal)<(?,?,?) "
                       "AND NOT EXISTS(SELECT 1 FROM matched WHERE canonical=records.id AND source=?) "
                       "ORDER BY received,source,ordinal LIMIT 1")
             args = (source, received, source, ordinal, source)
             match = None
-            if identity:
+            if publication:
+                match = self.db.execute("SELECT id FROM records WHERE publication_identity=?" + common,
+                                        (publication, *args)).fetchone()
+            elif identity:
                 match = self.db.execute("SELECT id FROM records WHERE identity=?" + common,
                                         (identity, *args)).fetchone()
             reason = "proven_duplicate"
             if match:
                 stats["proven_duplicates"] += 1
-            else:
+                if publication:
+                    stats["publication_duplicates"] += 1
+            elif not publication:
                 likely = self.db.execute("SELECT id FROM records WHERE signature=? "
-                    "AND received>=?" + common, (signature, received - window, *args)).fetchone()
+                    "AND publication_identity IS NULL AND received>=?" + common,
+                    (signature, received - window, *args)).fetchone()
                 if likely:
                     if mode == "aggressive":
                         match, reason = likely, "likely_duplicate"
@@ -265,23 +319,49 @@ class MergeIndex:
         return self.db.execute("SELECT topic,payload,effective,sent FROM records WHERE keep=1 "
                                "ORDER BY effective,priority,source,ordinal")
 
+    def output_records(self):
+        return self.db.execute("SELECT topic,payload,effective,sent,channel,sequence FROM records WHERE keep=1 "
+                               "ORDER BY effective,priority,source,ordinal")
+
     def provenance(self, path):
         with Path(path).open("w") as stream:
             for row in self.db.execute("SELECT id,source,ordinal,topic,received,sent,effective,"
-                                       "duplicate_of,reason,schedule_basis,priority FROM records ORDER BY id"):
-                stream.write(json.dumps(dict(zip(("id", "input", "ordinal", "topic", "received_ns",
+                                       "duplicate_of,reason,schedule_basis,priority,publication_identity,"
+                                       "source_record FROM records ORDER BY id"):
+                values = dict(zip(("id", "input", "ordinal", "topic", "received_ns",
                     "sent_ns", "schedule_ns", "duplicate_of", "decision", "schedule_basis",
-                    "schedule_priority"), row)), separators=(",", ":")) + "\n")
+                    "schedule_priority", "publication_identity", "source_record"), row))
+                for key in ("publication_identity", "source_record"):
+                    if values[key] is not None:
+                        values[key] = json.loads(values[key])
+                stream.write(json.dumps(values, separators=(",", ":")) + "\n")
 
     def close(self):
         self.db.close()
 
 
 def convert(request):
-    implementation_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    source = Path(__file__)
+    producer = {
+        "implementation_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "module_sha256": {
+            name: hashlib.sha256(source.with_name(name).read_bytes()).hexdigest()
+            for name in ("mcap_proxy.py", "publication_identity.py")
+        },
+    }
     import rosbag2_py
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message, get_service
+
+    try:
+        import mcap  # noqa: F401 — require inspection before accepting any MCAP source.
+    except ImportError:
+        if any(bag["storage"] == "mcap" for bag in request["bags"]):
+            raise ValueError("bag proxy: MCAP inputs require the updated player image with Python mcap; "
+                             "publication evidence cannot safely be inspected by the older ROS reader") from None
+        raw_output = False  # Older images can still merge SQLite-only, unmarked recordings.
+    else:
+        raw_output = True
 
     settings = policy(request["policy"])
     stage = Path(request["destination"])
@@ -290,14 +370,24 @@ def convert(request):
     index_path = stage / "merge.sqlite3"
     index = MergeIndex(index_path, settings)
     topics, classes, unknown_qos = {}, {}, set()
-    writer = None
     try:
         for source, bag in enumerate(request["bags"]):
-            reader = rosbag2_py.SequentialReader()
-            reader.open(rosbag2_py.StorageOptions(uri=bag["path"], storage_id=bag["storage"]),
-                        rosbag2_py.ConverterOptions("cdr", "cdr"))
+            mode, _ = compression(bag["path"])
+            reader = None
+            if bag["storage"] == "mcap":
+                # Metadata-only ROS API avoids its compression reader writing
+                # decompressed files into the read-only source recording.
+                info = rosbag2_py.Info().read_metadata(bag["path"], "mcap")
+                bag_topics = [entry.topic_metadata for entry in info.topics_with_message_count]
+            else:
+                if mode:
+                    raise ValueError("bag proxy: outer compression is supported for MCAP inputs only")
+                reader = rosbag2_py.SequentialReader()
+                reader.open(rosbag2_py.StorageOptions(uri=bag["path"], storage_id=bag["storage"]),
+                            rosbag2_py.ConverterOptions("cdr", "cdr"))
+                bag_topics = reader.get_all_topics_and_types()
             available = {}
-            for tm in reader.get_all_topics_and_types():
+            for tm in bag_topics:
                 if tm.serialization_format != "cdr":
                     raise ValueError(f"{tm.name}: only CDR bag serialization is supported")
                 previous = topics.get(tm.name)
@@ -324,9 +414,28 @@ def convert(request):
                     if not tm.offered_qos_profiles:
                         unknown_qos.add(tm.name)
                 available[tm.name] = tm.type
-            ordinal = 0
-            while reader.has_next():
-                topic, payload, received, sent = reader.read_next_ext()[:4]
+            def records():
+                if bag["storage"] == "mcap":
+                    raw_channels = {}
+                    def register_raw(file_path, schema, channel):
+                        if channel.message_encoding != "cdr":
+                            raise ValueError(f"{channel.topic}: only CDR bag serialization is supported")
+                        if channel.topic not in available:
+                            raise ValueError(f"{channel.topic}: raw channel absent from bag metadata")
+                        if schema and schema.name != available.get(channel.topic):
+                            raise ValueError(f"{channel.topic}: raw channel type disagrees with bag metadata")
+                        raw_channels[file_path, channel.id] = index.channel(mcap_descriptor(schema, channel))
+                    for raw in iter_mcap_records(bag["path"], on_channel=register_raw):
+                        channel, data = raw.channel, raw.message
+                        key = (raw.file_path, channel.id)
+                        yield (channel.topic, data.data, data.log_time, data.publish_time,
+                               raw_channels[key], data.sequence,
+                               dict(file=raw.file_path.name, record=raw.file_ordinal, channel_id=channel.id))
+                else:
+                    while reader.has_next():
+                        yield (*reader.read_next_ext()[:4], None, 0, None)
+
+            for ordinal, (topic, payload, received, sent, channel, sequence, source_record) in enumerate(records()):
                 topic_type = available[topic]
                 message = None
                 needs_sensor = settings["time_source"] == "sensor"
@@ -343,25 +452,30 @@ def convert(request):
                         message = deserialize_message(payload, cls)
                     elif needs_sensor and settings["timestamp_fallback"] == "error":
                         raise ValueError(f"{topic}: message type unavailable for sensor timestamps: {topic_type}")
-                index.add(source, ordinal, topic, topic_type, bytes(payload), received, sent, message)
-                ordinal += 1
+                index.add(source, ordinal, topic, topic_type, bytes(payload), received, sent, message,
+                          channel=channel, sequence=sequence, source_record=source_record)
             del reader
         stats = index.deduplicate()
         stats["unknown_qos_topics"] = sorted(unknown_qos)
         stats["unavailable_message_types"] = sorted(name for name, cls in classes.items() if cls is None)
         if not stats["output_messages"]:
             raise ValueError("bag proxy has no messages")
-        writer = rosbag2_py.SequentialWriter()
-        writer.open(rosbag2_py.StorageOptions(uri=str(stage / "bag"), storage_id="mcap"),
-                    rosbag2_py.ConverterOptions("cdr", "cdr"))
-        for name in sorted(topics):
-            writer.create_topic(topics[name])
+        if raw_output:
+            write_proxy(stage / "bag", topics, index)
+        else:
+            writer = rosbag2_py.SequentialWriter()
+            writer.open(rosbag2_py.StorageOptions(uri=str(stage / "bag"), storage_id="mcap"),
+                        rosbag2_py.ConverterOptions("cdr", "cdr"))
+            try:
+                for name in sorted(topics):
+                    writer.create_topic(topics[name])
+                for topic, payload, effective, sent in index.output():
+                    writer.write(topic, payload, recv_timestamp=effective, send_timestamp=sent)
+            finally:
+                writer.close()
         expected = hashlib.sha256()
         for topic, payload, effective, sent in index.output():
-            writer.write(topic, payload, recv_timestamp=effective, send_timestamp=sent)
             expected.update(json.dumps([topic, effective, sent, hashlib.sha256(payload).hexdigest()]).encode())
-        writer.close()
-        writer = None
         reader = rosbag2_py.SequentialReader()
         reader.open(rosbag2_py.StorageOptions(uri=str(stage / "bag"), storage_id="mcap"),
                     rosbag2_py.ConverterOptions("cdr", "cdr"))
@@ -377,14 +491,13 @@ def convert(request):
         if count != stats["output_messages"] or actual.digest() != expected.digest():
             raise ValueError("bag proxy verification failed: written messages differ")
         index.provenance(stage / "messages.jsonl")
-        result = dict(version=1, validation={"ok": True, "payloads_verified": True},
+        result = dict(version=1, validation={"ok": True, "payloads_verified": True,
+                                          "publication_metadata_verified": raw_output},
                       statistics=stats, policy=settings,
-                      producer={"implementation_sha256": implementation_sha})
+                      producer=producer)
         (stage / "report.json").write_text(json.dumps(result, indent=2) + "\n")
         return result
     finally:
-        if writer is not None:
-            writer.close()
         index.close()
         index_path.unlink(missing_ok=True)
 

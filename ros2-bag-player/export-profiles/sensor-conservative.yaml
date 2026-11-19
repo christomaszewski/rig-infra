@@ -1,7 +1,7 @@
 {
   "version": 1,
   "id": "sensor-conservative",
-  "revision": 2,
+  "revision": 3,
   "format": "rosbag2-proxy/v1",
   "lossy": true,
   "policy": {

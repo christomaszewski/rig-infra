@@ -93,9 +93,10 @@ def test_specs_per_session_with_the_default_preset():
         assert warns == []
         assert [j[0].name for j in jobs] == ["bag_logger_20260101T000000Z", "bag_logger_20260101T001000Z"]
         sess, spec, spec_path = jobs[0]
-        assert spec == {"output_bags": [{"uri": str(dest / "bags" / "bag_logger" / sess.name),
+        assert spec == {"output_bags": [{"uri": str(dest / "bags" / "bag_logger" / ".rig-export" / sess.name),
                                          "storage_id": "mcap", "storage_preset_profile": "zstd_small",
-                                         "all_topics": True}]}
+                                         "all_topics": True, "all_services": True,
+                                         "all_actions": True, "include_hidden_topics": True}]}
         assert spec_path == dest / ".rig" / "export" / "bag_logger" / f"{sess.name}.yaml"
         assert f"ros2 bag convert -i {sess} -o {spec_path}" in script
         assert script.count("ros2 bag convert -i") == 2
@@ -106,16 +107,21 @@ def test_specs_per_session_with_the_default_preset():
 def test_exclude_topics_and_window_from_the_session_start():
     with tempfile.TemporaryDirectory() as tmp:
         run, dest = _run_tree(pathlib.Path(tmp), sessions=("bag_logger_20260101T000000Z",))
-        jobs, _, _ = _plan(run, dest, {"preset": "none", "exclude": [".*/points$", "^/cam/.*"],
+        jobs, script, _ = _plan(run, dest, {"preset": "none", "exclude": [".*/points$", "^/cam/.*"],
                                        "topics": ["/imu/data", "/gnss/fix"], "from_s": 5, "to_s": 15})
         spec = jobs[0][1]["output_bags"][0]
         assert "storage_preset_profile" not in spec               # none = uncompressed
-        assert spec["exclude_regex"] == "(?:.*/points$)|(?:^/cam/.*)"
-        assert spec["topics"] == ["/imu/data", "/gnss/fix"] and spec["all_topics"] is False
-        assert spec["start_time_ns"] == T0 + 5_000_000_000
-        assert spec["end_time_ns"] == T0 + 15_000_000_000
+        assert "exclude_regex" not in spec
+        assert spec["topics"] == ["/gnss/fix", "/imu/data"] and spec["all_topics"] is False
+        assert spec["services"] == spec["topics"] and spec["include_hidden_topics"]
+        input_spec = jobs[0][1]["input_bags"][0]
+        assert input_spec["start_time_ns"] == T0 + 5_000_000_000
+        assert input_spec["end_time_ns"] == T0 + 15_000_000_000
+        assert input_spec["uri"] == str(jobs[0][0])
+        assert "start_time_ns" not in spec and "end_time_ns" not in spec
+        assert f"ros2 bag convert --input-options {jobs[0][2]} -o {jobs[0][2]}" in script
         jobs, _, _ = _plan(run, dest, {"exclude": ["^/chatter$"]})
-        assert jobs[0][1]["output_bags"][0]["exclude_regex"] == "^/chatter$"   # one = as written
+        assert jobs[0][1]["output_bags"][0]["topics"] == [] # empty fixture metadata; exact resolution
 
 
 def test_unindexed_session_skipped_with_the_fix_named_and_window_needs_metadata():
@@ -133,6 +139,22 @@ def test_unindexed_session_skipped_with_the_fix_named_and_window_needs_metadata(
             assert "starting_time" in str(exc)
 
 
+def test_file_compressed_sessions_stage_readonly_inputs_and_keep_window():
+    for suffix in (".mcap.zstd", ".db3.zstd"):
+        with tempfile.TemporaryDirectory() as tmp:
+            run, dest = _run_tree(pathlib.Path(tmp), sessions=("session",))
+            session = run / "bags/bag_logger/session"
+            (session / "session_0.mcap").rename(session / ("session_0" + suffix))
+            (session / "metadata.yaml").write_text(META + "  compression_mode: FILE\n  compression_format: zstd\n")
+            jobs, script, warns = _plan(run, dest, {"from_s": 1, "to_s": 2})
+            assert len(jobs) == 1 and warns == []
+            input_spec = dest / ".rig/export/bag_logger/session.input.yaml"
+            assert f"stage-input {session} " in script
+            assert f"ros2 bag convert --input-options {input_spec} -o " in script
+            assert jobs[0][1]["input_bags"][0]["start_time_ns"] == T0 + 1_000_000_000
+            assert "rm -rf " + str(dest / "bags/bag_logger/.rig-export/session.input") in script
+
+
 def test_idempotent_unless_force_and_nothing_to_export():
     with tempfile.TemporaryDirectory() as tmp:
         run, dest = _run_tree(pathlib.Path(tmp))
@@ -143,7 +165,8 @@ def test_idempotent_unless_force_and_nothing_to_export():
         assert [j[0].name for j in jobs] == ["bag_logger_20260101T001000Z"]
         assert any("already exported" in w for w in warns)
         jobs, script, _ = _plan(run, dest, {}, force=True)
-        assert len(jobs) == 2 and f"rm -rf {done}" in script      # convert refuses an existing dir
+        assert len(jobs) == 2 and f"rm -rf {done}" not in script # preserve until verified
+        assert f"mv {done} " in script
         jobs, _, warns = _plan(run, dest, {}, name="other_logger")
         assert jobs == [] and any("no sessions" in w for w in warns)
 
@@ -167,9 +190,9 @@ def test_in_place_plan_converts_beside_verifies_then_swaps():
         assert f"ros2 bag convert -i {sess} -o " in script
         assert f"python3 {verify} {sess}/metadata.yaml {out}/metadata.yaml all" in script
         orig = tree / ".rig-rewrite" / f"{sess.name}.orig"
-        assert f"mv {sess} {orig} && mv {out} {sess}" in script   # swap only after the verify
+        assert f"mv {sess} {orig}; }} && mv {out} {sess}" in script
         assert script.index("python3 ") < script.index(f"mv {sess} ")
-        assert f"[ -e {sess} ] || mv {orig} {sess}" in script      # a failed swap restores
+        assert f"[ ! -e {orig} ] || mv {orig} {sess}" in script   # a failed swap restores
         assert "*.orig" in script and "df -Pk" in script           # crash recovery + free-space guard
         assert "original untouched" in script and script.rstrip().endswith("exit $rc")
         # an in-place session is never "already exported": rig's manifest record is the gate
@@ -219,8 +242,8 @@ def test_main_in_place_refuses_lossy_without_the_flag_and_honors_the_data_name()
             rc = bag_export.main([str(cfg), str(REPO)], {**base, "RIG_EXPORT_LOSSY": "1"})
         script, count, name = out.getvalue().strip().split("\t")
         assert rc == 0 and count == "1" and name == "legacy"
-        assert script == str(run / ".rig" / "export" / "legacy" / "convert.sh")
-        assert (run / ".rig" / "export" / "legacy" / "verify.py").is_file()
+        assert pathlib.Path(script).parent.parent == run / ".rig" / "export" / "legacy"
+        assert (pathlib.Path(script).parent / "verify.py").is_file()
         assert " kept" in pathlib.Path(script).read_text() and "rewrite IN PLACE" in err.getvalue()
         for env, needle in (({**base, "RIG_EXPORT_DEST": str(tmp)}, "is the run itself"),
                             ({**base, "RIG_EXPORT_NAME": "../x"}, "plain directory name")):
@@ -269,7 +292,8 @@ def test_launcher_in_place_mounts_the_run_once_writable():
         argv = [line for line in log.splitlines() if line.startswith("ARGV:")][0]
         assert f"-v {run}:{run} " in argv and ":ro" not in argv
         assert argv.count(" -v ") == 1
-        assert argv.endswith(f"bag-logger /bin/bash {run / '.rig' / 'export' / 'bag_logger' / 'convert.sh'}")
+        script = next((run / ".rig/export/bag_logger").glob("*/convert.sh"))
+        assert argv.endswith(f"bag-logger /bin/bash {script}")
 
 
 # --- main + the launcher -------------------------------------------------------------------------------
@@ -290,12 +314,14 @@ def test_main_writes_specs_and_script_and_prints_the_handoff():
         assert rc == 0
         script, count, name = out.getvalue().strip().split("\t")
         assert count == "2" and name == "bag_logger"
-        assert script == str(dest / ".rig" / "export" / "bag_logger" / "convert.sh")
+        assert pathlib.Path(script).parent.parent == dest / ".rig" / "export" / "bag_logger"
         assert os.access(script, os.X_OK)
-        spec = yaml.safe_load((dest / ".rig" / "export" / "bag_logger" /
-                               "bag_logger_20260101T000000Z.yaml").read_text())
-        assert spec["output_bags"][0]["exclude_regex"] == ".*/points$"
+        spec = yaml.safe_load((pathlib.Path(script).parent / "bag_logger_20260101T000000Z.yaml").read_text())
+        assert spec["output_bags"][0]["all_topics"] is False
+        assert "exclude_regex" not in spec["output_bags"][0]
         assert "2 session(s) to convert, preset=zstd_small" in err.getvalue()
+        for helper in ("export_provenance.py", "publication_identity.py"):
+            assert (pathlib.Path(script).parent / helper).read_bytes() == (REPO / "tools" / helper).read_bytes()
         for env, needle in (({"RIG_EXPORT_DEST": str(dest)}, "RIG_EXPORT_SOURCE"),
                             ({"RIG_EXPORT_SOURCE": str(run)}, "RIG_EXPORT_DEST")):
             try:
@@ -330,7 +356,7 @@ def test_launcher_export_runs_a_one_off_convert_with_both_dirs_mounted():
         proc, log = _launch(tmp, "export", {"RIG_EXPORT_SOURCE": str(run), "RIG_EXPORT_DEST": str(dest),
                                             "COMPOSE_PROJECT_NAME": "bag_logger-vehicle-7"})
         assert proc.returncode == 0, proc.stderr
-        script = dest / ".rig" / "export" / "bag_logger" / "convert.sh"
+        script = next((dest / ".rig/export/bag_logger").glob("*/convert.sh"))
         assert script.is_file()
         argv = [line for line in log.splitlines() if line.startswith("ARGV:")][0]
         assert argv.startswith(f"ARGV:compose -f {REPO}/docker/compose.deploy.yaml run --rm --no-deps -T ")

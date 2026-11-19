@@ -1,0 +1,1 @@
+{"schema_version":1,"contract":"rmw_publication","rosbag2_version":"0.33.4","capture":true,"preserve_mcap_convert":true,"rmw_implementations":["rmw_zenoh_cpp"],"compression_modes":["none","file:zstd","message:zstd"]}

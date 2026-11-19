@@ -1,0 +1,38 @@
+service: observer
+launcher: observer-up
+tier: infra
+ros_distro: lyrical
+verbs:
+  up: "up -d"
+  down: "down"
+  status: "ps"
+  logs: "logs"
+  config: "config"
+  images: "images"
+  runtime-images: "runtime-images"
+examples: [config/observer.example.yaml]
+# Graph introspection uses the same fleet message interfaces and middleware.
+build:
+  architectures: [arm64, amd64]
+  capabilities: {no_cache: true, platforms: true}
+  command: ../base/build.sh
+  images: [fleet-ros]
+  provides: base
+  msgs_overlay: {command: ../msgs/build-msgs.sh, image: fleet-ros-msgs}
+# Consume RIG_SIM_TIME only to suppress live-host publication during replay by
+# default. Host samples and opt-in replay-host diagnostics always retain wall time.
+replay: {sim_time: true}
+interface:
+  publishes: [{topic: /diagnostics, type: diagnostic_msgs/msg/DiagnosticArray}]
+launch_surface:
+  - observer-up
+  - tools/observer_config.py
+  - tools/runtime_images.py
+  - tools/graph_snapshot.py
+  - tools/endpoint_snapshot.py
+  - tools/run_observer.py
+  - tools/system_snapshot.py
+  - tools/host_probe.py
+  - tools/diagnostics_publish.py
+  - docker/compose.deploy.yaml
+  - docker/compose.system.yaml

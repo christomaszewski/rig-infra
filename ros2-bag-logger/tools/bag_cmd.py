@@ -33,6 +33,7 @@ restart writes a NEW bag instead of failing on an existing dir — and ``config`
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 import re
 import shlex
@@ -237,28 +238,98 @@ def zenoh_env_lines(cfg: dict, warns: list[str]) -> tuple[str, bool]:
     ), shm_on
 
 
-def graph_params(cfg: dict) -> tuple[bool, str, str]:
-    """`graph:` (the graph-snapshotter sidecar gate) -> (enabled, interval_s, settle_s) — the
-    values ros2-bag-logger-up exports as GRAPH_SNAPSHOT_INTERVAL_S / GRAPH_SNAPSHOT_SETTLE_S
-    (GRAPH_SNAPSHOT_NAME is the config `name`). Absent block = disabled, defaults untouched —
-    existing configs and deployments stay byte-identical. Strict on keys, like `zenoh:`: a typo'd
-    knob must not silently run the sidecar at defaults. Pure — no I/O."""
-    g = cfg.get("graph")
-    if g is None:
-        return False, "", ""
-    if not isinstance(g, dict):
-        raise SystemExit("bag_cmd: `graph` must be a mapping")
-    unknown = set(g) - {"enabled", "interval_s", "settle_s"}
+def _capture_block(cfg: dict, name: str, defaults: dict, minimums: dict) -> dict:
+    """Strict legacy knobs; absent blocks remain disabled during the migration release."""
+    block = cfg.get(name)
+    if block is None:
+        block = {}
+    if not isinstance(block, dict):
+        raise SystemExit(f"bag_cmd: `{name}` must be a mapping")
+    unknown = set(block) - set(defaults)
     if unknown:
-        raise SystemExit(f"bag_cmd: unknown graph key(s): {', '.join(sorted(unknown))} "
-                         "(graph.enabled, graph.interval_s, graph.settle_s)")
-    for key, lo in (("interval_s", 1), ("settle_s", 0)):
-        val = g.get(key)
-        if val is not None and (not isinstance(val, (int, float)) or isinstance(val, bool)
-                                or val < lo):
-            raise SystemExit(f"bag_cmd: graph.{key} must be a number >= {lo}")
-    fmt = lambda v: "" if v is None else f"{float(v):g}"  # noqa: E731 — "" = tool default
-    return bool(g.get("enabled")), fmt(g.get("interval_s")), fmt(g.get("settle_s"))
+        raise SystemExit(f"bag_cmd: unknown {name} key(s): {', '.join(sorted(map(str, unknown)))}")
+    result = {**defaults, **block}
+    for key, default in defaults.items():
+        value = result[key]
+        if name == "graph" and key == "enabled":
+            # The released graph gate used Python truthiness on the parsed YAML.
+            result[key] = bool(value)
+        elif type(default) is bool:
+            if type(value) is not bool:
+                raise SystemExit(f"bag_cmd: {name}.{key} must be true or false")
+        elif value is None:
+            result[key] = default
+        elif type(value) not in (int, float) or not value >= minimums[key]:
+            raise SystemExit(f"bag_cmd: {name}.{key} must be a number >= {minimums[key]:g}")
+        elif name == "system" and not math.isfinite(value):
+            raise SystemExit(f"bag_cmd: {name}.{key} must be finite")
+    return result
+
+
+def legacy_observer_params(cfg: dict, *, control=False) -> tuple[dict, dict]:
+    """Deprecated capture stays in this logger's project, with no diagnostics publisher.
+
+    Control verbs accept old or subsequently edited collector blocks so stopping an
+    installed sidecar does not depend on the validity of its former capture settings.
+    """
+    # Unset legacy timings defer to the deployment environment, then Compose's defaults.
+    graph_defaults = {"enabled": False, "interval_s": None, "settle_s": None, "endpoints": True}
+    system_defaults = {"enabled": False, "interval_s": 1, "settings_interval_s": 30}
+    if control:
+        return graph_defaults, system_defaults
+    graph = _capture_block(cfg, "graph", graph_defaults, {"interval_s": 1, "settle_s": 0})
+    system = _capture_block(cfg, "system", system_defaults, {"interval_s": .1, "settings_interval_s": 1})
+    if graph["enabled"] or system["enabled"]:
+        name = str(cfg.get("name") or "bag_logger")
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", name):
+            raise SystemExit("bag_cmd: legacy observer name must be one safe path component")
+        sys.stderr.write(
+            "ros2-bag-logger: DEPRECATED graph/system capture remains enabled in the existing "
+            "graph-snapshotter sidecar for this compatibility release. Migrate these blocks to "
+            "an observer service instance, then disable/remove them here; diagnostics remain off.\n")
+    return graph, system
+
+
+# This code runs from record.sh inside both Compose and baked deployments.
+# Pin the run once so the scope and every split of the bag use the same manifest.
+RECORDING_ROOT = """\
+root="${RIG_BAG_ROOT:-/data}"
+if [ -e "$root/current" ]; then
+    run="$(readlink -f "$root/current")"
+    bags="$run/bags"
+    if [ -z "${RIG_PUBLICATION_SCOPE:-}" ] && [ -f "$run/manifest.yaml" ]; then
+        if ! RIG_PUBLICATION_SCOPE="$(python3 - "$run/manifest.yaml" <<'PYTHON'
+import sys
+import uuid
+import yaml
+
+try:
+    with open(sys.argv[1]) as manifest:
+        document = yaml.safe_load(manifest)
+    if not isinstance(document, dict):
+        raise ValueError("expected a run manifest")
+    if "run_uuid" in document:
+        value = document["run_uuid"]
+        if not isinstance(value, str):
+            raise ValueError("expected run_uuid string")
+        parsed = uuid.UUID(value)
+        if str(parsed) != value or parsed.int == 0:
+            raise ValueError("invalid run_uuid")
+        print(value)
+except (OSError, ValueError, yaml.YAMLError):
+    print(f"ros2-bag-logger: invalid or unreadable run UUID in {sys.argv[1]}; using boot scope",
+          file=sys.stderr)
+PYTHON
+)"; then
+            echo "ros2-bag-logger: could not read $run/manifest.yaml; using boot scope" >&2
+            RIG_PUBLICATION_SCOPE=
+        fi
+        export RIG_PUBLICATION_SCOPE
+    fi
+else
+    bags="$root/bags"
+fi
+"""
 
 
 def render(cfg: dict, repo: pathlib.Path,
@@ -279,11 +350,7 @@ def render(cfg: dict, repo: pathlib.Path,
         "# Source ROS if the image's entrypoint didn't (we run as `command:`, so usually it did).\n"
         '[ -n "${ROS_DISTRO:-}" ] && [ -f "/opt/ros/$ROS_DISTRO/setup.bash" ] && '
         '. "/opt/ros/$ROS_DISTRO/setup.bash"\n'
-        + shm +
-        # Run-aware output (ROADMAP §3c): pin the OPEN run at process start — resolve `current` ONCE
-        # (a live symlink flip would ENOENT the recorder's next split). No run registry -> flat layout.
-        'root="${RIG_BAG_ROOT:-/data}"\n'
-        'if [ -e "$root/current" ]; then bags="$(readlink -f "$root/current")/bags"; else bags="$root/bags"; fi\n'
+        + shm + RECORDING_ROOT +
         f'base="$bags/{shlex.quote(name)}"\n'
         f'out="$base/{shlex.quote(name)}_$(date -u +%Y%m%dT%H%M%SZ)"\n'
         'mkdir -p "$base"\n'
@@ -298,16 +365,22 @@ def render(cfg: dict, repo: pathlib.Path,
 
 
 def main() -> int:
-    if len(sys.argv) != 3 and not (len(sys.argv) == 4 and sys.argv[3] == "--inspect"):
-        sys.stderr.write("usage: bag_cmd.py <config.yaml> <repo-dir>\n")
+    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in ("--inspect", "--legacy-control")):
+        sys.stderr.write("usage: bag_cmd.py <config.yaml> <repo-dir> [--inspect|--legacy-control]\n")
         return 2
     import os
     cfg = yaml.safe_load(open(sys.argv[1])) or {}
+    mode = sys.argv[3] if len(sys.argv) == 4 else ""
+    graph, system = legacy_observer_params(cfg, control=mode == "--legacy-control")
     name, script, shm_on = render(cfg, pathlib.Path(sys.argv[2]),
-                                  sim_time_env=os.environ.get("RIG_SIM_TIME"), write=len(sys.argv) == 3)
-    graph_on, interval_s, settle_s = graph_params(cfg)
+                                  sim_time_env=os.environ.get("RIG_SIM_TIME"),
+                                  write=not mode)
+    flag = lambda value: str(value).lower()
+    timing = lambda value: "" if value is None else f"{value:g}"
     print("\t".join([name, script, "shm" if shm_on else "",
-                     "graph" if graph_on else "", interval_s, settle_s]))
+                     flag(graph["enabled"]), timing(graph["interval_s"]), timing(graph["settle_s"]),
+                     flag(system["enabled"]), f'{system["interval_s"]:g}', f'{system["settings_interval_s"]:g}',
+                     flag(graph["endpoints"])]))
     return 0
 
 

@@ -1,0 +1,42 @@
+# Compatibility release for legacy graph/system blocks. The service/project name
+# and run paths remain unchanged; diagnostics are explicitly disabled. The runtime
+# is a checked-in mirror verified by tools/sync_observer_compat.py --check.
+services:
+  graph-snapshotter:
+    profiles: [legacy-observer]
+    image: ${BAG_LOGGER_IMAGE:-${RIG_MSGS_IMAGE:-${RIG_BASE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}}}
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 5s
+    tmpfs:
+      - /run/observer
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+      ZENOH_CONFIG_OVERRIDE: ${ZENOH_CONFIG_OVERRIDE:-}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      RIG_BAG_ROOT: /data
+      # Empty observer name preserves the legacy graph_snapshotter_<safe-name>
+      # node and GRAPH_SNAPSHOT_NAME paths, including hyphens or leading digits.
+      OBSERVER_NAME: ""
+      OBSERVER_RECORDING_ENABLED: "true"
+      OBSERVER_DIAGNOSTICS_ENABLED: "false"
+      OBSERVER_NATIVE_PROBE_FILE: ""
+      OBSERVER_STATE_DIR: /run/observer
+      GRAPH_SNAPSHOT_ENABLED: ${GRAPH_SNAPSHOT_ENABLED:-false}
+      GRAPH_SNAPSHOT_NAME: ${GRAPH_SNAPSHOT_NAME:-bag_logger}
+      GRAPH_SNAPSHOT_INTERVAL_S: ${GRAPH_SNAPSHOT_INTERVAL_S:-60}
+      GRAPH_SNAPSHOT_SETTLE_S: ${GRAPH_SNAPSHOT_SETTLE_S:-2}
+      GRAPH_SNAPSHOT_ENDPOINTS_ENABLED: ${GRAPH_SNAPSHOT_ENDPOINTS_ENABLED:-true}
+      SYSTEM_SNAPSHOT_ENABLED: ${SYSTEM_SNAPSHOT_ENABLED:-false}
+      SYSTEM_SNAPSHOT_NAME: ${SYSTEM_SNAPSHOT_NAME:-bag_logger}
+      SYSTEM_SNAPSHOT_INTERVAL_S: ${SYSTEM_SNAPSHOT_INTERVAL_S:-1}
+      SYSTEM_SNAPSHOT_SETTINGS_INTERVAL_S: ${SYSTEM_SNAPSHOT_SETTINGS_INTERVAL_S:-30}
+    volumes:
+      - ${RIG_DATA_DIR:-/data}:/data
+      - ../tools/observer/graph_snapshot.py:/graph_snapshot.py:ro
+      - ../tools/observer/endpoint_snapshot.py:/endpoint_snapshot.py:ro
+      - ../tools/observer/run_observer.py:/run_observer.py:ro
+      - ../tools/observer/system_snapshot.py:/system_snapshot.py:ro
+    command: ["/bin/bash", "-c", "[ -n \"$${ROS_DISTRO:-}\" ] && [ -f \"/opt/ros/$$ROS_DISTRO/setup.bash\" ] && . \"/opt/ros/$$ROS_DISTRO/setup.bash\"; exec python3 /run_observer.py"]

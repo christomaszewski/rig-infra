@@ -5,8 +5,13 @@ plus the **`fleet-ros` base image** they default to. Each service dir is an ordi
 service: a launcher + `rigging.yaml` meeting the launcher contract (`rig certify` runs against every
 one in CI).
 
-[v1.20.2](docs/releases/v1.20.2.md) keeps the `fleet-ros` base image unchanged when only its
-replay check script changes, and builds the messages overlay without resolving a Dockerfile
+[v1.21.0](docs/releases/v1.21.0.md) adds the [observer](#observer--graph-system-capture-and-diagnostics) service for graph capture,
+host measurements and live diagnostics. The bag logger accepts its old graph settings for
+this release. New MCAP recordings can also carry publication identities through export and
+conservative deduplication.
+
+The [build changes included since v1.20.1](docs/releases/v1.20.2.md) keep the `fleet-ros` base image unchanged when only its
+replay check script changes, and build the messages overlay without resolving a Dockerfile
 frontend on Docker Hub. The first build after upgrading publishes new base and overlay images
 once; with Rig v0.2.82, later builds that change nothing keep their digests. See
 [what changes the base image](#what-changes-the-base-image).
@@ -28,10 +33,10 @@ recipe again to adopt the new proxy timing. Existing proxy generations remain un
   recording can be gated at runtime through rosbag2's own services
   (`/bag_logger/{pause,resume,split_bagfile,stop,…}`); trigger *policy* (arm/disarm, geofence)
   belongs in a separate node that calls them — see the example config. Default image: `fleet-ros`
-  (rosbag2 + mcap + rmw_zenoh, ~1 GB — no camera image needed on camera-less vehicles). A
-  `graph:` block in the config additionally starts the **graph-snapshotter sidecar**, recording
-  the live graph *topology* (who talked to what) beside the bags — see
-  [Graph topology capture](#graph-topology-capture--the-graph-snapshotter-sidecar).
+  (rosbag2 + mcap + rmw_zenoh, ~1 GB — no camera image needed on camera-less vehicles).
+- **`observer/`** — records graph topology, host resources and settings alongside the run, and
+  publishes live ROS diagnostics from the same system samples. Graph, system, recording and
+  diagnostics have separate settings — see [Observer](#observer--graph-system-capture-and-diagnostics).
 - **`ros2-bag-player/`** — the SIL replay player (`autonomy` tier): joins the graph like any
   service and plays a selected topic subset from a SOURCE run's bags, mounted read-only. It never
   decides what to play — `rig replay` (or the standalone config) hands it the set. An exited
@@ -60,18 +65,18 @@ different versions — and a skewed `rmw_zenoh_cpp` means zenoh sessions that ca
 that with ONE base image per deployment; rig-infra owns `fleet-ros`, so it is the provider side of
 that contract.
 
-- **Declared.** `zenoh-router` and `ros2-bag-logger` both carry
+- **Declared.** `zenoh-router`, `ros2-bag-logger` and `observer` carry
   `build: { command: ../base/build.sh, images: [fleet-ros], provides: base }` — `images[0]` names the
   base image. `rig build` builds it FIRST and exports its composed ref
   (`<registry>/fleet-ros:<tag>`) to every other build and to every launcher as `RIG_BASE_IMAGE`, so
-  one image pins the fleet's distro+rmw packages. The declaration is kept on **both** riggings so
-  that either service alone still supplies a fleet's base; they name the same image from the same
+  one image pins the fleet's distro+rmw packages. The declaration is kept on these riggings so
+  that each service alone still supplies a fleet's base; they name the same image from the same
   script, so rig treats them as one base and builds it once.
 - **Providers must agree.** Agreeing on the image *name* is not agreeing on the base. Providers of
   one base that declare a different name, a different `build.platforms`, or a different build script
   are an ERROR in `rig doctor` and/or `rig build` — never a manifest-order guess (the last one would
   have two builds racing for one tag). Practical consequence here: if fleet-ros ever needs a
-  `platforms:` matrix (an L4T/CUDA base, say), it has to be added to **both** provider riggings in
+  `platforms:` matrix (an L4T/CUDA base, say), it has to be added to all provider riggings in
   the same change.
 - **Consumed.** The composes that RUN the base resolve their image as
   `${<SVC>_IMAGE:-${RIG_BASE_IMAGE:-<registry>/fleet-ros:<tag>}}` — operator override, then the
@@ -562,48 +567,206 @@ export re-fires within ~20 ms of the recorded offsets, `-r 2` compressing wall t
 in-window calls at their recorded offsets, not shifted). A timed-out call blocks the timeline for at
 most its own `timeout_s` (calls are sequential — script accordingly).
 
-## Graph topology capture — the graph-snapshotter sidecar
+## Observer — graph, system capture and diagnostics
 
-Bags record data, not topology: rosbag2 keeps topic names and types but no node identity, nothing
-about subscribers, and no services — so a run's bag cannot answer *who talked to what*, and in
-particular a service's **inputs** are invisible from its own run (which is exactly what
-`rig replay` needs). The live graph API is the instrument: a `graph:` block in the ros2 bag
-logger's config starts a second, compose-profile-gated container beside the recorder that walks
-the graph every `interval_s` (via `get_node_names_and_namespaces` + the four per-node NodeGraph
-calls — works under rmw_zenoh, whose graph cache rides liveliness tokens) and records per-node
-**pubs / subs / service servers (`provides:`) / clients (`requires:`)**, with a type on every
-edge.
+`observer` is an independent infra service that uses the fleet ROS image. It replaces the
+bag logger's graph-snapshotter sidecar, so a deployment with a recorder and observer still
+uses two containers. Its separate graph, system and diagnostics workers share one container;
+measurements are collected once and used for both run recording and live health reporting.
 
-**The artifact — append-only, change-deduped epochs.** One YAML file per distinct graph state at
-`<run>/graph/<name>/epoch_<UTCstamp>.yaml` (the pinned open run; flat `<data>/graph/<name>`
-without a run registry — mirrors `bags/`), carrying its validity window:
+```yaml
+service: observer
+name: observer
+graph: {enabled: true, interval_s: 60, settle_s: 2}
+system: {enabled: true, interval_s: 1, settings_interval_s: 30}
+recording: {enabled: true}
+diagnostics:
+  enabled: true
+  topic: /diagnostics
+  interval_s: 1
+  stale_after_s: 5
+  publish_during_replay: false
+```
 
-- Each tick the observed graph is canonicalized and hashed (the hash covers the `nodes:` body
-  only). Unchanged → the SAME file is atomically rewritten with `last:` bumped — the liveness
-  signal; a crash loses at most one interval. Changed → a NEW file opens (`first:` = now) and the
-  old one is never touched again, so a flapping node *looks different* from a stable one.
-- A sidecar (re)start always opens a new epoch — no file is ever read back, trusted, or resumed.
-  Overlapping epochs are harmless: readers dedup by content.
-- **Self-exclusion only.** The snapshotter drops its own node (a measurement artifact) and
-  nothing else. Notably the bag recorder itself IS recorded, as the graph sees it: subscriptions
-  to everything it records, its control services (`/<node>/pause`, …), and its
-  `/events/rosbag2_messages_lost` / `/events/write_split` publishers. Writer dumb, reader smart:
-  no filtering, no namespace→instance grouping — rig derives every view (union across epochs,
-  instance grouping, declared-vs-observed checks) at read time (`rig graph`, rig ≥ v0.2.32).
+The [example config](observer/config/observer.example.yaml) documents component selection and
+thresholds. Add `observer/rigging.yaml` as a separate infra instance using the same data root,
+ROS domain and middleware as the recorder. Standalone use:
 
-**Enabling.** Uncomment `graph:` in the example config (`enabled: true`; `interval_s`, `settle_s`
-knobs documented there). The launcher gates the sidecar by compose profile: `--profile graph` on
-`up` only when enabled, and unconditionally on `down`/`status`/`logs`/`ps` — a sidecar left
-running from a since-disabled config is still torn down and visible. No `graph:` block = no
-sidecar, byte-identical behavior to earlier releases. The sidecar reuses the logger's image chain
-and env (`ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`, the data-root mount) — custom-type introspection
-works wherever the recorder's does, and there are no new rig-owned env vars. Cost is negligible:
-a ~28-node graph walks in single-digit milliseconds per tick and writes ~35 KB per epoch.
+```sh
+RIG_DATA_DIR=/data ./observer/observer-up observer/config/observer.example.yaml up -d
+./observer/observer-up observer/config/observer.example.yaml logs
+./observer/observer-up observer/config/observer.example.yaml down
+```
 
-**Shutdown.** Docker's normal SIGTERM wakes the warm-up or interval wait within 100 ms. If a
-graph observation or atomic epoch write is already underway, it finishes before the ROS node
-and context are torn down. Shutdown does not start another observation or bump `last:` without
-one; the last saved timestamp remains the time the graph was actually observed.
+- **Capture only:** set `diagnostics.enabled: false`.
+- **Diagnostics only:** set `graph.enabled: false` and `recording.enabled: false`; keep
+  `system.enabled: true`. No open run is required and no run files are written.
+- **Graph only:** disable both `system` and `diagnostics`.
+
+Graph capture requires recording, and diagnostics requires system collection. The name must
+start with a letter and contain only letters, numbers and underscores, because it also names
+ROS nodes. The node names are `/<name>/graph_snapshotter` and `/<name>/system_health`.
+`OBSERVER_IMAGE` overrides the fleet messages/base image chain. `ROS_DOMAIN_ID`,
+`RMW_IMPLEMENTATION` and `ZENOH_CONFIG_OVERRIDE` pass through to the shared container.
+
+### Graph artifacts
+
+Graph capture records per-node publishers, subscribers, service servers (`provides`) and
+clients (`requires`), with a type on every edge. Bags carry message data; the graph supplies
+ownership and connectivity evidence for `rig graph` and replay planning.
+
+The existing schema-1 contract is preserved: `<run>/graph/<name>/epoch_<UTCstamp>.yaml`
+contains the canonical `nodes` body, its hash, and `first`/`last` observation timestamps.
+Unchanged topology atomically updates the current file's `last`; a change starts a new epoch.
+A worker restart always starts a new file. Only the graph worker itself is excluded, so
+recorder subscriptions and services remain visible. Rig derives grouping, union and interface
+checks at read time. Timestamps describe observations, not proof of uninterrupted discovery.
+
+#### Endpoint provenance
+
+With `graph.endpoints: true` (the default), each graph observation also records publisher and
+subscriber discovery evidence in `graph/<name>/endpoints_<stamp>_<collector>.json`. These are
+separate, change-deduplicated epochs: unchanged evidence advances the last observation, while
+changed endpoints, discovery errors or coverage start a new file. Existing topology YAML,
+its schema and identity hash, and Rig's graph reader remain unchanged.
+
+Endpoint records preserve node FQN, publisher/subscriber GID bytes, topic/type, available
+type hash and QoS policies, including duration fields. Multiple endpoints with the same node
+name remain separate. Unavailable/all-zero GIDs, unsupported type hashes and missing QoS
+fields are explicit unknowns. Each file includes a collector UUID, observation counters,
+wall/monotonic query windows, RMW/domain, and associated topology hash. Failed topology writes
+are explicit (`topology_written: false`, `topology_file: null`); endpoint evidence is retained.
+
+Collection queries graph metadata only. It creates no payload subscriptions and computes no
+message hashes. Each observation allows at most 512 topics, 4096 endpoints, and 250 ms of
+work checked between API calls; a middleware call itself cannot be preempted by that budget.
+Skipped work, unsupported APIs and per-query discovery failures produce partial coverage.
+Even completed queries are not an atomic or globally complete discovery snapshot. First/last
+windows mean sampled sightings, not continuous endpoint lifetimes; a changed GID identifies
+a different endpoint incarnation, not a proven process restart.
+
+Use endpoint epochs to investigate which publishers were visible when the recorders overlapped.
+For per-message matching, the recorder captures the publisher identity at receipt.
+
+### Publication identity in recorded bags
+
+With the updated fleet image, the standard MCAP logger records each qualified publication's
+writer GID and full 64-bit publication sequence number. This works with the Lyrical Zenoh
+transport (validated with rosbag2 0.33.4 and rmw_zenoh_cpp 0.10.6). Capture is independent
+of the observer and requires no additional subscription.
+The payload, topic, and middleware send time keep their original values. SQLite recordings,
+older recorders, and middleware that supplies insufficient evidence can still be replayed.
+
+At recorder startup, the logger resolves the current run directory once and uses its
+`manifest.yaml` field `run_uuid` as the publication scope. Loggers on different hosts
+participating in that run can match publications automatically when the RMW and ROS domain
+also agree. Independently opened runs receive distinct UUIDs. An explicit
+`RIG_PUBLICATION_SCOPE` still overrides the default. Standalone recording and legacy
+manifests without a UUID fall back to the recorder host's Linux boot ID.
+
+In MCAP, a marked channel carries the schema version, scope, RMW, domain, writer GID, and upper
+32 sequence bits under `rig.provenance.*`. The message's MCAP sequence carries the lower 32 bits.
+Each marked file also carries the `rig.publication_provenance` metadata marker. Readers use
+the channel and sequence from the same physical record. A missing GID or unsupported
+publication sequence leaves that record unmarked. Capture and conversion support MCAP chunk
+compression, including the logger's default `zstd_fast`, and rosbag2 file- and message-level zstd.
+
+Slim exports preserve this evidence for retained records. Bag proxies preserve it across timing
+profiles and can use it for conservative deduplication. Conflicting evidence keeps every affected
+record. See [bag proxy policies](ros2-bag-player/REPLAY_PLAN.md) for the matching rules.
+
+### System artifacts
+
+Each system worker start creates `<run>/system/<name>/<capture-id>/` with `host.json`,
+`metrics.jsonl`, `settings-events.jsonl` and `status.json`. Metrics append every sample; unchanged
+settings are not repeated. New native host snapshots are retained in settings events while
+`host.json` preserves the starting baseline. The supervisor resolves `current` once and pins
+that run across worker restarts; without a run registry, paths are relative to the data root.
+An interrupted capture may retain `state: running`; subsequent captures never overwrite it.
+
+Read-only `/proc` and `/sys` mounts provide host CPU utilization, load, memory/swap, disk/network
+counters, pressure, CPU clocks, temperatures and available hwmon/devfreq readings. Recording
+filesystem capacity comes from the data mount. CPU utilization uses counter deltas; the first
+sample is explicitly warming up, and idle/iowait remain separate. Raw sources and kernel units
+are retained. Missing or denied probes are statuses, never invented zero measurements.
+No Docker socket, privileged container or host PID namespace is needed.
+
+On actual launcher `up`, a bounded native host probe also captures hardware/OS/kernel, L4T,
+installed JetPack/CUDA/cuDNN/TensorRT/GStreamer/ROS packages, selected sysctls, shared memory,
+allowlisted launcher tuning variables, and the read-only queries `nvpmodel -q --verbose` and
+`jetson_clocks --show`. Commands share a three-second budget and never invoke sudo or change
+power settings. The installed `nvidia-jetpack` metapackage takes precedence, including its
+Debian build suffix. Without it, the observer checks the host's L4T release file and installed
+`nvidia-l4t-core` version against a local table of Orin and Thor release pairings. An exact
+match records `probes.jetpack.status: inferred`, the L4T version and its source in `host.json`.
+Conflicting or unmapped versions yield `unknown`. The host diagnostics component publishes
+`host.inventory.jetpack_status` as `installed`, `inferred` or `unknown`. An inferred version
+identifies the SDK release associated with the BSP. Package inventory records which SDK
+components are installed. [NVIDIA JetPack archive](https://developer.nvidia.com/embedded/jetpack-archive)
+
+Native evidence lives in the launcher's `var/run/<name>/native/` cache, mounted read-only as a
+directory so atomic refreshes are visible to an already-running observer. `config` can create
+an explicit unavailable placeholder but never probes the render host or replaces existing
+evidence; image inspection and teardown do neither. Direct/baked Compose starts do not run
+native host commands. Use `observer-up ... up` on the target to refresh them. Matching boot
+IDs are required to associate this evidence with the measured host, including with remote
+Docker or Docker Desktop. Host package versions and launcher environment do not establish
+the versions or effective settings inside other workload containers.
+
+### Live diagnostics
+
+The system worker atomically updates a bounded cache in container tmpfs. The diagnostics
+worker reads that cache, independently of graph capture and disk recording, and publishes
+standard `diagnostic_msgs/msg/DiagnosticArray` on `/diagnostics` with reliable, volatile QoS.
+It follows the dashboard's service-health contract: service/instance/vehicle identity,
+process identity, increasing publication sequence, source sample identity, monotonic sample
+age and explicit unavailable/stale status. Repeating a heartbeat never freshens a sample.
+Storage failures leave live sampling available and appear in recording diagnostics.
+
+Host health follows the currently sampled host boot identity. `host.inventory.*` is verified
+startup context with its own observation timestamp and age, not a repeated package query.
+`power.startup_mode_id/name` retain the native query timestamp and age;
+`power.mode_availability=not_live_sampled` avoids claiming the mode remains active. Hardware
+rail readings keep per-sample freshness. Excluding the power component also omits startup mode.
+
+Components cover CPU, memory, storage, temperature, GPU, power, host, recording and collectors.
+`diagnostics.components` selects which the observer owns; when another service such as
+Jetson Manager reports thermal/power health, omit those components here to avoid duplicate
+alerts. Thresholds are optional per metric, for example
+`disk.free_pct: {direction: below, warn: 10, error: 5}` under `diagnostics.thresholds`.
+There are no universal temperature or power limits. GPU readings with unknown driver units
+remain explicitly raw rather than being presented as percentages.
+
+Host measurements and diagnostic Header stamps always use wall time, including during
+replay. `RIG_SIM_TIME` suppresses live diagnostics by default so they do not compete with
+recorded source health. Explicit `diagnostics.publish_during_replay: true` uses the distinct
+`<name>_replay_host` identity and `observer.scope: replay_host`.
+
+### Shutdown and migration
+
+The supervisor isolates worker failures and restarts them with backoff. SIGTERM/SIGINT reaches
+all workers immediately; healthy waits wake within 100 ms. After a shared three-second grace,
+it kills any stuck worker process group and reaps it. Compose supplies an init process and a
+five-second outer grace. Shutdown never invents a graph observation to extend an epoch.
+
+The next release **deprecates but continues to support** `graph` and `system` blocks in the
+bag-logger config. Enabled legacy settings emit a warning and run the observer capture workers
+in the existing `graph-snapshotter` container, under the same recorder Compose project and
+`graph/<logger-name>` / `system/<logger-name>` paths. Existing intervals and discovery settle
+settings still apply. This compatibility path does not enable diagnostics or require a separate
+observer instance. Native system probes run only on actual `up`, preserving evidence in the run.
+
+For a new deployment, use the independent observer service. To migrate an existing deployment,
+move the enabled graph/system settings into its config and remove or disable the corresponding
+blocks in the bag logger; do not leave both instances capturing the same graph unintentionally.
+A migrated logger `up` removes only its own legacy sidecar. `down`, `status` and `logs` continue
+to include the sidecar even after those blocks are disabled. Existing bags and graph files are
+preserved, and upgrading does not require an immediate config rewrite.
+
+The compatibility runtime is a checked-in copy of the canonical observer workers, included in
+the logger's launch surface so standalone installs, vendoring and offline bakes remain
+self-contained. `python3 tools/sync_observer_compat.py --check` verifies it in CI; after changing
+observer workers, regenerate it with `python3 tools/sync_observer_compat.py --write`.
 
 ## Slim exports — the bag logger's `export` verb (v1.14.0, rig ≥ v0.2.54)
 
@@ -612,10 +775,9 @@ off the vehicle is leaving data out and re-writing the rest smaller — by the s
 it. rig's `rig run export <run> --profile <p>` builds `<run>/exports/<p>/` on the vehicle
 (hardlinks where kept, the profile's `omit` globs left out) and invokes the `export` verb of
 every service whose rigging declares `export:`; this logger declares `export: {data: bags/{name}}`
-and re-writes its sessions with **`ros2 bag convert`** in its own image — no new tooling in the
-vehicle image (rosbag2's converter is the recorder's writer run again: zstd chunks in-band, every
-mcap reader takes the result as-is; a `zstd_small` re-write of a `zstd_fast` recording is the
-same data at a ~2–4× smaller size for telemetry-class topics, dropped point clouds are the rest).
+and re-writes its sessions with **`ros2 bag convert`** in the fleet image. Its verifier checks selected records before publishing a marked MCAP
+export, including source timestamps, identities, payloads, and repetition counts. The output
+uses standard MCAP chunks and can be read directly by MCAP tools.
 
 ```yaml
 # vehicle.yaml — the profile block this launcher receives (verbatim, as RIG_EXPORT_OPTIONS)
@@ -648,7 +810,7 @@ session qualifies, runs recorded long before this release included.
 
 **Mechanics.** `tools/bag_export.py` (pure, tested) finds the sessions the recorder wrote
 (`<run>/bags/<name>/<name>_<stamp>/` with a `metadata.yaml`), renders one rosbag2 output spec
-per session plus a `convert.sh` under `<export>/.rig/export/<name>/`, and the launcher runs the
+per session plus an invocation-specific `convert.sh` under `<export>/.rig/export/<name>/`. The launcher runs the
 script as a one-off `docker compose run --rm` of the `bag-logger` service with the run mounted
 read-only and the export dir writable **at their host paths** (the specs name host paths). It
 runs beside whatever the logger is recording now — never inside the recorder's container.

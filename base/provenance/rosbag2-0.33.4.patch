@@ -1,0 +1,198 @@
+--- a/rosbag2_transport/src/rosbag2_transport/recorder.cpp
++++ b/rosbag2_transport/src/rosbag2_transport/recorder.cpp
+@@ -36,6 +36,7 @@
+ #include "rclcpp/event.hpp"
+ #include "rclcpp/logging.hpp"
+ #include "rmw/types.h"
++#include "rig_publication_provenance.hpp"
+ #include "rosbag2_cpp/bag_events.hpp"
+ #include "rosbag2_cpp/service_utils.hpp"
+ #include "rosbag2_cpp/writer.hpp"
+@@ -1758,8 +1759,12 @@
+       on_messages_lost_in_transport(topic_name, msgs_lost_info);
+     };
+ 
++  const char * implementation = rmw_get_implementation_identifier();
++  auto identity_cache = std::make_shared<rig_publication_provenance::CaptureCache>(
++    rig_publication_provenance::recording_scope(), implementation ? implementation : "",
++    node->get_node_base_interface()->get_context()->get_domain_id());
+   auto subscription_callback =
+-    [this, topic_name, topic_type](std::shared_ptr<const rclcpp::SerializedMessage> message,
++    [this, topic_name, topic_type, identity_cache](std::shared_ptr<const rclcpp::SerializedMessage> message,
+     const rclcpp::MessageInfo & mi)
+     {
+       rcutils_time_point_value_t recv_timestamp{0};
+@@ -1789,7 +1794,34 @@
+       handle_pending_resume_request(topic_name, send_timestamp, recv_timestamp);
+ 
+       if (!paused_.load()) {
+-        writer_->write(std::move(message), topic_name, topic_type, recv_timestamp, send_timestamp);
++        // Keep identity in this payload's ownership block, not in the public message ABI.
++        const auto & info = mi.get_rmw_message_info();
++        const char * rmw = rmw_get_implementation_identifier();
++        rig_publication_provenance::IdentityPtr identity;
++        if (!info.from_intra_process && info.publisher_gid.implementation_identifier && rmw &&
++          std::string(info.publisher_gid.implementation_identifier) == rmw)
++        {
++          identity = identity_cache->get(info.publisher_gid.data, RMW_GID_STORAGE_SIZE,
++            info.publication_sequence_number);
++        }
++        if (!identity) {
++          writer_->write(std::move(message), topic_name, topic_type, recv_timestamp, send_timestamp);
++        } else {
++          auto bag_message = std::make_shared<rosbag2_storage::SerializedBagMessage>();
++          bag_message->topic_name = topic_name;
++          bag_message->recv_timestamp = recv_timestamp;
++          bag_message->send_timestamp = send_timestamp;
++          bag_message->sequence_number = static_cast<uint32_t>(info.publication_sequence_number);
++          bag_message->serialized_data = std::shared_ptr<rcutils_uint8_array_t>(
++            new rcutils_uint8_array_t(message->get_rcl_serialized_message()),
++            [message](rcutils_uint8_array_t * data) {
++              (void)message;
++              data->buffer = nullptr;
++              delete data;
++            });
++          rig_publication_provenance::attach(bag_message->serialized_data, std::move(identity));
++          writer_->write(bag_message, topic_name, topic_type, rmw_get_serialization_format());
++        }
+         // Handle pending bag split request if it is existing
+         handle_pending_bag_split_request(topic_name, send_timestamp, recv_timestamp);
+       }
+--- a/rosbag2_storage_mcap/src/mcap_storage.cpp
++++ b/rosbag2_storage_mcap/src/mcap_storage.cpp
+@@ -1,3 +1,4 @@
++#include "rig_publication_provenance.hpp"
+ // Copyright 2022, Amazon.com Inc or its Affiliates. All rights reserved.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -267,6 +268,12 @@
+     RCPPUTILS_TSA_GUARDED_BY(mcap_storage_mutex_);  // datatype -> schema_id
+   std::unordered_map<std::string, mcap::ChannelId> channel_ids_
+     RCPPUTILS_TSA_GUARDED_BY(mcap_storage_mutex_);  // topic -> channel_id
++  std::unordered_map<std::string, std::unordered_map<std::string, mcap::ChannelId>>
++    provenance_channel_ids_;
++  std::unordered_map<mcap::ChannelId, rig_publication_provenance::IdentityPtr>
++    read_channel_identity_;
++  bool provenance_marker_written_ = false;
++  uint32_t allocated_channel_count_ = 0;
+   rosbag2_storage::StorageFilter storage_filter_{};
+   mcap::ReadMessageOptions::ReadOrder read_order_ = mcap::ReadMessageOptions::ReadOrder::FileOrder;
+ 
+@@ -542,6 +549,18 @@
+   msg->topic_name = messageView.channel->topic;
+   msg->serialized_data = rosbag2_storage::make_serialized_message(messageView.message.data,
+                                                                   messageView.message.dataSize);
++
++  msg->sequence_number = messageView.message.sequence;
++  {  // Carry all channel metadata through conversion, including unmarked channels.
++    auto found = read_channel_identity_.find(messageView.channel->id);
++    if (found == read_channel_identity_.end()) {
++      rig_publication_provenance::Metadata fields(
++        messageView.channel->metadata.begin(), messageView.channel->metadata.end());
++      found = read_channel_identity_.emplace(messageView.channel->id,
++        rig_publication_provenance::identity(std::move(fields))).first;
++    }
++    rig_publication_provenance::attach(msg->serialized_data, found->second);
++  }
+ 
+   // enqueue this message to be used
+   next_ = msg;
+@@ -905,6 +924,42 @@
+ 
+   mcap::Message mcap_msg;
+   mcap_msg.channelId = channel_it->second;
++  if (const auto * envelope = rig_publication_provenance::envelope(msg->serialized_data)) {
++    const auto * identity = &envelope->fields;
++    auto & channels = provenance_channel_ids_[msg->topic_name];
++    const auto known = channels.find(envelope->key);
++    if (known != channels.end()) {
++      mcap_msg.channelId = known->second;
++    } else {
++      // Leave the ordinary topic channel unmarked. Unsupported records can never inherit
++      // the previous writer's identity, including when the upper32 sequence changes.
++      mcap::Channel channel;
++      channel.topic = msg->topic_name;
++      channel.messageEncoding = topic_it->second.topic_metadata.serialization_format;
++      channel.schemaId = schema_ids_.at(topic_it->second.topic_metadata.type);
++      channel.metadata.emplace("offered_qos_profiles",
++        rosbag2_storage::serialize_rclcpp_qos_vector(
++          topic_it->second.topic_metadata.offered_qos_profiles));
++      channel.metadata.emplace("topic_type_hash",
++        topic_it->second.topic_metadata.type_description_hash);
++      for (const auto & pair : *identity) {channel.metadata[pair.first] = pair.second;}
++      rig_publication_provenance::require_channel_capacity(allocated_channel_count_);
++      mcap_writer_->addChannel(channel);
++      ++allocated_channel_count_;
++      channels.emplace(envelope->key, channel.id);
++      mcap_msg.channelId = channel.id;
++    }
++    if (!provenance_marker_written_ && identity->count(rig_publication_provenance::marker)) {
++      // Metadata records are outside chunks, so even an old tool can detect presence
++      // without decompressing payloads. This marker is also re-emitted during convert.
++      mcap::Metadata marker;
++      marker.name = "rig.publication_provenance";
++      marker.metadata = {{"schema", "1"}, {"contract", "rmw_publication"}};
++      const auto marker_status = mcap_writer_->write(marker);
++      if (!marker_status.ok()) {throw std::runtime_error(marker_status.message);}
++      provenance_marker_written_ = true;
++    }
++  }
+   mcap_msg.sequence = msg->sequence_number;
+   if (msg->recv_timestamp < 0) {
+     RCUTILS_LOG_WARN_NAMED(LOG_NAME, "Invalid message timestamp %ld", msg->recv_timestamp);
+@@ -977,7 +1032,9 @@
+       "offered_qos_profiles",
+       rosbag2_storage::serialize_rclcpp_qos_vector(topic_info.topic_metadata.offered_qos_profiles));
+     channel.metadata.emplace("topic_type_hash", topic_info.topic_metadata.type_description_hash);
++    rig_publication_provenance::require_channel_capacity(allocated_channel_count_);
+     mcap_writer_->addChannel(channel);
++    ++allocated_channel_count_;
+     channel_ids_.emplace(topic.name, channel.id);
+   }
+ }
+--- a/rosbag2_compression/src/rosbag2_compression/sequential_compression_writer.cpp
++++ b/rosbag2_compression/src/rosbag2_compression/sequential_compression_writer.cpp
+@@ -1,3 +1,4 @@
++#include "rig_publication_provenance.hpp"
+ // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -414,6 +415,13 @@
+   compressed_message->send_timestamp = message->send_timestamp;
+   compressed_message->topic_name = message->topic_name;
+   compressor.compress_serialized_bag_message(message.get(), compressed_message.get());
++  // Compression changes the buffer, never the source publication it represents.
++  compressed_message->sequence_number = message->sequence_number;
++  compressed_message->recv_timestamp = message->recv_timestamp;
++  compressed_message->send_timestamp = message->send_timestamp;
++  if (auto identity = rig_publication_provenance::identity_owner(message->serialized_data)) {
++    rig_publication_provenance::attach(compressed_message->serialized_data, std::move(identity));
++  }
+   return compressed_message;
+ }
+ 
+--- a/rosbag2_compression/src/rosbag2_compression/sequential_compression_reader.cpp
++++ b/rosbag2_compression/src/rosbag2_compression/sequential_compression_reader.cpp
+@@ -1,3 +1,4 @@
++#include "rig_publication_provenance.hpp"
+ // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -111,7 +112,17 @@
+     has_next();
+     auto message = storage_->read_next();
+     if (compression_mode_ == rosbag2_compression::CompressionMode::MESSAGE) {
++      auto identity = rig_publication_provenance::identity_owner(message->serialized_data);
++      const auto sequence = message->sequence_number;
++      const auto received = message->recv_timestamp;
++      const auto published = message->send_timestamp;
+       decompressor_->decompress_serialized_bag_message(message.get());
++      message->sequence_number = sequence;
++      message->recv_timestamp = received;
++      message->send_timestamp = published;
++      if (identity && rig_publication_provenance::envelope(message->serialized_data) != identity.get()) {
++        rig_publication_provenance::attach(message->serialized_data, std::move(identity));
++      }
+     }
+     return converter_ ? converter_->convert(message) : message;
+   }

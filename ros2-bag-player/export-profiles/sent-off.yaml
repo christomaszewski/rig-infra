@@ -1,7 +1,7 @@
 {
   "version": 1,
   "id": "sent-off",
-  "revision": 1,
+  "revision": 2,
   "format": "rosbag2-proxy/v1",
   "lossy": false,
   "policy": {

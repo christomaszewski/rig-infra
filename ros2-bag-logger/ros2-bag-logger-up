@@ -12,7 +12,10 @@ CONFIG="${1:?usage: ros2-bag-logger-up <config.yaml> [up [-d]|down|status|logs|c
 [ -f "$CONFIG" ] || { echo "ros2-bag-logger-up: config not found: $CONFIG" >&2; exit 1; }
 CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 INSPECT=()
-case "${1:-}" in runtime-images|images) INSPECT=(--inspect) ;; esac
+case "${1:-}" in
+  runtime-images|images) INSPECT=(--inspect) ;;
+  down|status|logs|ps|stop|rm) INSPECT=(--legacy-control) ;;
+esac
 
 # `export` (v1.14.0, rig ≥ v0.2.54 `rig run export`): re-write THIS instance's sessions of a sealed
 # run smaller — `ros2 bag convert` per session (recompress at the profile's preset, drop topics,
@@ -48,51 +51,69 @@ if [ "${1:-}" = "export" ]; then
     bag-logger /bin/bash "$SCRIPT"
 fi
 
-# config -> the exact `ros2 bag record` command, rendered to var/run/<name>/record.sh (captured by
-# `rig bake` like any launcher-rendered file). bag_cmd prints
-# "<name>\t<script-path>\t<shm-flag>\t<graph-flag>\t<interval_s>\t<settle_s>": the shm flag ("shm"
-# when zenoh shared memory is EFFECTIVELY on) gates the ipc:host compose overlay — the container
-# only gives up IPC-namespace isolation when SHM can actually use it — and the graph fields carry
-# the `graph:` block (the graph-snapshotter sidecar gate; empty interval/settle = tool defaults).
+# Legacy graph/system capture remains in this project for the compatibility release.
+# Config parsing warns about migration; diagnostics are never implicitly enabled.
 NAME_AND_SCRIPT="$("$PYTHON" "$REPO/tools/bag_cmd.py" "$CONFIG_ABS" "$REPO" ${INSPECT[@]+"${INSPECT[@]}"})"
-# split on tabs by hand — `read` with a whitespace IFS collapses runs of tabs, losing empty fields
 REST="$NAME_AND_SCRIPT"
 NAME="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
 SCRIPT="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
 SHM_FLAG="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
-GRAPH_FLAG="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
-GRAPH_INTERVAL="${REST%%$'\t'*}"
-GRAPH_SETTLE="${REST#*$'\t'}"
+GRAPH_ENABLED="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+GRAPH_INTERVAL="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+GRAPH_SETTLE="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+SYSTEM_ENABLED="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+SYSTEM_INTERVAL="${REST%%$'\t'*}"; REST="${REST#*$'\t'}"
+SYSTEM_SETTINGS_INTERVAL="${REST%%$'\t'*}"
+GRAPH_ENDPOINTS="${REST#*$'\t'}"
 export BAG_LOGGER_NAME="$NAME"
 export BAG_RECORD_SCRIPT="$SCRIPT"
-
-# The graph-snapshotter sidecar (profiles: ["graph"]): its parameters travel by env, no render
-# step. The profile flag goes on `up` only when the config enables it — but UNCONDITIONALLY on
-# down/status/logs/ps, so a sidecar left running from a since-disabled (or since-removed) config
-# is still torn down and visible; a profile matching no container is harmless.
-export GRAPH_SNAPSHOT_NAME="$NAME"
-[ -n "$GRAPH_INTERVAL" ] && export GRAPH_SNAPSHOT_INTERVAL_S="$GRAPH_INTERVAL"
-[ -n "$GRAPH_SETTLE" ] && export GRAPH_SNAPSHOT_SETTLE_S="$GRAPH_SETTLE"
-
-# rig sets COMPOSE_PROJECT_NAME=<name>-vehicle-<id>; honor it (fall back to our own for standalone use).
+export GRAPH_SNAPSHOT_NAME="$NAME" GRAPH_SNAPSHOT_ENABLED="$GRAPH_ENABLED"
+# An omitted/null timing used the caller's environment (or Compose's default) in v1.20.1.
+[ -z "$GRAPH_INTERVAL" ] || export GRAPH_SNAPSHOT_INTERVAL_S="$GRAPH_INTERVAL"
+[ -z "$GRAPH_SETTLE" ] || export GRAPH_SNAPSHOT_SETTLE_S="$GRAPH_SETTLE"
+export GRAPH_SNAPSHOT_ENDPOINTS_ENABLED="$GRAPH_ENDPOINTS"
+export SYSTEM_SNAPSHOT_NAME="$NAME" SYSTEM_SNAPSHOT_ENABLED="$SYSTEM_ENABLED"
+export SYSTEM_SNAPSHOT_INTERVAL_S="$SYSTEM_INTERVAL"
+export SYSTEM_SNAPSHOT_SETTINGS_INTERVAL_S="$SYSTEM_SETTINGS_INTERVAL"
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ros2-bag-logger_${NAME}}"
 FILES=(-f "$REPO/docker/compose.deploy.yaml")
 [ "$SHM_FLAG" = "shm" ] && FILES+=(-f "$REPO/docker/compose.shm.yaml")
 ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
 [ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
-PROFILE=()
+LEGACY_ACTIVE=false
+if [ "$GRAPH_ENABLED" = true ] || [ "$SYSTEM_ENABLED" = true ]; then LEGACY_ACTIVE=true; fi
 case "${ARGS[0]}" in
-  up|runtime-images|images) [ "$GRAPH_FLAG" = "graph" ] && PROFILE=(--profile graph) ;;
-  down|ps|logs) PROFILE=(--profile graph) ;;
+  up|config|images|runtime-images)
+    if [ "$LEGACY_ACTIVE" = true ]; then
+      FILES+=(-f "$REPO/docker/compose.legacy-observer.yaml" --profile legacy-observer)
+      [ "$SYSTEM_ENABLED" = true ] && FILES+=(-f "$REPO/docker/compose.legacy-system.yaml")
+    fi ;;
+  down|ps|logs|stop|rm)
+    # Always address old sidecars, including after their config blocks were removed.
+    FILES+=(-f "$REPO/docker/compose.legacy-observer.yaml" --profile legacy-observer) ;;
+  *)
+    # As in the released base model, Compose activates this profiled service when
+    # a passthrough command explicitly targets it (e.g. restart graph-snapshotter).
+    FILES+=(-f "$REPO/docker/compose.legacy-observer.yaml")
+    [ "$SYSTEM_ENABLED" != true ] || FILES+=(-f "$REPO/docker/compose.legacy-system.yaml") ;;
 esac
 case "${ARGS[0]}" in
   runtime-images|images)
-    exec "$PYTHON" "$REPO/tools/runtime_images.py" "${ARGS[0]}" "${FILES[@]}" ${PROFILE[@]+"${PROFILE[@]}"} ;;
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" "${ARGS[0]}" "${FILES[@]}" ;;
   up)
+    if [ "$LEGACY_ACTIVE" != true ]; then
+      # A migrated config removes only this project's former sidecar. Keep run files,
+      # volumes, the recorder, and any independently configured observer project.
+      docker compose "${FILES[@]}" -f "$REPO/docker/compose.legacy-observer.yaml" \
+        --profile legacy-observer rm --stop --force graph-snapshotter
+    fi
+    if [ "$SYSTEM_ENABLED" = true ]; then
+      "$PYTHON" "$REPO/tools/observer/host_probe.py" --data-root "${RIG_DATA_DIR:-/data}" --name "$NAME" || \
+        echo "ros2-bag-logger: native host probe failed; continuing legacy system capture" >&2
+    fi
     if [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
-      exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" ${PROFILE[@]+"${PROFILE[@]}"} -- "${ARGS[@]:1}"
+      exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" -- "${ARGS[@]:1}"
     fi ;;
 esac
-echo "ros2-bag-logger-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} script=$SCRIPT${SHM_FLAG:+ shm=on}${GRAPH_FLAG:+ graph=on}" >&2
-# ${PROFILE[@]+...}: an EMPTY array under `set -u` is an error on bash < 4.4 (macOS dev boxes)
-exec docker compose "${FILES[@]}" ${PROFILE[@]+"${PROFILE[@]}"} "${ARGS[@]}"
+echo "ros2-bag-logger-up: project=${COMPOSE_PROJECT_NAME} domain=${ROS_DOMAIN_ID:-0} rmw=${RMW_IMPLEMENTATION:-?} script=$SCRIPT${SHM_FLAG:+ shm=on}" >&2
+exec docker compose "${FILES[@]}" "${ARGS[@]}"

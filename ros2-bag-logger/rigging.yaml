@@ -53,6 +53,14 @@ launch_surface:
   - ros2-bag-logger-up
   - tools/bag_cmd.py
   - tools/bag_export.py       # the `export` verb's renderer (specs + convert script per run)
-  - tools/graph_snapshot.py   # the graph-snapshotter sidecar's tool (mounted, not rendered)
+  - tools/export_provenance.py # verify selected raw records before publishing converted sessions
+  - tools/publication_identity.py # mirrored from ros2-bag-player; checked by export tests
   - docker/compose.deploy.yaml
+  - tools/observer/graph_snapshot.py
+  - tools/observer/endpoint_snapshot.py
+  - tools/observer/run_observer.py
+  - tools/observer/system_snapshot.py
+  - tools/observer/host_probe.py
+  - docker/compose.legacy-observer.yaml # deprecated capture bridge + scoped migration cleanup
+  - docker/compose.legacy-system.yaml
   - docker/compose.shm.yaml   # applied only when the config effectively enables zenoh shared memory

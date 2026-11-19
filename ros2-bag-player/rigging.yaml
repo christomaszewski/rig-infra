@@ -33,6 +33,8 @@ launch_surface:
   - tools/play_cmd.py
   - tools/bag_inputs.py
   - tools/bag_proxy.py
+  - tools/mcap_proxy.py
+  - tools/publication_identity.py
   - tools/bag_proxy_host.py
   - export-profiles
   - tools/call_injector.py   # the call injector's tool (mounted, not rendered — the graph-snapshotter pattern)

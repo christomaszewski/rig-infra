@@ -1,0 +1,51 @@
+# Shared fleet ROS image; capture-only mode does not start the diagnostics publisher.
+services:
+  observer:
+    image: ${OBSERVER_IMAGE:-${RIG_MSGS_IMAGE:-${RIG_BASE_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}fleet-ros:${RIG_IMAGE_TAG:-latest}}}}
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 5s
+    tmpfs:
+      - /run/observer
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}
+      ZENOH_CONFIG_OVERRIDE: ${ZENOH_CONFIG_OVERRIDE:-}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      RIG_BAG_ROOT: /data
+      OBSERVER_NAME: ${OBSERVER_NAME:-observer}
+      OBSERVER_RECORDING_ENABLED: ${OBSERVER_RECORDING_ENABLED:-true}
+      OBSERVER_DIAGNOSTICS_ENABLED: ${OBSERVER_DIAGNOSTICS_ENABLED:-true}
+      OBSERVER_STATE_DIR: /run/observer
+      OBSERVER_NATIVE_PROBE_FILE: /native-host/native-host.json
+      GRAPH_SNAPSHOT_ENABLED: ${GRAPH_SNAPSHOT_ENABLED:-true}
+      GRAPH_SNAPSHOT_ENDPOINTS_ENABLED: ${GRAPH_SNAPSHOT_ENDPOINTS_ENABLED:-true}
+      GRAPH_SNAPSHOT_NAME: ${GRAPH_SNAPSHOT_NAME:-observer}
+      GRAPH_SNAPSHOT_INTERVAL_S: ${GRAPH_SNAPSHOT_INTERVAL_S:-60}
+      GRAPH_SNAPSHOT_SETTLE_S: ${GRAPH_SNAPSHOT_SETTLE_S:-2}
+      SYSTEM_SNAPSHOT_ENABLED: ${SYSTEM_SNAPSHOT_ENABLED:-true}
+      SYSTEM_SNAPSHOT_NAME: ${SYSTEM_SNAPSHOT_NAME:-observer}
+      SYSTEM_SNAPSHOT_INTERVAL_S: ${SYSTEM_SNAPSHOT_INTERVAL_S:-1}
+      SYSTEM_SNAPSHOT_SETTINGS_INTERVAL_S: ${SYSTEM_SNAPSHOT_SETTINGS_INTERVAL_S:-30}
+      OBSERVER_DIAGNOSTICS_TOPIC: ${OBSERVER_DIAGNOSTICS_TOPIC:-/diagnostics}
+      OBSERVER_DIAGNOSTICS_INTERVAL_S: ${OBSERVER_DIAGNOSTICS_INTERVAL_S:-1}
+      OBSERVER_DIAGNOSTICS_STALE_AFTER_S: ${OBSERVER_DIAGNOSTICS_STALE_AFTER_S:-5}
+      OBSERVER_DIAGNOSTICS_COMPONENTS: ${OBSERVER_DIAGNOSTICS_COMPONENTS:?set by observer-up}
+      OBSERVER_DIAGNOSTICS_THRESHOLDS: ${OBSERVER_DIAGNOSTICS_THRESHOLDS:?set by observer-up}
+      OBSERVER_DIAGNOSTICS_INSTANCE: ${OBSERVER_DIAGNOSTICS_INSTANCE:-observer}
+      OBSERVER_DIAGNOSTICS_SCOPE: ${OBSERVER_DIAGNOSTICS_SCOPE:-live_host}
+    volumes:
+      - ${RIG_DATA_DIR:-/data}:/data
+      - ../tools/graph_snapshot.py:/graph_snapshot.py:ro
+      - ../tools/endpoint_snapshot.py:/endpoint_snapshot.py:ro
+      - ../tools/run_observer.py:/run_observer.py:ro
+      - ../tools/system_snapshot.py:/system_snapshot.py:ro
+      - ../tools/diagnostics_publish.py:/diagnostics_publish.py:ro
+      - type: bind
+        source: ${OBSERVER_NATIVE_PROBE_DIR:?set by observer-up}
+        target: /native-host
+        read_only: true
+        bind:
+          create_host_path: false
+    command: ["/bin/bash", "-c", "[ -n \"$${ROS_DISTRO:-}\" ] && [ -f \"/opt/ros/$$ROS_DISTRO/setup.bash\" ] && . \"/opt/ros/$$ROS_DISTRO/setup.bash\"; exec python3 /run_observer.py"]

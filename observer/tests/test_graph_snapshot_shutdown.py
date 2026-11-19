@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -77,7 +78,11 @@ def child(mode, root):
         state["shutdown"] = True
 
     rclpy.init = init
-    rclpy.create_node = lambda name: Node()
+    def create_node(name, **kwargs):
+        state["node_name"] = name
+        state["node_namespace"] = kwargs.get("namespace")
+        return Node()
+    rclpy.create_node = create_node
     rclpy.ok = lambda: state["ok"]
     rclpy.try_shutdown = shutdown
     sys.modules.update({"rclpy": rclpy, "rclpy.signals": signals})
@@ -108,6 +113,7 @@ def child(mode, root):
     gs._utc = lambda: (f"2026-10-16T12:00:0{state['walks']}Z",
                        f"20261016T12000{state['walks']}Z")
     os.environ.update(RIG_BAG_ROOT=root, GRAPH_SNAPSHOT_NAME="test",
+                      GRAPH_SNAPSHOT_ENDPOINTS_ENABLED="false",
                       GRAPH_SNAPSHOT_SETTLE_S="60" if mode == "settle" else "0",
                       GRAPH_SNAPSHOT_INTERVAL_S="60")
     handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
@@ -117,6 +123,28 @@ def child(mode, root):
 
 
 class ShutdownTests(unittest.TestCase):
+    def test_namespaced_observer_node_and_disabled_recording(self):
+        with mock.patch.dict(os.environ, {"OBSERVER_RECORDING_ENABLED": "false"}):
+            self.assertEqual(gs.main(), 0)  # no rclpy imported or filesystem touched
+        with tempfile.TemporaryDirectory() as root:
+            proc = subprocess.Popen([sys.executable, __file__, "--child", "interval", root],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    env={**os.environ, "OBSERVER_NAME": "host_observer"})
+            try:
+                ready, _, _ = select.select([proc.stdout], [], [], 5)
+                self.assertTrue(ready)
+                self.assertEqual(proc.stdout.readline(), "ready\n")
+                proc.terminate()
+                _, stderr = proc.communicate(timeout=3)
+                self.assertEqual(proc.returncode, 0, stderr)
+                state = json.loads(pathlib.Path(root, "cleanup.json").read_text())
+                self.assertEqual(state["node_name"], "graph_snapshotter")
+                self.assertEqual(state["node_namespace"], "/host_observer")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.communicate()
+
     def check_shutdown(self, mode, sig):
         with tempfile.TemporaryDirectory() as root:
             proc = subprocess.Popen([sys.executable, __file__, "--child", mode, root],

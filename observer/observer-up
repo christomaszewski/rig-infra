@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Independent graph/system observation with optional disk recording and ROS diagnostics.
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${OBSERVER_PYTHON:-python3}"
+CONFIG="${1:?usage: observer-up config.yaml [up [-d]|down|status|logs|config|images|runtime-images]}"
+shift || true
+[ -f "$CONFIG" ] || { echo "observer-up: config not found: $CONFIG" >&2; exit 1; }
+ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = status ] && ARGS=(ps "${ARGS[@]:1}")
+MODE=control
+case "${ARGS[0]}" in
+  up|config) MODE="${ARGS[0]}" ;;
+  images|runtime-images) MODE=inspect ;;
+esac
+ENV_LINES="$("$PYTHON" "$REPO/tools/observer_config.py" "$CONFIG" "$REPO" --mode "$MODE")"
+# The renderer emits only validated, shell-quoted assignments to its fixed key list.
+eval "$ENV_LINES"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-observer_${OBSERVER_NAME}}"
+FILES=(-f "$REPO/docker/compose.deploy.yaml")
+[ "$SYSTEM_SNAPSHOT_ENABLED" = true ] && FILES+=(-f "$REPO/docker/compose.system.yaml")
+case "${ARGS[0]}" in
+  images|runtime-images)
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" "${ARGS[0]}" "${FILES[@]}" ;;
+  up)
+    if [ "$SYSTEM_SNAPSHOT_ENABLED" = true ]; then
+      # Fresh, read-only native evidence is collected only on an actual launch.
+      # The placeholder was reset above, so a failure cannot reuse an older host.
+      "$PYTHON" "$REPO/tools/host_probe.py" --output "$OBSERVER_NATIVE_PROBE_SOURCE" || \
+        echo "observer-up: native host probe failed; continuing with available measurements" >&2
+    fi
+    if [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+      exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" -- "${ARGS[@]:1}"
+    fi ;;
+esac
+echo "observer-up: project=$COMPOSE_PROJECT_NAME graph=$GRAPH_SNAPSHOT_ENABLED system=$SYSTEM_SNAPSHOT_ENABLED recording=$OBSERVER_RECORDING_ENABLED diagnostics=$OBSERVER_DIAGNOSTICS_ENABLED" >&2
+exec docker compose "${FILES[@]}" "${ARGS[@]}"

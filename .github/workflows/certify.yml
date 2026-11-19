@@ -22,7 +22,7 @@ jobs:
         with:
           repository: christomaszewski/rig
           path: .rig
-      - run: python3 -m pip install --user pyyaml
+      - run: python3 -m pip install --user pyyaml mcap==1.3.1
       - uses: ./.rig/.github/actions/setup-build-probe
       # Each service's declared `examples:` is certify's default --config.
       - name: certify zenoh-router
@@ -34,27 +34,36 @@ jobs:
           ./.rig/rig certify --require-build-check --repo zenoh-router --config /tmp/zr.yaml
       - name: certify ros2-bag-logger
         run: ./.rig/rig certify --require-build-check --repo ros2-bag-logger
-      # The logger's second config path: a `graph:` block gates the graph-snapshotter sidecar
-      # (profile-gated compose service + GRAPH_SNAPSHOT_* env exports).
-      - name: certify ros2-bag-logger (graph path)
+      - name: certify ros2-bag-logger (deprecated graph/system settings)
         run: |
-          printf 'service: ros2-bag-logger\nname: bl\ngraph:\n  enabled: true\n  interval_s: 30\n' > /tmp/bl.yaml
-          ./.rig/rig certify --require-build-check --repo ros2-bag-logger --config /tmp/bl.yaml
-      # The graph-snapshotter's pure core (epoch dedup/hash/schema — the rig v0.2.32 reader is
-      # built against fixtures of exactly this schema) and the `graph:` config gate — plus the
-      # v1.9.0 sim-time adoption (RIG_SIM_TIME fills use_sim_time's default, explicit config
-      # wins both ways: the rigging's `replay: {sim_time: true}` promise rig v0.2.34 relies on).
+          printf 'service: ros2-bag-logger\nname: legacy\ngraph: {enabled: true}\n' > /tmp/logger-legacy-graph.yaml
+          ./.rig/rig certify --require-build-check --repo ros2-bag-logger --config /tmp/logger-legacy-graph.yaml
+          printf 'service: ros2-bag-logger\nname: legacy\ngraph: {enabled: true}\nsystem: {enabled: true}\n' > /tmp/logger-legacy-system.yaml
+          ./.rig/rig certify --require-build-check --repo ros2-bag-logger --config /tmp/logger-legacy-system.yaml
+      - name: certify observer (combined path)
+        run: ./.rig/rig certify --require-build-check --repo observer
+      - name: certify observer (capture-only and diagnostics-only paths)
+        run: |
+          printf 'service: observer\nname: obs\ndiagnostics: {enabled: false}\n' > /tmp/observer-capture.yaml
+          ./.rig/rig certify --require-build-check --repo observer --config /tmp/observer-capture.yaml
+          printf 'service: observer\nname: obs\ngraph: {enabled: false}\nrecording: {enabled: false}\n' > /tmp/observer-diagnostics.yaml
+          ./.rig/rig certify --require-build-check --repo observer --config /tmp/observer-diagnostics.yaml
+      - name: observer tests
+        run: |
+          python3 tools/sync_observer_compat.py --check
+          for test in observer/tests/test_*.py; do python3 "$test"; done
       - name: ros2-bag-logger unit tests
         run: |
-          python3 ros2-bag-logger/tests/test_graph_snapshot.py
-          python3 ros2-bag-logger/tests/test_graph_snapshot_shutdown.py
+          python3 ros2-bag-logger/tests/test_observer_migration.py
           python3 ros2-bag-logger/tests/test_bag_cmd_sim_time.py
+          python3 ros2-bag-logger/tests/test_recording_scope.py
           # v1.14.0: the `export` verb — bag_export's pure core (specs per session, the options
           # schema, windows off the session's metadata, idempotency) + the launcher against a
           # docker stub (the one-off `compose run` with both dirs mounted at their host paths)
           # v1.15.0: + the in-place rewrite (convert beside, verify.py run for real, swap,
           # crash recovery, the lossy gate, RIG_EXPORT_NAME, the single writable mount)
           python3 ros2-bag-logger/tests/test_bag_export.py
+          python3 ros2-bag-logger/tests/test_export_provenance.py
       # The player renders against a source run (session resolution is host-side, §1.3 of the
       # replay handoff) and the example config's source.run is empty ON PURPOSE — the source is
       # rig's channel. Certify passes the caller's env through, so hand it a fabricated run.
@@ -136,6 +145,7 @@ jobs:
           python3 ros2-bag-player/tests/test_replay_plan.py
           python3 ros2-bag-player/tests/test_multi_input.py
           python3 ros2-bag-player/tests/test_bag_proxy.py
+          python3 ros2-bag-player/tests/test_publication_identity.py
           python3 ros2-bag-player/tests/test_inspect_calls.py
           python3 ros2-bag-player/tests/test_runtime_images.py
           python3 ros2-bag-player/tests/test_runtime_acceptance_runner.py
@@ -182,7 +192,7 @@ jobs:
             echo "  ok  $1 -> $3"
           }
           BASE=nvcr.io/vendor/l4t-ros:36.4
-          for svc in zenoh-router ros2-bag-logger; do
+          for svc in zenoh-router ros2-bag-logger observer; do
             expect "$svc fallback (certify's view)" "devbox:5000/fleet-ros:v1.3.0" "$(rendered '' $svc)"
             expect "$svc runs the base"             "$BASE"                        "$(rendered $BASE $svc)"
           done

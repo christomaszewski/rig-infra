@@ -1,5 +1,5 @@
-"""The graph-snapshotter's pure core (tools/graph_snapshot.py) and the `graph:` config gate
-(tools/bag_cmd.py). The epoch contract these pin down (rig-graph-capture-handoff §1.2): identity
+"""The observer graph worker's pure core (tools/graph_snapshot.py).
+The epoch contract these tests pin down (rig-graph-capture-handoff §1.2): identity
 hash over the canonical `nodes:` body only; unchanged graph -> the SAME file with `last:` bumped;
 changed graph -> a NEW file, the old one never touched again; canonical ordering makes the hash
 input-order-independent; the snapshotter excludes its OWN node and nothing else; same-second
@@ -14,7 +14,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "tools")
 
 import yaml
 
-import bag_cmd
+
 import graph_snapshot as gs
 
 TALKER = {"pubs": [("/chatter", ["std_msgs/msg/String"]), ("/rosout", ["rcl_interfaces/msg/Log"])],
@@ -149,38 +149,6 @@ def test_epoch_file_matches_the_contract_schema():
     empty = yaml.safe_load(gs.render_epoch({}, "2026-08-27T10:15:03Z", "2026-08-27T10:15:03Z",
                                            "rmw_zenoh_cpp", 0))
     assert empty["nodes"] == {}
-
-
-# --- the `graph:` config gate (bag_cmd) -----------------------------------------------------------
-
-def _expect_exit(cfg, needle):
-    try:
-        bag_cmd.graph_params(cfg)
-        raise AssertionError(f"expected SystemExit mentioning {needle!r}")
-    except SystemExit as exc:
-        assert needle in str(exc), f"{needle!r} not in {exc}"
-
-
-def test_graph_params_absent_block_is_off_and_inert():
-    assert bag_cmd.graph_params({}) == (False, "", "")
-    assert bag_cmd.graph_params({"name": "x", "record": {}}) == (False, "", "")
-
-
-def test_graph_params_reads_the_block():
-    assert bag_cmd.graph_params({"graph": {"enabled": True}}) == (True, "", "")
-    assert bag_cmd.graph_params({"graph": {"enabled": True, "interval_s": 60, "settle_s": 5}}) \
-        == (True, "60", "5")
-    assert bag_cmd.graph_params({"graph": {"enabled": False, "interval_s": 30}}) == (False, "30", "")
-    assert bag_cmd.graph_params({"graph": {"enabled": True, "settle_s": 2.5}}) == (True, "", "2.5")
-
-
-def test_graph_params_is_strict():
-    _expect_exit({"graph": []}, "must be a mapping")
-    _expect_exit({"graph": {"enable": True}}, "unknown graph key")      # the typo that would
-    _expect_exit({"graph": {"interval": 30}}, "unknown graph key")      # silently run defaults
-    _expect_exit({"graph": {"enabled": True, "interval_s": 0}}, "interval_s")
-    _expect_exit({"graph": {"enabled": True, "interval_s": "fast"}}, "interval_s")
-    _expect_exit({"graph": {"enabled": True, "settle_s": -1}}, "settle_s")
 
 
 if __name__ == "__main__":
