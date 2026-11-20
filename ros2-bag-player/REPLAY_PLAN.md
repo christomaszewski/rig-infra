@@ -85,6 +85,14 @@ It preserves serialized payloads and original send times, verifies the written b
 and writes per-message receive/send/schedule and deduplication provenance. Rig verifies
 source/output hashes and atomically publishes the immutable generation.
 
+Rig passes recipe `export.bags.exclude` as the conversion policy's optional
+`exclude_topics` list. Names match complete recorded ROS topics. Excluded messages
+are skipped before timestamp validation. The report counts them in `input_messages`,
+`excluded_messages` and `excluded_messages_by_topic`. The per-message provenance
+file uses original source ordinals for the remaining messages. Storage-level checks
+still apply to each input bag, including CRC validation for MCAP and metadata
+parsing by the SQLite storage reader.
+
 Profiles in `export-profiles/` combine arrival, middleware send, or sensor timing with
 `off`, `conservative`, or `aggressive` deduplication. Conservative mode can match ordinary MCAP messages across input recordings
 when both carry the same recorder-attested scope, RMW, ROS domain, writer GID and 64-bit publication

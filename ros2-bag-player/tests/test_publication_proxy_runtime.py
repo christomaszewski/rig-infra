@@ -29,7 +29,7 @@ class PublicationProxyRuntime(unittest.TestCase):
         import yaml
         import zstandard
         from mcap.writer import CompressionType, Writer
-        records = [("/value", "std_msgs/msg/String", serialize_message(String(data=row.get("text", "same"))),
+        records = [(row.get("topic", "/value"), "std_msgs/msg/String", serialize_message(String(data=row.get("text", "same"))),
                     row.get("received", 100 + i), row.get("sent", 90)) for i, row in enumerate(rows)]
         bag = self.bag(name, "mcap", records)
         root = Path(bag["path"])
@@ -66,11 +66,14 @@ class PublicationProxyRuntime(unittest.TestCase):
                                         scope=row.get("scope", "boot:example"))
                     evidence.update(row.get("metadata", {}))
                     channel_metadata = {**raw[i].channel.metadata, **evidence}
-                    key = json.dumps(channel_metadata, sort_keys=True)
+                    topic = row.get("topic", "/value")
+                    key = (topic, json.dumps(channel_metadata, sort_keys=True))
                     if key not in channels:
-                        channels[key] = writer.register_channel("/value", "cdr", sid, channel_metadata)
+                        channels[key] = writer.register_channel(topic, "cdr", sid, channel_metadata)
                     data = (zstandard.ZstdCompressor().compress(message.data) if outer == "message"
                             else message.data)
+                    if row.get("invalid_compressed"):
+                        data = b"not a zstd message"
                     writer.add_message(channels[key], message.log_time, data, message.publish_time, seq & 0xffffffff)
                 writer.finish()
             if outer == "file":
@@ -93,6 +96,30 @@ class PublicationProxyRuntime(unittest.TestCase):
     @staticmethod
     def identities(path):
         return [identity_key(row.channel.metadata, row.message.sequence) for row in iter_mcap_records(path)]
+
+    def test_excluded_compressed_payload_keeps_original_split_ordinals(self):
+        import zstandard
+        a = self.marked("excluded-compressed", [dict(sequence=1),
+                        dict(topic="/excluded", sequence=2, invalid_compressed=True),
+                        dict(sequence=3, text="last")], split_at=2, outer="message")
+        with self.assertRaises(zstandard.ZstdError):
+            self.convert([a], "bad-compression-unfiltered")
+        result, records, provenance, channels = self.convert([a], "bad-compression-filtered",
+                                                           exclude_topics=["/excluded"])
+        self.assertEqual(len(records), 2)
+        self.assertEqual([c.name for c in channels], ["/value"])
+        self.assertEqual([p["ordinal"] for p in provenance], [0, 2])
+        self.assertEqual([(p["source_record"]["file"], p["source_record"]["record"]) for p in provenance],
+                         [("part0.mcap", 0), ("part1.mcap", 0)])
+        self.assertEqual([p["publication_identity"][-1] for p in provenance], [1, 3])
+        self.assertEqual(result["statistics"]["input_messages"], 3)
+        self.assertEqual(result["statistics"]["excluded_messages_by_topic"], {"/excluded": 1})
+
+    def test_exclusion_does_not_hide_missing_container_provenance_marker(self):
+        a = self.marked("excluded-marker", [dict(sequence=1), dict(topic="/excluded", sequence=2)],
+                        split_at=1, omit_marker_part=1)
+        with self.assertRaisesRegex(ValueError, "required outer marker"):
+            self.convert([a], "excluded-marker-output", exclude_topics=["/excluded"])
 
     def test_same_topic_channels_are_attached_to_exact_raw_record_not_sorted_ordinal(self):
         a = self.marked("a", [dict(gid="12"*16, sequence=1, received=200),

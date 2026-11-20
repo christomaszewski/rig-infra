@@ -32,6 +32,19 @@ class MergeTests(unittest.TestCase):
         self.addCleanup(result.close)
         return result
 
+    def test_exclusion_policy_is_optional_exact_and_canonical(self):
+        self.assertNotIn("exclude_topics", policy({}))
+        self.assertEqual(policy({"exclude_topics": []})["exclude_topics"], [])
+        original = ["/z", "/robot/camera", "/z", "/_internal"]
+        self.assertEqual(policy({"exclude_topics": original})["exclude_topics"],
+                         ["/_internal", "/robot/camera", "/z"])
+        self.assertEqual(original, ["/z", "/robot/camera", "/z", "/_internal"])
+        for invalid in (None, "/topic", {}, [None], [1], ["topic"], ["/"], ["/topic/"],
+                        ["//topic"], ["/topic/*"], ["/topic.*"], ["/topic name"], ["/1topic"],
+                        ["/topic\\n"], ["/topic/{name}"]):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "exclude_topics"):
+                policy({"exclude_topics": invalid})
+
     def test_equal_ordinary_messages_are_ambiguous_in_conservative_mode(self):
         index = self.index()
         index.add(0, 0, "/sample", "std_msgs/msg/String", b"same", 100, 50)

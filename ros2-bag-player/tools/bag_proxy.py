@@ -4,13 +4,15 @@
 Deduplication operates in original receive order before scheduling-time sorting.
 An ordinary ROS bag does not identify the original publisher/message: equal bytes
 are only a likely match. Service events can attest client/request/event identity.
-All discarded records retain a provenance link to the retained record.
+Duplicate records retain a provenance link to the retained record. Excluded topics
+are counted without per-message audit rows; retained source ordinals keep gaps.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import math
+from collections import Counter
 from pathlib import Path
 import re
 import sqlite3
@@ -28,7 +30,7 @@ DEFAULT_TF_LEAD_MS = 100.0
 
 
 def policy(value):
-    if not isinstance(value, dict) or set(value) - set(DEFAULTS) - {"tf_lead_time_ms"}:
+    if not isinstance(value, dict) or set(value) - set(DEFAULTS) - {"tf_lead_time_ms", "exclude_topics"}:
         raise ValueError("bag proxy: unknown policy fields")
     result = {**DEFAULTS, **value}
     if result["time_source"] not in ("received", "sent", "sensor"):
@@ -43,6 +45,12 @@ def policy(value):
     for field in [result["sensor_timestamp_field"], *fields.values()]:
         if not isinstance(field, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_][A-Za-z_0-9]*)*", field):
             raise ValueError("bag proxy: timestamp fields must be dotted ROS field paths")
+    if "exclude_topics" in result:
+        excluded = result["exclude_topics"]
+        if not isinstance(excluded, list) or any(not isinstance(topic, str) or not re.fullmatch(
+                r"(?:/[A-Za-z_][A-Za-z_0-9]*)+", topic) for topic in excluded):
+            raise ValueError("bag proxy: exclude_topics requires a list of exact absolute ROS topic names")
+        result["exclude_topics"] = sorted(set(excluded))
     for key in ("max_clock_skew_s", "dedup_window_ms", "tf_lead_time_ms"):
         if key not in result:
             continue  # Keep legacy profile policies byte-for-byte comparable to their requests.
@@ -364,6 +372,8 @@ def convert(request):
         raw_output = True
 
     settings = policy(request["policy"])
+    excluded_topics = frozenset(settings.get("exclude_topics", ()))
+    excluded_counts = Counter()
     stage = Path(request["destination"])
     if (stage / "bag").exists():
         raise ValueError("bag proxy output already exists")
@@ -388,6 +398,8 @@ def convert(request):
                 bag_topics = reader.get_all_topics_and_types()
             available = {}
             for tm in bag_topics:
+                if tm.name in excluded_topics:
+                    continue
                 if tm.serialization_format != "cdr":
                     raise ValueError(f"{tm.name}: only CDR bag serialization is supported")
                 previous = topics.get(tm.name)
@@ -418,6 +430,8 @@ def convert(request):
                 if bag["storage"] == "mcap":
                     raw_channels = {}
                     def register_raw(file_path, schema, channel):
+                        if channel.topic in excluded_topics:
+                            return
                         if channel.message_encoding != "cdr":
                             raise ValueError(f"{channel.topic}: only CDR bag serialization is supported")
                         if channel.topic not in available:
@@ -425,17 +439,23 @@ def convert(request):
                         if schema and schema.name != available.get(channel.topic):
                             raise ValueError(f"{channel.topic}: raw channel type disagrees with bag metadata")
                         raw_channels[file_path, channel.id] = index.channel(mcap_descriptor(schema, channel))
-                    for raw in iter_mcap_records(bag["path"], on_channel=register_raw):
+                    for raw in iter_mcap_records(bag["path"], on_channel=register_raw,
+                                                 skip_payload_topics=excluded_topics):
                         channel, data = raw.channel, raw.message
                         key = (raw.file_path, channel.id)
                         yield (channel.topic, data.data, data.log_time, data.publish_time,
-                               raw_channels[key], data.sequence,
+                               None if channel.topic in excluded_topics else raw_channels[key], data.sequence,
                                dict(file=raw.file_path.name, record=raw.file_ordinal, channel_id=channel.id))
                 else:
                     while reader.has_next():
                         yield (*reader.read_next_ext()[:4], None, 0, None)
 
             for ordinal, (topic, payload, received, sent, channel, sequence, source_record) in enumerate(records()):
+                # Count every input without renumbering surviving provenance. Excluded
+                # payloads never reach type loading, deserialization, timestamps or dedup.
+                if topic in excluded_topics:
+                    excluded_counts[topic] += 1
+                    continue
                 topic_type = available[topic]
                 message = None
                 needs_sensor = settings["time_source"] == "sensor"
@@ -456,9 +476,15 @@ def convert(request):
                           channel=channel, sequence=sequence, source_record=source_record)
             del reader
         stats = index.deduplicate()
+        stats["excluded_messages"] = sum(excluded_counts.values())
+        stats["excluded_messages_by_topic"] = dict(sorted(excluded_counts.items()))
+        stats["input_messages"] += stats["excluded_messages"]
         stats["unknown_qos_topics"] = sorted(unknown_qos)
         stats["unavailable_message_types"] = sorted(name for name, cls in classes.items() if cls is None)
         if not stats["output_messages"]:
+            if stats["excluded_messages"]:
+                raise ValueError(f"bag proxy: all {stats['input_messages']} input messages were excluded "
+                                 "by exclude_topics")
             raise ValueError("bag proxy has no messages")
         if raw_output:
             write_proxy(stage / "bag", topics, index)

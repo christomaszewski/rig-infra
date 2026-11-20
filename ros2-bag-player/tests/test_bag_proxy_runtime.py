@@ -4,10 +4,12 @@ from collections import Counter
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import bag_proxy
@@ -65,9 +67,165 @@ class BagProxyRuntime(unittest.TestCase):
         provenance = [json.loads(line) for line in (stage / "messages.jsonl").read_text().splitlines()]
         self.assertTrue(result["validation"]["payloads_verified"])
         self.assertEqual(result["statistics"]["output_messages"], len(records))
-        self.assertEqual(result["statistics"]["input_messages"], len(provenance))
+        self.assertEqual(result["statistics"]["input_messages"],
+                         len(provenance) + result["statistics"].get("excluded_messages", 0))
         self.assertFalse((stage / "merge.sqlite3").exists())
         return result, records, provenance, channels
+
+    def test_topic_exclusion_precedes_payload_timestamp_and_tf_processing(self):
+        from rosidl_runtime_py.utilities import get_message
+        base = 100 * 10**9
+        image = Image()
+        image.header.stamp.sec = 100
+        image.data = [1, 2, 3]
+        kept = serialize_message(image)
+        image.header.stamp.sec = 200  # Present, but outside the clock-skew bound.
+        skewed = serialize_message(image)
+        static_a = serialize_message(TFMessage(transforms=[self.transform(0, "base", "camera", 1)]))
+        static_b = serialize_message(TFMessage(transforms=[self.transform(0, "base", "camera", 2)]))
+        excluded = ["/bad_clock", "/bad_cdr", "/tf_static", "/tf"]
+        for storage in ("mcap", "sqlite3"):
+            with self.subTest(storage=storage):
+                bag = self.bag("exclude-" + storage, storage, [
+                    ("/bad_clock", "sensor_msgs/msg/Image", skewed, base, base),
+                    ("/keep", "sensor_msgs/msg/Image", kept, base + 1, base),
+                    ("/bad_cdr", "std_msgs/msg/String", b"invalid CDR", base + 2, base),
+                    ("/tf_static", bag_proxy.TF_TYPE, static_a, base + 3, base),
+                    ("/tf_static", bag_proxy.TF_TYPE, static_b, base + 4, base),
+                    ("/tf", bag_proxy.TF_TYPE, b"invalid TF", base + 5, base),
+                    ("/bad_clock/child", "sensor_msgs/msg/Image", kept, base + 6, base),
+                    ("/bad_clock2", "sensor_msgs/msg/Image", kept, base + 7, base)])
+                with self.assertRaisesRegex(ValueError, "max_clock_skew_s"):
+                    self.convert([bag], "unfiltered-" + storage, time_source="sensor")
+                with mock.patch("rosidl_runtime_py.utilities.get_message", wraps=get_message) as load_type:
+                    result, records, provenance, channels = self.convert(
+                        [bag], "filtered-" + storage, time_source="sensor", exclude_topics=excluded)
+                self.assertEqual(load_type.call_args_list, [mock.call("sensor_msgs/msg/Image")])
+                self.assertEqual([row[0] for row in records], ["/keep", "/bad_clock/child", "/bad_clock2"])
+                # SQLite does not persist send timestamps; the reader reports zero.
+                expected_sent = base if storage == "mcap" else 0
+                self.assertEqual([(bytes(row[1]), *row[2:]) for row in records],
+                                 [(kept, base, expected_sent)] * 3)
+                self.assertEqual([row["ordinal"] for row in provenance], [1, 6, 7])
+                self.assertEqual([row["received_ns"] for row in provenance],
+                                 [base + 1, base + 6, base + 7])
+                self.assertEqual([row["sent_ns"] for row in provenance], [expected_sent] * 3)
+                if storage == "mcap":
+                    self.assertEqual([row["source_record"]["record"] for row in provenance], [1, 6, 7])
+                self.assertEqual({row.name for row in channels}, {"/keep", "/bad_clock/child", "/bad_clock2"})
+                stats = result["statistics"]
+                self.assertEqual((stats["input_messages"], stats["excluded_messages"], stats["output_messages"]),
+                                 (8, 5, 3))
+                self.assertEqual(stats["excluded_messages_by_topic"],
+                                 {"/bad_cdr": 1, "/bad_clock": 1, "/tf": 1, "/tf_static": 2})
+                self.assertEqual((stats["tf_messages"], stats["tf_static_messages"], stats["timestamp_fallbacks"]),
+                                 (0, 0, 0))
+
+    def test_excluded_topic_type_conflicts_and_all_filtered_inputs(self):
+        payload = serialize_message(String(data="kept"))
+        image = serialize_message(Image())
+        bags = [self.bag("conflict-a", "mcap", [
+                    ("/excluded", "std_msgs/msg/String", payload, 100, 90),
+                    ("/keep", "std_msgs/msg/String", payload, 101, 90)]),
+                self.bag("conflict-b", "sqlite3", [
+                    ("/excluded", "sensor_msgs/msg/Image", image, 102, 90),
+                    ("/keep", "std_msgs/msg/String", payload, 103, 90)])]
+        with self.assertRaisesRegex(ValueError, "conflicting type/schema"):
+            self.convert(bags, "conflict-unfiltered")
+        result, records, provenance, channels = self.convert(bags, "conflict-filtered", exclude_topics=["/excluded"])
+        self.assertEqual([row.name for row in channels], ["/keep"])
+        self.assertEqual([(row["input"], row["ordinal"]) for row in provenance], [(0, 1), (1, 1)])
+        self.assertEqual(len(records), 2)
+        self.assertEqual(result["statistics"]["excluded_messages_by_topic"], {"/excluded": 2})
+        for storage in ("mcap", "sqlite3"):
+            bag = self.bag("all-" + storage, storage, [("/excluded", "std_msgs/msg/String", payload, 100, 90)])
+            with self.subTest(storage=storage), self.assertRaisesRegex(ValueError, "all 1 input messages were excluded"):
+                self.convert([bag], "all-filtered-" + storage, exclude_topics=["/excluded"])
+            self.assertFalse((self.root / ("all-filtered-" + storage) / "merge.sqlite3").exists())
+            self.assertFalse((self.root / ("all-filtered-" + storage) / "bag").exists())
+
+    def test_empty_exclusions_preserve_unfiltered_output(self):
+        payload = serialize_message(String(data="same"))
+        bag = self.bag("no-exclusions", "mcap", [("/keep", "std_msgs/msg/String", payload, 100, 90)])
+        before = self.convert([bag], "absent-filter")
+        after = self.convert([bag], "empty-filter", exclude_topics=[])
+        self.assertEqual(before[1:3], after[1:3])
+        self.assertEqual(before[0]["statistics"], after[0]["statistics"])
+        self.assertNotIn("exclude_topics", before[0]["policy"])
+        self.assertEqual(after[0]["policy"]["exclude_topics"], [])
+
+    def test_excluded_mcap_metadata_and_raw_channels_bypass_export_validation(self):
+        import yaml
+        from mcap.writer import Writer
+        from publication_identity import iter_mcap_records
+        payload = serialize_message(String(data="kept"))
+        bag = self.bag("excluded-channels", "mcap", [
+            ("/excluded", "std_msgs/msg/String", b"invalid CDR", 100, 90),
+            ("/keep", "std_msgs/msg/String", payload, 101, 90)])
+        directory = Path(bag["path"])
+        raw = list(iter_mcap_records(directory))
+        metadata_path = directory / "metadata.yaml"
+        metadata = yaml.safe_load(metadata_path.read_text())
+        for entry in metadata["rosbag2_bagfile_information"]["topics_with_message_count"]:
+            if entry["topic_metadata"]["name"] == "/excluded":
+                entry["topic_metadata"]["serialization_format"] = "json"
+                entry["topic_metadata"]["type"] = "unavailable_msgs/msg/Excluded"
+                entry["topic_metadata"]["offered_qos_profiles"] = []
+        metadata_path.write_text(yaml.safe_dump(metadata))
+        with raw[0].file_path.open("wb") as stream:
+            writer = Writer(stream, enable_data_crcs=True)
+            writer.start(profile="ros2")
+            for record in raw:
+                excluded = record.channel.topic == "/excluded"
+                schema = record.schema
+                sid = writer.register_schema("different_msgs/msg/Excluded" if excluded else schema.name,
+                                             schema.encoding, schema.data)
+                cid = writer.register_channel(record.channel.topic, "json" if excluded else "cdr", sid,
+                    {"offered_qos_profiles": "not valid QoS"} if excluded else record.channel.metadata)
+                message = record.message
+                writer.add_message(cid, message.log_time, message.data, message.publish_time, message.sequence)
+            writer.finish()
+        with self.assertRaisesRegex(ValueError, "only CDR"):
+            self.convert([bag], "channel-unfiltered")
+        result, records, provenance, channels = self.convert([bag], "channel-filtered",
+                                                           exclude_topics=["/excluded"])
+        self.assertEqual([(r[0], bytes(r[1])) for r in records], [("/keep", payload)])
+        self.assertEqual([p["ordinal"] for p in provenance], [1])
+        self.assertEqual([c.name for c in channels], ["/keep"])
+        self.assertEqual(result["statistics"]["unknown_qos_topics"], [])
+        self.assertEqual(result["statistics"]["excluded_messages_by_topic"], {"/excluded": 1})
+
+    def test_excluded_sqlite_unknown_type_bypasses_sensor_validation(self):
+        import yaml
+        image = Image()
+        image.header.stamp.sec = 100
+        payload = serialize_message(image)
+        base = 100 * 10**9
+        bag = self.bag("excluded-sqlite-metadata", "sqlite3", [
+            ("/excluded", "std_msgs/msg/String", b"invalid CDR", base, base),
+            ("/keep", "sensor_msgs/msg/Image", payload, base + 1, base)])
+        directory = Path(bag["path"])
+        excluded_type = "unavailable_msgs/msg/Excluded"
+        with sqlite3.connect(next(directory.glob("*.db3"))) as db:
+            db.execute("UPDATE topics SET type=? WHERE name=?", (excluded_type, "/excluded"))
+        # SequentialReader gets topic metadata from metadata.yaml, so keep both
+        # the storage table and the recording's metadata consistent.
+        metadata_path = directory / "metadata.yaml"
+        metadata = yaml.safe_load(metadata_path.read_text())
+        for entry in metadata["rosbag2_bagfile_information"]["topics_with_message_count"]:
+            if entry["topic_metadata"]["name"] == "/excluded":
+                entry["topic_metadata"]["type"] = excluded_type
+        metadata_path.write_text(yaml.safe_dump(metadata))
+        with self.assertRaisesRegex(ValueError, "/excluded: message type unavailable for sensor timestamps"):
+            self.convert([bag], "sqlite-metadata-unfiltered", time_source="sensor")
+        result, records, provenance, channels = self.convert(
+            [bag], "sqlite-metadata-filtered", time_source="sensor", exclude_topics=["/excluded"])
+        self.assertEqual([(r[0], bytes(r[1])) for r in records], [("/keep", payload)])
+        self.assertEqual(records[0][2:], (base, 0))
+        self.assertEqual([p["ordinal"] for p in provenance], [1])
+        self.assertEqual([c.name for c in channels], ["/keep"])
+        self.assertEqual(result["statistics"]["unavailable_message_types"], [])
+        self.assertEqual(result["statistics"]["excluded_messages_by_topic"], {"/excluded": 1})
 
     def test_mixed_storage_conservative_and_aggressive_keep_same_source_repetition(self):
         payload = serialize_message(String(data="identical ordinary message"))

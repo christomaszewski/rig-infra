@@ -112,15 +112,19 @@ class RawRecord:
     message: object
 
 
-def iter_mcap_records(path, *, on_channel=None):
+def iter_mcap_records(path, *, on_channel=None, skip_payload_topics=()):
     """Stream physical records with their own channel, including compressed bags.
 
     StreamReader validates data/chunk CRCs and does not reorder the whole file.
     Split files remain one caller-selected recording source. Consume the entire
     iterator: required outer-marker validation completes at each file's end.
+    Topics in skip_payload_topics still yield records for original ordinals/counts,
+    but their outer message-compressed payloads remain compressed. Callers must discard
+    those payloads. Container structure, CRCs and publication markers remain checked.
 """
     from mcap.records import Channel, Message, Metadata, Schema
     from mcap.stream_reader import StreamReader
+    skip_payload_topics = frozenset(skip_payload_topics)
     mode, _ = compression(path)
     if mode:
         import zstandard
@@ -159,7 +163,7 @@ def iter_mcap_records(path, *, on_channel=None):
                     raise ValueError(f"publication identity: channel has unknown schema in {file_path}")
                 schema = schemas.get(channel.schema_id)
                 marked = marked or identity_key(channel.metadata, message.sequence) is not None
-                if mode == "message":
+                if mode == "message" and channel.topic not in skip_payload_topics:
                     message = replace(message, data=decompressor.decompress(message.data,
                                                                            max_output_size=2**30))
                 yield RawRecord(file_path, ordinal, schema, channel, message)
