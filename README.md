@@ -5,6 +5,11 @@ plus the **`fleet-ros` base image** they default to. Each service dir is an ordi
 service: a launcher + `rigging.yaml` meeting the launcher contract (`rig certify` runs against every
 one in CI).
 
+[v1.22.0](docs/releases/v1.22.0.md) adds exact topic exclusions to bag proxy exports through
+Rig v0.2.89 version 2 recipes using `replay.export.bags.exclude`. Upgrade the player launch
+package and re-bake artifacts that carry it. Existing compatible `fleet-ros` images can be
+reused. Reports include aggregate exclusion counts and original source ordinals in provenance.
+
 [v1.21.0](docs/releases/v1.21.0.md) adds the [observer](#observer--graph-system-capture-and-diagnostics) service for graph capture,
 host measurements and live diagnostics. The bag logger accepts its old graph settings for
 this release. New MCAP recordings can also carry publication identities through export and
